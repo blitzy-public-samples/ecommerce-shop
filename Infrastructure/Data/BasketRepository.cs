@@ -18,6 +18,9 @@ namespace Infrastructure.Data
         public async Task<CustomerBasket> GetBasketAsync(string basketId)
         {
             var data = await _database.StringGetAsync(basketId);
+            // Explicit (string) cast resolves the System.Text.Json Deserialize<T> overload ambiguity
+            // (string vs ReadOnlySpan<byte>) for the implicitly-convertible RedisValue under .NET 10.
+            // Preserves the pre-upgrade string-overload binding; behavior, key, and 30-day TTL unchanged.
             return data.IsNullOrEmpty ? null : JsonSerializer.Deserialize<CustomerBasket>((string)data);
         }
 
