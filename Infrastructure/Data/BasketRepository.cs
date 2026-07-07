@@ -18,7 +18,7 @@ namespace Infrastructure.Data
         public async Task<CustomerBasket> GetBasketAsync(string basketId)
         {
             var data = await _database.StringGetAsync(basketId);
-            return data.IsNullOrEmpty ? null : JsonSerializer.Deserialize<CustomerBasket>(data);
+            return data.IsNullOrEmpty ? null : JsonSerializer.Deserialize<CustomerBasket>((string)data);
         }
 
         //update or create a basket
