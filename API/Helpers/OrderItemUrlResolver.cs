@@ -1,6 +1,5 @@
 using API.Dtos;
 using AutoMapper;
-using AutoMapper.Configuration;
 using Core.Entities.OrderAggregate;
 using IConfiguration = Microsoft.Extensions.Configuration.IConfiguration;
 
