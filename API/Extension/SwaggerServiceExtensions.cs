@@ -1,6 +1,7 @@
+using System.Collections.Generic;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.OpenApi.Models;
+using Microsoft.OpenApi;
 
 namespace API.Extension
 {
@@ -17,17 +18,15 @@ namespace API.Extension
                     Name = "Authorization",
                     In = ParameterLocation.Header,
                     Type = SecuritySchemeType.Http,
-                    Scheme = "bearer",
-                    Reference = new OpenApiReference
-                    {
-                        Type = ReferenceType.SecurityScheme,
-                        Id = "Bearer"
-                    }
+                    Scheme = "bearer"
                 };
                 
                 c.AddSecurityDefinition("Bearer",securitySchema);
-                var securityRequirement = new OpenApiSecurityRequirement {{securitySchema, new[] {"Bearer"}}};
-                c.AddSecurityRequirement(securityRequirement);
+                c.AddSecurityRequirement(document =>
+                    new OpenApiSecurityRequirement
+                    {
+                        {new OpenApiSecuritySchemeReference("Bearer", document), new List<string> {"Bearer"}}
+                    });
             });
             return services;
         }

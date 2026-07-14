@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using Core.Entities.Identity;
 using Infrastructure.Identity;
@@ -24,7 +25,11 @@ namespace API.Extension
                     options.TokenValidationParameters = new TokenValidationParameters
                     {
                         ValidateIssuerSigningKey = true,
-                        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(config["Token:Key"])),
+                        // Derive the 512-bit validation key identically to TokenService's signing key.
+                        // HMAC-SHA512 requires a key of at least 512 bits under Microsoft.IdentityModel 8.x;
+                        // the configured Token:Key is expanded via SHA-512 so signing and validation stay
+                        // in sync without altering the immutable configuration value.
+                        IssuerSigningKey = new SymmetricSecurityKey(SHA512.HashData(Encoding.UTF8.GetBytes(config["Token:Key"]))),
                         ValidIssuer = config["Token:Issuer"],
                         ValidateIssuer = true,
                         ValidateAudience = false,

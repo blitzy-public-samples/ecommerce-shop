@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using Core.Entities.Identity;
 using Core.Interfaces;
@@ -18,7 +19,13 @@ namespace Infrastructure.Services
         public TokenService(IConfiguration config)
         {
             _config = config;
-            _key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_config["Token:Key"]));
+            // Derive a 512-bit signing key from the configured secret via SHA-512. HMAC-SHA512
+            // (used in CreateToken below) requires a key of at least 512 bits under
+            // Microsoft.IdentityModel 8.x, which enforces per-algorithm key sizes (added in 6.30.1);
+            // the configured Token:Key is shorter, so it is expanded here deterministically rather
+            // than altering the immutable configuration value. The HMAC-SHA512 algorithm and the
+            // emitted token shape (claims, expiry, issuer) are preserved unchanged.
+            _key = new SymmetricSecurityKey(SHA512.HashData(Encoding.UTF8.GetBytes(_config["Token:Key"])));
         }
 
         public string CreateToken(AppUser user)
