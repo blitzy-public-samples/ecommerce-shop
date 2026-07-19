@@ -12,7 +12,7 @@ Run `ng generate component component-name` to generate a new component. You can 
 
 ## Build
 
-Run `ng build` to build the project. The build artifacts will be stored in the `dist/` directory. Use the `--prod` flag for a production build.
+Run `ng build` to build the project. This project configures its output path in `angular.json`, so the build artifacts are written to the `../API/wwwroot` directory (from where the API serves the compiled client). Use the `--prod` flag for a production build.
 
 ## Running unit tests
 

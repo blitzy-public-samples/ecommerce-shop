@@ -1,5 +1,15 @@
 ## Project Development Procces Tracker:
 
+> **Historical Document Notice**
+>
+> This file is a dated development diary written during the project's initial implementation in **2021** (see "Date Created" below). It records the original, step-by-step build process **as it was at that time** and is preserved for historical reference. The codebase has since evolved, so some details below intentionally differ from the current application:
+>
+> - **Database engine:** the diary describes an early **SQLite** setup; the current application uses **PostgreSQL** (`API/Startup.cs` configures `UseNpgsql` for both the store and identity databases).
+> - **Solution file:** the solution was originally named `API.sln`; it is now **`ecommerce-shop.sln`**.
+> - **Unknown-route behavior:** an early entry shows unknown API routes returning `404`; the current app registers an SPA fallback (`MapFallbackToController`), so unmatched routes serve the Angular `index.html`.
+>
+> For the **current** setup, stack, and run instructions, always refer to the top-level [`README.md`](README.md).
+
 #### Project: Online store web application as a part of a web development course.
 
 Goal: To track progress I embedded all of the development process(code edits, file creation, design pattern implementation etc.) in this file so in the end I will have whole development procces documented.
@@ -1219,7 +1229,7 @@ app.UseMiddleware<ExceptionMiddleware>();
 
 ### 4.3. Improving validation error responses
 
-1.  Inside `Errors` create a new class `ApiValidationErrorResponse.cs`
+1.  Inside `Errors` create a new class `ApiValidationErrorResponose.cs`
 
 ```c#
 using System.Collections.Generic;

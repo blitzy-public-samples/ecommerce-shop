@@ -199,19 +199,41 @@ namespace API.Tests.Controllers
         // ------------------------------------------------------------------
 
         [Fact]
-        public void Constructor_WithConfiguredWhSecret_ConstructsWithoutThrowing()
+        public async Task Constructor_WiresConfiguredWhSecretIntoWebhookVerification_VerifiesEventSignedWithThatSecret()
         {
             // Arrange
+            // Construct the controller with a webhook secret DISTINCT from the suite default
+            // (WebhookSecret). The constructor reads StripeSettings:WhSecret into the field that
+            // EventUtility.ConstructEvent later verifies the Stripe-Signature against, so successfully
+            // verifying a payload signed with THIS specific secret proves the constructor wired the
+            // *configured* value through (not a hardcoded or default one) — a concrete
+            // WhSecret-dependent behavior rather than a mere non-null construction check. Signing and
+            // verification are pure local HMAC with no network access, honoring the "no live Stripe
+            // calls" constraint (AAP §0.10.1).
+            const string constructorSecret = "whsec_constructor_specific_secret";
             var paymentService = new Mock<IPaymentService>();
             var logger = new Mock<ILogger<PaymentsController>>();
+            // Return a non-null Order so the succeeded branch's `order.Id` log call does not hit null.
+            paymentService
+                .Setup(s => s.UpdateOrderPaymentSucceeded(It.IsAny<string>()))
+                .ReturnsAsync(new Order());
+            var controller = CreateController(paymentService, logger, constructorSecret);
+
+            var payload = BuildEventPayload("payment_intent.succeeded", "pi_ctor_secret");
+            // Sign the payload offline with the SAME secret the constructor received.
+            AttachWebhookRequest(controller, payload, BuildSignatureHeader(payload, constructorSecret));
 
             // Act
-            // Documents that the constructor reads StripeSettings:WhSecret and completes without throwing
-            // when the key is present.
-            var controller = CreateController(paymentService, logger, "whsec_documented_secret");
+            var result = await controller.StripeWebhook();
 
             // Assert
-            controller.Should().NotBeNull();
+            // Local HMAC verification against the constructor-configured secret succeeded (no
+            // StripeException), so the event switch executed and delegated the payment-intent id to the
+            // payment service. This outcome only holds when the constructor stored the *configured*
+            // WhSecret in the field ConstructEvent verifies against.
+            result.Should().BeOfType<EmptyResult>();
+            paymentService.Verify(s => s.UpdateOrderPaymentSucceeded("pi_ctor_secret"), Times.Once);
+            paymentService.Verify(s => s.UpdateOrderPaymentFailed(It.IsAny<string>()), Times.Never);
         }
 
         // ------------------------------------------------------------------
