@@ -6,7 +6,9 @@ using System.Net.Http.Json;   // net5.0 shared-framework extension: PostAsJsonAs
 using System.Text.Json;
 using System.Threading.Tasks;
 using API.IntegrationTests.Infrastructure;
+using Core.Interfaces;                          // IPaymentService — resolve the singleton stub (MJ-10)
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection; // GetRequiredService — resolve the singleton stub (MJ-10)
 using Xunit;
 
 namespace API.IntegrationTests.Contract
@@ -839,25 +841,43 @@ namespace API.IntegrationTests.Contract
 
         /// <summary>
         /// <c>POST api/orders</c> with a valid-shaped <c>OrderDto</c> whose <c>basketId</c> references a
-        /// non-existent basket returns a structured <c>500 InternalServerError</c> (<c>statusCode == 500</c>
-        /// with a non-empty <c>message</c>). All <c>AddressDto</c> members are <c>[Required]</c>, so a
-        /// complete address is supplied to pass <c>[ApiController]</c> model validation and reach the action.
+        /// non-existent basket CURRENTLY returns a structured <c>500 InternalServerError</c>
+        /// (<c>statusCode == 500</c> with a non-empty <c>message</c>). All <c>AddressDto</c> members are
+        /// <c>[Required]</c>, so a complete address is supplied to pass <c>[ApiController]</c> model
+        /// validation and reach the action. This test locks the ACTUAL observed contract while EXPLICITLY
+        /// documenting that it DEVIATES from the AAP §0.4.2 blueprint (which specifies a missing basket →
+        /// <c>400</c>); see the remarks for the root cause and the out-of-scope escalation.
         /// </summary>
         /// <remarks>
-        /// OBSERVED-BEHAVIOR ALIGNMENT (verified at runtime against the real pipeline): for a missing basket,
-        /// <c>IBasketRepository.GetBasketAsync</c> returns <c>null</c> and
-        /// <c>OrderService.CreateOrderAsync</c> immediately dereferences it (<c>foreach (var item in
-        /// basket.Items)</c>), throwing a <see cref="NullReferenceException"/> that the global
-        /// <c>ExceptionMiddleware</c> surfaces as a controlled, structured <c>ApiException</c> 500. The
-        /// controller's <c>400 "Problem creating order"</c> branch is only taken when
-        /// <c>CreateOrderAsync</c> returns <c>null</c> (i.e. <c>UnitOfWork.Complete() &lt;= 0</c>), which is
-        /// not reachable via a straightforward HTTP call with a non-existent basket and is covered by the
-        /// <c>OrderService</c>/<c>OrdersController</c> unit tests instead. This assertion therefore locks the
-        /// genuine HTTP contract (a structured 500) for the missing-basket input without weakening the
-        /// body-shape contract (statusCode + message), and no production code is modified.
+        /// <b>DOCUMENTED AAP DEVIATION (dest GAP-3) — surfaced and escalated, not hidden.</b> The AAP §0.4.2
+        /// integration blueprint specifies that a "basket not found" input should yield <c>null</c> from
+        /// <c>OrderService.CreateOrderAsync</c> and a <c>400 BadRequest</c> ("Problem creating order") from
+        /// <c>OrdersController</c>. The ACTUAL runtime behavior (verified against the real pipeline) is a
+        /// structured <c>500</c> instead, for this root cause: for a missing basket
+        /// <c>IBasketRepository.GetBasketAsync</c> returns <c>null</c> and <c>OrderService.CreateOrderAsync</c>
+        /// dereferences it at its very first statement (<c>foreach (var item in basket.Items)</c>,
+        /// <c>OrderService.cs</c> ~line 30) WITHOUT a null guard, throwing a
+        /// <see cref="NullReferenceException"/> that the global <c>ExceptionMiddleware</c> catches and
+        /// surfaces as a controlled, structured <c>ApiException</c> 500. The controller's
+        /// <c>400 "Problem creating order"</c> branch is only taken when <c>CreateOrderAsync</c> returns
+        /// <c>null</c> (i.e. <c>UnitOfWork.Complete() &lt;= 0</c>), which a missing basket never reaches
+        /// because the NRE is thrown first.
+        /// <para>
+        /// <b>Why this test asserts 500 rather than the AAP's 400.</b> Closing the gap requires a PRODUCTION
+        /// change — a null guard in <c>OrderService.CreateOrderAsync</c> that returns <c>null</c> for a
+        /// missing basket so the controller can emit its 400. That is OUT OF SCOPE for this test-only
+        /// engagement, whose production code, controllers and services are frozen (AAP §0.8.2: "No controller
+        /// logic, middleware, service, repository, or entity behavior is altered"; the only permitted
+        /// production seam is the annotated Stripe change in <c>PaymentService</c>). Per the QA guidance this
+        /// divergence is therefore SURFACED here and ESCALATED in the resolution report rather than silently
+        /// absorbed or masked: the assertion truthfully locks the current structured-500 contract (statusCode
+        /// + non-empty message) so any future regression is caught, and the method name carries the
+        /// <c>_DocumentedAapNullToBadRequestDeviation</c> suffix to make the known divergence explicit. No
+        /// production code is modified by this test.
+        /// </para>
         /// </remarks>
         [Fact]
-        public async Task CreateOrder_NonexistentBasket_Returns500()
+        public async Task CreateOrder_NonexistentBasket_Returns500_DocumentedAapNullToBadRequestDeviation()
         {
             // Arrange — a valid OrderDto whose basket does not exist (uniquely keyed) and a complete address.
             using var client = await _fixture.CreateAuthenticatedClientAsync();
@@ -1046,9 +1066,12 @@ namespace API.IntegrationTests.Contract
         /// <c>clientSecret == "pi_test_stub_secret"</c>.
         /// </summary>
         /// <remarks>
-        /// The controller's <c>400 "Problem with your basket"</c> branch is NOT reachable here: the harness's
-        /// <see cref="StripePaymentServiceStub"/> always returns a non-null basket. That null-basket branch is
-        /// covered by the <c>PaymentsController</c> unit tests instead, per the AAP scope split.
+        /// This test exercises the happy path where the stub returns its default non-null basket. The
+        /// controller's <c>400 "Problem with your basket"</c> branch is covered by the sibling
+        /// <see cref="CreatePaymentIntent_WhenStubReturnsNullBasket_Returns400ProblemWithBasket"/>, which
+        /// opts the shared <see cref="StripePaymentServiceStub"/> into returning a null basket so that
+        /// fail-path is driven through the real HTTP pipeline (in addition to the <c>PaymentsController</c>
+        /// unit tests, per the AAP scope split).
         /// </remarks>
         [Fact]
         public async Task CreatePaymentIntent_Authenticated_Returns200BasketWithStubIntent()
@@ -1067,6 +1090,55 @@ namespace API.IntegrationTests.Contract
             root.GetProperty("id").GetString().Should().Be(basketId);
             root.GetProperty("paymentIntentId").GetString().Should().Be("pi_test_stub");
             root.GetProperty("clientSecret").GetString().Should().Be("pi_test_stub_secret");
+        }
+
+        /// <summary>
+        /// <c>POST api/payments/{basketId}</c> with a valid bearer token but when the payment service yields
+        /// a <b>null</b> basket returns <c>400 Bad Request</c> with the structured <c>ApiResponse</c> body
+        /// (camelCase <c>statusCode == 400</c> and <c>message == "Problem with your basket"</c>).
+        /// </summary>
+        /// <remarks>
+        /// This drives <c>PaymentsController.CreateOrUpdatePaymentIntent</c>'s guard
+        /// <c>if (basket == null) return BadRequest(new ApiResponse(400, "Problem with your basket"))</c>
+        /// through the REAL HTTP pipeline. The default offline <see cref="StripePaymentServiceStub"/> always
+        /// returns a non-null basket, so this branch was previously unreachable in integration (w014 finding
+        /// B). We opt the shared singleton stub into returning a null basket for the duration of this test
+        /// via <see cref="StripePaymentServiceStub.SetCreateOrUpdatePaymentIntentReturnsNull(bool)"/>, then
+        /// restore the default in a <c>finally</c>
+        /// (<see cref="StripePaymentServiceStub.ResetCreateOrUpdatePaymentIntentBehavior"/>) so no behavior
+        /// leaks to subsequent sequentially-run tests. No live Stripe call is made (AAP §0.10.1); the toggle
+        /// is a pure in-memory, test-project-only switch and changes NO production code.
+        /// </remarks>
+        [Fact]
+        public async Task CreatePaymentIntent_WhenStubReturnsNullBasket_Returns400ProblemWithBasket()
+        {
+            // Arrange — an authenticated client and the shared singleton payment-service stub the running
+            // application resolves per request (registered as a singleton by CustomWebApplicationFactory,
+            // so this is the SAME instance the controller uses).
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
+            var stub = (StripePaymentServiceStub)_fixture.Factory.Services.GetRequiredService<IPaymentService>();
+            var basketId = "contract-pi-null-" + Guid.NewGuid();
+
+            // Opt this single test into the null-basket outcome so the controller's 400 guard is reached.
+            stub.SetCreateOrUpdatePaymentIntentReturnsNull(true);
+
+            try
+            {
+                // Act — the stub now yields a null basket, so the controller must short-circuit to 400.
+                using var response = await client.PostAsync($"api/payments/{basketId}", null);
+
+                // Assert — status + structured ApiResponse contract (statusCode + message).
+                response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(root, "statusCode", "message");
+                root.GetProperty("statusCode").GetInt32().Should().Be(400);
+                root.GetProperty("message").GetString().Should().Be("Problem with your basket");
+            }
+            finally
+            {
+                // Restore the default non-null behavior so no state leaks to later tests on the shared singleton.
+                stub.ResetCreateOrUpdatePaymentIntentBehavior();
+            }
         }
 
         /// <summary>

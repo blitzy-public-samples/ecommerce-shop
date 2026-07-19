@@ -210,7 +210,14 @@ namespace API.IntegrationTests.Concurrency
         /// is not wrapped in a database lock/transaction and <c>Order.PaymentId</c> has no unique index, so
         /// under TRUE concurrency both callers can miss the (initially absent) order and both insert —
         /// yielding 1 OR 2 persisted orders depending on timing (the review reproduced two inserts / zero
-        /// deletes). Guaranteeing exactly-one <i>even under concurrency</i> would require a PRODUCTION
+        /// deletes). This test therefore <b>surfaces the divergence the QA review flagged (dest GAP-1)</b>
+        /// between the AAP §0.4.2 integration blueprint — <i>"stale-order concurrency (duplicate
+        /// PaymentIntentId → exactly one order)"</i> — and the code's ACTUAL behavior under genuine
+        /// concurrency. The root cause is the unguarded check → delete → insert sequence in
+        /// <c>OrderService.CreateOrderAsync</c> combined with the absent unique index on
+        /// <c>Order.PaymentId</c>; closing the gap so exactly-one holds even under concurrency is a
+        /// PRODUCTION idempotency fix that is out of scope here and is escalated to the resolution report
+        /// rather than silently absorbed. Guaranteeing exactly-one <i>even under concurrency</i> would require a PRODUCTION
         /// idempotency change — a unique constraint on <c>PaymentId</c> and/or a transactional
         /// check-and-insert in <c>OrderService</c>. That production change is deliberately
         /// <b>DEFERRED / separately authorized</b>: this is a test-only engagement whose production code,

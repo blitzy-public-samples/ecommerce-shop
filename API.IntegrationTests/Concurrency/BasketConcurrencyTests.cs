@@ -220,6 +220,139 @@ namespace API.IntegrationTests.Concurrency
             }
         }
 
+        /// <summary>
+        /// Fires <see cref="ConcurrentRequestCount"/> concurrent <c>POST api/basket</c> requests to the
+        /// <b>same</b> basket id using <b>conflicting</b> payloads: each request writes a single-item basket
+        /// whose <c>Quantity</c> is distinct (the writer index, 1..N), so every writer genuinely competes to
+        /// persist a <i>different</i> document to the same Redis key. Asserts that despite the write race
+        /// (a) no request degrades into a <c>500</c> — all return <c>200 OK</c>; (b) each response body is a
+        /// well-formed single-item <see cref="CustomerBasket"/> that is a coherent snapshot of some writer's
+        /// full document — its quantity is always one of the submitted values, never a torn, partial, or
+        /// merged multi-item document; and (c) the final document read back via <c>GET</c> is a single
+        /// coherent basket whose item carries exactly one of the submitted quantities — a clean
+        /// last-write-wins outcome, never a corrupted, partial, summed, or field-merged document.
+        ///
+        /// <para>
+        /// <b>Why conflicting (not identical) payloads.</b> An identical-payload burst can only ever prove
+        /// the stored value is byte-stable; it cannot detect a torn or merged write because every writer's
+        /// bytes are the same. Making each concurrent write observably different (a distinct
+        /// <c>Quantity</c> per writer) means any interleaving that produced a merged/partial document —
+        /// e.g. two items, a summed quantity, or a quantity outside the submitted set — would fail these
+        /// coherence assertions. This is the conflicting-payload same-key concurrency scenario required by
+        /// the AAP §0.4.2 blueprint ("20 concurrent <c>POST api/basket</c> ... non-corrupted JSON").
+        /// </para>
+        ///
+        /// <para>
+        /// <b>Determinism.</b> Which writer wins is non-deterministic under a race (last-write-wins), so
+        /// this test never asserts <i>which</i> quantity survives — only that every observed document (each
+        /// response and the final <c>GET</c>) is exactly one coherent single-item basket drawn from the
+        /// submitted set. Note that <c>UpdateBasketAsync</c> SETs the caller's payload and then RE-READS the
+        /// shared key (<c>return await GetBasketAsync(basket.Id)</c>), so a response reflects a coherent
+        /// snapshot of whichever writer's full document was current at the read — not necessarily the
+        /// caller's own write. That is precisely why conflicting payloads (rather than identical ones) are
+        /// required: a torn, partial, or field-merged write would surface as a multi-item document or a
+        /// quantity outside the submitted set — which these assertions would catch — whereas an
+        /// identical-payload burst cannot detect it. A full-document overwrite per request (not a
+        /// field-level merge) is the storage contract; this test verifies the application preserves it
+        /// end-to-end under genuine concurrency against real Redis.
+        /// </para>
+        /// </summary>
+        [Fact]
+        public async Task UpdateBasket_TwentyConcurrentRequestsSameIdConflictingPayloads_NoCorruptionAndCoherentLastWriteWins()
+        {
+            // Arrange — one shared basket id, and ConcurrentRequestCount DISTINCT single-item payloads whose
+            // Quantity encodes the writer index (1..N). Every payload is individually valid (Quantity >= 1,
+            // Price >= 0.1) but genuinely conflicts with the others, so the final stored document must equal
+            // exactly one writer's payload rather than any merged/torn combination of them.
+            var basketId = $"basket-concurrency-conflict-{Guid.NewGuid():N}";
+
+            // The set of quantities that were submitted; the surviving persisted quantity MUST be one of these.
+            var submittedQuantities = Enumerable.Range(1, ConcurrentRequestCount).ToList();
+
+            var payloads = submittedQuantities
+                .Select(quantity =>
+                {
+                    // Reuse the shared single-item builder, then vary ONLY the quantity so each payload is a
+                    // distinct-yet-valid conflicting document for the SAME key.
+                    var dto = BuildBasketDto(basketId, itemCount: 1);
+                    dto.Items[0].Quantity = quantity;
+                    return dto;
+                })
+                .ToList();
+
+            using var client = _fixture.CreateClient();
+
+            // Complete the lazy Redis connect BEFORE the burst so this measures concurrent write-safety, not
+            // one-time cold-connect behavior (bounded readiness wait strategy, never a fixed Thread.Sleep).
+            await WarmUpRedisConnectionAsync(client);
+
+            // Act — fire all conflicting posts concurrently through a SINGLE Task.WhenAll. Task.WhenAll
+            // preserves input order, so responses[i] is the response to payloads[i].
+            var responses = await Task.WhenAll(
+                payloads.Select(dto => client.PostAsJsonAsync("api/basket", dto)));
+
+            try
+            {
+                // Assert (per-response): none failed, and each echoes its OWN single-item payload intact —
+                // proving the pipeline never returned a torn/merged body under the conflicting race.
+                responses.Should().NotContain(
+                    r => r.StatusCode == HttpStatusCode.InternalServerError,
+                    "conflicting racing writes to the same key must not degrade into an unhandled exception / 500");
+                responses.Should().OnlyContain(
+                    r => r.StatusCode == HttpStatusCode.OK,
+                    "every conflicting concurrent write to the same basket must complete successfully");
+
+                foreach (var response in responses)
+                {
+                    var basket = await response.Content.ReadFromJsonAsync<CustomerBasket>();
+                    AssertWellFormed(basket, basketId);
+
+                    // Because UpdateBasketAsync SETs the caller's payload and then RE-READS the shared key
+                    // (return await GetBasketAsync(basket.Id)), a response under a same-key race reflects a
+                    // COHERENT SNAPSHOT of whichever writer's full document was current in Redis at the read
+                    // — not necessarily this caller's own write. The corruption-freedom invariant is
+                    // therefore that every response body is a single-item basket whose quantity is one of
+                    // the values submitted by SOME writer: never a torn/partial document, never a merged
+                    // multi-item document, never a quantity outside the submitted set.
+                    var snapshotItem = basket.Items.Should().ContainSingle(
+                        "each response is a coherent single-item snapshot of the shared key, " +
+                        "never a torn, partial, or merged multi-item document").Which;
+                    submittedQuantities.Should().Contain(
+                        snapshotItem.Quantity,
+                        "each returned quantity must be one submitted by some concurrent writer, " +
+                        "confirming the SET/GET round-trip never yielded a corrupted or out-of-set value");
+                }
+
+                // Assert (final Redis state via GET): the race resolves to ONE coherent last-write-wins
+                // document — a single-item basket whose quantity is exactly one of the submitted values,
+                // never a merged/summed/partial result.
+                using var getResponse = await client.GetAsync($"api/basket?id={basketId}");
+                getResponse.StatusCode.Should().Be(HttpStatusCode.OK,
+                    "the basket persisted in Redis must be retrievable through the real pipeline");
+
+                var finalBasket = await getResponse.Content.ReadFromJsonAsync<CustomerBasket>();
+                AssertWellFormed(finalBasket, basketId);
+
+                var survivingItem = finalBasket.Items.Should().ContainSingle(
+                    "the persisted basket must be a single coherent document (last-write-wins), " +
+                    "never a torn, merged, or partially-written combination of conflicting writers").Which;
+                submittedQuantities.Should().Contain(
+                    survivingItem.Quantity,
+                    "the surviving quantity must be exactly one of the submitted values, " +
+                    "proving a clean last-write-wins outcome rather than a corrupted/merged document");
+            }
+            finally
+            {
+                foreach (var response in responses)
+                {
+                    response?.Dispose();
+                }
+
+                // MJ-04 deterministic cleanup: delete the basket key this test wrote to Redis.
+                await CleanupBasketsAsync(new[] { basketId });
+            }
+        }
+
         // ----------------------------------------------------------------------------------------------
         // Private helpers
         // ----------------------------------------------------------------------------------------------

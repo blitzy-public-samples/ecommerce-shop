@@ -52,6 +52,15 @@ namespace API.IntegrationTests.Infrastructure
         private readonly object _sync = new object();
         private readonly List<PaymentServiceCall> _calls = new List<PaymentServiceCall>();
 
+        // MJ-10 — opt-in switch (test-project only) that forces CreateOrUpdatePaymentIntent to return a
+        // NULL basket, so a single integration test can drive PaymentsController's
+        // 400 "Problem with your basket" branch through the real HTTP pipeline (that branch is otherwise
+        // unreachable while the stub always returns a non-null basket). Default false = the non-null
+        // behavior every other test relies on. Guarded by the same lock as the delegation log; the webhook
+        // Update* transitions are unaffected. Reset via ResetCreateOrUpdatePaymentIntentBehavior so no
+        // behavior leaks between the sequentially-run tests.
+        private bool _createOrUpdateReturnsNull;
+
         /// <summary>
         /// MJ-09 — an ordered, thread-safe snapshot of every webhook transition this stub has been asked to
         /// perform (<see cref="UpdateOrderPaymentSucceeded"/> / <see cref="UpdateOrderPaymentFailed"/>), each
@@ -77,6 +86,32 @@ namespace API.IntegrationTests.Infrastructure
             lock (_sync) { _calls.Clear(); }
         }
 
+        /// <summary>
+        /// MJ-10 — opt-in switch that makes subsequent <see cref="CreateOrUpdatePaymentIntent"/> calls return
+        /// a <c>null</c> basket, letting an integration test exercise <c>PaymentsController</c>'s
+        /// <c>400 "Problem with your basket"</c> branch through the real HTTP pipeline (that branch is
+        /// unreachable while the stub always returns a non-null basket). The default is <c>false</c>
+        /// (non-null), preserving the behavior every other test depends on; the webhook transition methods
+        /// (<see cref="UpdateOrderPaymentSucceeded"/>/<see cref="UpdateOrderPaymentFailed"/>) are unaffected.
+        /// </summary>
+        /// <param name="returnsNull">
+        /// <c>true</c> to return a null basket; <c>false</c> to restore the default non-null basket.
+        /// </param>
+        public void SetCreateOrUpdatePaymentIntentReturnsNull(bool returnsNull)
+        {
+            lock (_sync) { _createOrUpdateReturnsNull = returnsNull; }
+        }
+
+        /// <summary>
+        /// MJ-10 — restores the default <see cref="CreateOrUpdatePaymentIntent"/> behavior (a non-null
+        /// basket). A test that opted into the null-basket path calls this in a <c>finally</c> so the shared
+        /// singleton stub leaks no behavior to subsequent sequentially-run tests.
+        /// </summary>
+        public void ResetCreateOrUpdatePaymentIntentBehavior()
+        {
+            lock (_sync) { _createOrUpdateReturnsNull = false; }
+        }
+
         /// <summary>Records a single webhook delegation under the lock.</summary>
         private void Record(string method, string paymentIntentId)
         {
@@ -98,6 +133,17 @@ namespace API.IntegrationTests.Infrastructure
         /// </returns>
         public Task<CustomerBasket> CreateOrUpdatePaymentIntent(string basketId)
         {
+            // MJ-10 — honor the opt-in null-basket toggle (default false). When a test enables it, return a
+            // null basket so PaymentsController's "Problem with your basket" 400 branch is exercised through
+            // the real pipeline. Still completely offline: no Stripe, no Redis, no DB access.
+            lock (_sync)
+            {
+                if (_createOrUpdateReturnsNull)
+                {
+                    return Task.FromResult<CustomerBasket>(null);
+                }
+            }
+
             // offline stub: no Stripe, no Redis, no DB access — pure in-memory echo of the basket id
             var basket = new CustomerBasket(basketId)
             {

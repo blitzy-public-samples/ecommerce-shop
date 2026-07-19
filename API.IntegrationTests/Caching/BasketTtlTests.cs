@@ -231,6 +231,116 @@ namespace API.IntegrationTests.Caching
         }
 
         /// <summary>
+        /// ACTUAL-expiry proof (w014 FINDING F): after a basket is stored with its real ~30-day TTL, this
+        /// test externally <b>shortens</b> that key's TTL and, using a bounded readiness poll (never a fixed
+        /// <see cref="System.Threading.Thread"/> sleep), proves the entry genuinely transitions
+        /// present -&gt; absent AND that the real application observes the resulting <b>miss</b> end-to-end
+        /// (a subsequent <c>GET api/basket</c> falls back to the empty <c>new CustomerBasket(id)</c>). The
+        /// configured 30-day TTL is never waited out — only a deliberately shortened, dedicated test key is
+        /// expired — so the test stays fast and deterministic (AAP §0.7.2, §0.10.1). It complements the two
+        /// configured-TTL tests above (which assert the ~30-day value at write time) by proving the eventual
+        /// eviction + application miss that the configured expiry implies.
+        /// <list type="bullet">
+        ///   <item><c>POST api/basket</c> stores the basket (present: <c>GET</c> returns its single item; the
+        ///         key exists; its TTL is the configured ~30 days).</item>
+        ///   <item>The key's TTL is shortened externally to ~1.5 s via <c>KeyExpire</c>.</item>
+        ///   <item>Bounded polling of the real <c>GET</c> endpoint observes the miss (empty basket) once the
+        ///         shortened TTL elapses.</item>
+        ///   <item>Native Redis then confirms the key is gone (<c>KeyExists</c> false, <c>KeyTimeToLive</c>
+        ///         null).</item>
+        /// </list>
+        /// </summary>
+        [Fact]
+        public async Task PostBasket_WhenKeyTtlExternallyShortened_ApplicationObservesExpiryMiss()
+        {
+            // Arrange — a unique key; post the one-item basket and confirm it was persisted with a real TTL.
+            var basketId = $"basket-ttl-{Guid.NewGuid():N}";
+            _writtenKeys.Add(basketId);
+            using var content = BuildOneItemBasketContent(basketId);
+            using var client = _fixture.CreateClient();
+
+            using (var postResponse = await client.PostAsync("api/basket", content))
+            {
+                postResponse.StatusCode.Should()
+                    .Be(HttpStatusCode.OK, "the one-item basket satisfies all model-validation rules");
+            }
+
+            // Pre-condition: the basket is present with the configured ~30-day TTL, so the eviction below is
+            // a genuine expiry of a real, live key rather than a no-op on an already-absent key.
+            _db.KeyExists(basketId).Should().BeTrue("the posted basket must exist in real Redis before expiry");
+            _db.KeyTimeToLive(basketId).Value.TotalDays.Should()
+                .BeInRange(29, 30, "the basket is first stored with the configured ~30-day TTL");
+
+            using (var presentGet = await client.GetAsync($"api/basket?id={basketId}"))
+            {
+                var presentBody = await presentGet.Content.ReadAsStringAsync();
+                using var presentDoc = JsonDocument.Parse(presentBody);
+                presentDoc.RootElement.GetProperty("items").GetArrayLength().Should()
+                    .Be(1, "before expiry the application returns the persisted basket with its single item");
+            }
+
+            // Act — externally shorten the dedicated test key's TTL, then poll the real GET endpoint (a
+            // bounded wait strategy, never a fixed sleep) until the application observes the expiry miss.
+            _db.KeyExpire(basketId, TimeSpan.FromMilliseconds(1500)).Should()
+                .BeTrue("the live basket key exists, so shortening its TTL must succeed");
+            await WaitUntilBasketMissedAsync(client, basketId);
+
+            // Assert — the application observed the miss end-to-end AND native Redis confirms the eviction.
+            using (var afterExpiryGet = await client.GetAsync($"api/basket?id={basketId}"))
+            {
+                afterExpiryGet.StatusCode.Should().Be(HttpStatusCode.OK,
+                    "GET api/basket returns 200 with an empty fallback basket once the key has expired");
+
+                var afterBody = await afterExpiryGet.Content.ReadAsStringAsync();
+                using var afterDoc = JsonDocument.Parse(afterBody);
+                afterDoc.RootElement.GetProperty("id").GetString().Should()
+                    .Be(basketId, "the empty fallback basket echoes the requested id");
+                afterDoc.RootElement.GetProperty("items").GetArrayLength().Should()
+                    .Be(0, "after expiry the application returns the empty new CustomerBasket(id) fallback (a genuine miss)");
+            }
+
+            _db.KeyExists(basketId).Should()
+                .BeFalse("the basket key must be gone from real Redis once its (shortened) TTL elapsed");
+            _db.KeyTimeToLive(basketId).Should()
+                .BeNull("an expired/absent key has no remaining TTL");
+        }
+
+        /// <summary>
+        /// Bounded readiness wait strategy (never a fixed <see cref="System.Threading.Thread"/> sleep) that
+        /// polls the REAL <c>GET api/basket?id=</c> endpoint through the genuine pipeline until the
+        /// application observes a MISS for <paramref name="basketId"/> — i.e. the controller falls back to
+        /// <c>new CustomerBasket(id)</c> with an empty <c>items</c> collection because the Redis key has
+        /// expired. Returns as soon as the miss is observed; throws if it is not observed within the bounded
+        /// attempt budget so a genuine failure surfaces loudly instead of hanging (AAP §0.10.1).
+        /// </summary>
+        /// <param name="client">An HTTP client bound to the in-process application.</param>
+        /// <param name="basketId">The basket id / Redis key whose expiry-driven miss is awaited.</param>
+        private static async Task WaitUntilBasketMissedAsync(HttpClient client, string basketId)
+        {
+            const int maxAttempts = 40; // ~40 * 100 ms = 4 s upper bound; a 1500 ms TTL expires within ~15 polls
+
+            for (var attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                using var response = await client.GetAsync($"api/basket?id={basketId}");
+                response.StatusCode.Should().Be(HttpStatusCode.OK,
+                    "GET api/basket always returns 200 (an empty basket for an unknown/expired id)");
+
+                var body = await response.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.GetProperty("items").GetArrayLength() == 0)
+                {
+                    return; // the application observed the miss (empty fallback basket) — expiry propagated
+                }
+
+                await Task.Delay(100);
+            }
+
+            throw new InvalidOperationException(
+                $"The application never observed an expiry miss for basket '{basketId}' within the bounded " +
+                "wait budget; the TTL expiry -> empty-basket transition could not be verified end-to-end.");
+        }
+
+        /// <summary>
         /// Deletes every basket key this test instance wrote (MJ-04 deterministic cleanup) and then disposes
         /// the dedicated Redis multiplexer opened by this test class so no connection leaks between tests. The
         /// containers themselves are owned and disposed by this class's <see cref="ContainerFixture"/>.
