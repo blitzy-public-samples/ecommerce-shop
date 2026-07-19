@@ -1393,5 +1393,134 @@ namespace API.IntegrationTests.Contract
                 if (basketId != null) await TryDeleteBasketAsync(bobClient, basketId);
             }
         }
+
+        // ------------------------------ FINDING J — pagination boundary contract ------------------------------
+        // Documents the ACTUAL (verified-at-runtime) behavior of GET api/products at its pagination edges.
+        // The paging spec computes Skip = PageSize*(PageIndex-1), Take = PageSize
+        // (ProductsWithTypesAndBrandsSpecification.ApplyPaging), and SpecificationEvaluator applies
+        // .Skip(Skip).Take(Take) directly to the EF Core query. Consequently a non-positive pageIndex or a
+        // negative pageSize produces a NEGATIVE OFFSET/LIMIT that real PostgreSQL rejects at execution time,
+        // which the global ExceptionMiddleware surfaces as a structured 500 (fail-closed). These are
+        // PRE-EXISTING production characteristics (no input clamping/guarding on the lower bound); the tests
+        // PIN them rather than mask them. Production code is NOT modified.
+
+        /// <summary>
+        /// FINDING J — non-positive <c>pageIndex</c> or negative <c>pageSize</c> yields a structured
+        /// <c>500 InternalServerError</c>. Each case drives a negative SQL <c>OFFSET</c>/<c>LIMIT</c> that
+        /// real PostgreSQL rejects, surfaced by <c>ExceptionMiddleware</c> as an <c>ApiException</c>
+        /// (<c>statusCode == 500</c> + non-empty <c>message</c>). Documented, unmodified production behavior.
+        /// </summary>
+        [Theory]
+        [InlineData("api/products?pageIndex=0")]    // Skip = 6*(0-1)  = -6  => negative OFFSET
+        [InlineData("api/products?pageIndex=-1")]   // Skip = 6*(-1-1) = -12 => negative OFFSET
+        [InlineData("api/products?pageSize=-5")]    // Take = -5             => negative LIMIT
+        public async Task GetProducts_NonPositivePagingBound_Returns500_DocumentedFailClosed(string path)
+        {
+            // Arrange
+            var client = _fixture.CreateClient();
+
+            // Act
+            var response = await client.GetAsync(path);
+
+            // Assert — real PostgreSQL rejects the negative OFFSET/LIMIT => structured 500 (fail-closed).
+            response.StatusCode.Should().Be(HttpStatusCode.InternalServerError);
+            var root = await ReadRootAsync(response);
+            ShouldExposeCamelCaseProperties(root, "statusCode", "message");
+            root.GetProperty("statusCode").GetInt32().Should().Be(500);
+            root.GetProperty("message").GetString().Should().NotBeNullOrWhiteSpace();
+        }
+
+        /// <summary>
+        /// FINDING J — an excessive <c>pageSize</c> is CLAMPED to <c>ProductSpecParams.MaxPageSize</c> (50):
+        /// <c>GET api/products?pageSize=100000</c> returns <c>200 OK</c> with the envelope's <c>pageSize == 50</c>
+        /// (the setter's documented upper-bound clamp), and the <c>data</c> array holds at most 50 items.
+        /// Confirms the upper-bound guard is intact (only the lower bound is unguarded — see the 500 theory).
+        /// </summary>
+        [Fact]
+        public async Task GetProducts_ExcessivePageSize_Returns200ClampedTo50()
+        {
+            // Arrange
+            var client = _fixture.CreateClient();
+
+            // Act
+            var response = await client.GetAsync("api/products?pageSize=100000");
+
+            // Assert — 200 + pageSize clamped to the MaxPageSize (50).
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            root.GetProperty("pageSize").GetInt32().Should().Be(50, "PageSize is clamped to MaxPageSize (50)");
+            root.GetProperty("data").GetArrayLength().Should().BeLessOrEqualTo(50);
+        }
+
+        /// <summary>
+        /// FINDING J — a non-integer <c>pageIndex</c> fails model binding, so <c>[ApiController]</c> returns
+        /// an automatic <c>400 BadRequest</c> (a <c>ValidationProblemDetails</c>) BEFORE the action runs —
+        /// distinct from the negative-bound 500s, which occur DURING query execution.
+        /// </summary>
+        [Fact]
+        public async Task GetProducts_NonIntegerPageIndex_Returns400()
+        {
+            // Arrange
+            var client = _fixture.CreateClient();
+
+            // Act — "abc" cannot bind to int PageIndex => automatic model-validation 400.
+            var response = await client.GetAsync("api/products?pageIndex=abc");
+
+            // Assert
+            response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        }
+
+        /// <summary>
+        /// FINDING J — a <c>pageIndex</c> far beyond the available data returns <c>200 OK</c> with an EMPTY
+        /// <c>data</c> array while <c>count</c> still reports the true total (the seeded 18). Confirms
+        /// over-paging is a valid, non-erroring case (a positive Skip past the end simply yields no rows).
+        /// </summary>
+        [Fact]
+        public async Task GetProducts_PageIndexBeyondData_Returns200EmptyData()
+        {
+            // Arrange
+            var client = _fixture.CreateClient();
+
+            // Act — page 999999 of size 6 => Skip is huge (positive) => no rows, but the query is valid.
+            var response = await client.GetAsync("api/products?pageIndex=999999");
+
+            // Assert — 200 + empty data + true total count preserved.
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            root.GetProperty("data").GetArrayLength().Should().Be(0);
+            root.GetProperty("count").GetInt32().Should().Be(18);
+        }
+
+        /// <summary>
+        /// FINDING I — <c>POST api/account/login</c> with a body that OMITS the <c>password</c> field (for
+        /// the seeded, resolvable e-mail) returns a structured <c>500 InternalServerError</c>. This documents
+        /// a PRE-EXISTING production deviation: <c>LoginDto</c> declares no <c>[Required]</c> attributes, so
+        /// <c>[ApiController]</c> model validation does NOT reject the missing password; the controller then
+        /// resolves the user and calls <c>SignInManager.CheckPasswordSignInAsync(user, null, …)</c>, whose
+        /// <c>PasswordHasher.VerifyHashedPassword</c> throws <c>ArgumentNullException</c> on the null password.
+        /// The global <c>ExceptionMiddleware</c> surfaces it as a structured <c>ApiException</c>
+        /// (<c>statusCode == 500</c> + non-empty <c>message</c>). A well-formed missing-field request would
+        /// ideally be a 400; pinning the current 500 makes any future <c>[Required]</c> hardening a visible,
+        /// deliberate change. The e-mail MUST be the seeded user's so the user is found (an unknown e-mail
+        /// short-circuits to a 401 before the null-password path). Production code is NOT modified.
+        /// </summary>
+        [Fact]
+        public async Task Login_MissingPasswordField_Returns500_DocumentedMissingRequiredDeviation()
+        {
+            // Arrange — a resolvable seeded e-mail but NO password property in the JSON body.
+            var client = _fixture.CreateClient();
+
+            // Act — the anonymous object intentionally has no "password" member => loginDto.Password == null.
+            var response = await client.PostAsJsonAsync(
+                "api/account/login",
+                new { email = CustomWebApplicationFactory.DefaultTestUserEmail });
+
+            // Assert — structured 500 from the null-password dereference in the identity password hasher.
+            response.StatusCode.Should().Be(HttpStatusCode.InternalServerError);
+            var root = await ReadRootAsync(response);
+            ShouldExposeCamelCaseProperties(root, "statusCode", "message");
+            root.GetProperty("statusCode").GetInt32().Should().Be(500);
+            root.GetProperty("message").GetString().Should().NotBeNullOrWhiteSpace();
+        }
     }
 }

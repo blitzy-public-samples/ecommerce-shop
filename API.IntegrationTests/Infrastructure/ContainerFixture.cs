@@ -82,26 +82,34 @@ namespace API.IntegrationTests.Infrastructure
         // --- Engine/credential parity with docker-compose.yml (REFERENCE ONLY; the compose stack is
         //     never reused). These are non-secret, test-only values. -------------------------------------
 
-        /// <summary>
-        /// PostgreSQL image, pinned to an IMMUTABLE content digest for deterministic, reproducible test
-        /// runs (MJ-01). The digest identifies the exact image content in use at authoring time —
-        /// <b>PostgreSQL 18.4</b>, the same content the mutable <c>postgres:latest</c> tag currently
-        /// resolves to — so the suite can never be silently upgraded by a moving <c>latest</c> tag.
-        /// Docker resolves a digest reference against the local image cache first, so this stays
-        /// offline-friendly. Engine/credential parity with <c>docker-compose.yml</c> (REFERENCE ONLY; the
-        /// compose stack is never reused).
-        /// </summary>
-        private const string PostgresImage =
-            "postgres@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500";
+        // Container images are pinned by IMMUTABLE DIGEST (@sha256), never by a mutable rolling tag such
+        // as ":latest". This makes `docker pull` deterministic across environments and over time: a clean
+        // host resolves the exact same image bytes forever, so migrations/seeding/behaviour cannot silently
+        // drift when the upstream ":latest" (or even a floating major) is republished. This mirrors the
+        // suite's version-pinning philosophy for every other tool (AAP §0.2.2 / §0.7.2 — e.g. Testcontainers
+        // 3.9.0, Moq 4.18.4, FluentAssertions 6.12.0 are all pinned exactly) and resolves QA finding F-1.
+        //
+        // The chosen digests resolve to engine majors aligned with the net5-era production drivers the
+        // application actually targets — PostgreSQL 13.x (Npgsql.EntityFrameworkCore.PostgreSQL 5.0.7, the
+        // PG 9.6–13 era) and Redis 6.x (StackExchange.Redis 2.2.62) — which also matches the engine family
+        // used by docker-compose.yml (REFERENCE ONLY; the compose stack itself is never reused — these
+        // tests always run against isolated, disposable containers on dynamically-assigned host ports).
+        // To re-pin (e.g. for a security patch) run `docker pull postgres:13` / `docker pull redis:6` and
+        // copy the resulting `RepoDigests` value here, keeping the human-readable major in this comment.
 
         /// <summary>
-        /// Redis image, pinned to an IMMUTABLE content digest for deterministic, reproducible test runs
-        /// (MJ-01). The digest identifies the exact image content in use at authoring time — <b>Redis
-        /// 8.8.0</b>, the same content the mutable <c>redis:latest</c> tag currently resolves to. As with
-        /// PostgreSQL, a moving <c>latest</c> tag can never silently change the Redis version under test.
+        /// PostgreSQL image, pinned by immutable digest for reproducibility (resolves to <b>PostgreSQL
+        /// 13.x</b>, the net5-era Npgsql 5.0.7 driver family; engine parity with <c>docker-compose.yml</c>).
+        /// </summary>
+        private const string PostgresImage =
+            "postgres@sha256:4689940c683801b4ab839ab3b0a0a3555a5fe425371422310944e89eca7d8068";
+
+        /// <summary>
+        /// Redis image, pinned by immutable digest for reproducibility (resolves to <b>Redis 6.x</b>, the
+        /// net5-era StackExchange.Redis 2.2.62 driver family; engine parity with <c>docker-compose.yml</c>).
         /// </summary>
         private const string RedisImage =
-            "redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b";
+            "redis@sha256:e608fb94319e1aa53cecadbb051faa36d5c495f1142b99ca6673b41c2b428c0a";
 
         /// <summary>PostgreSQL superuser name (parity with <c>POSTGRES_USER</c> in <c>docker-compose.yml</c>).</summary>
         private const string PostgresUsername = "appuser";
@@ -446,8 +454,31 @@ namespace API.IntegrationTests.Infrastructure
             await using var connection = new NpgsqlConnection(storeConnectionString);
             await connection.OpenAsync();
 
-            using var command = new NpgsqlCommand($"CREATE DATABASE {IdentityDatabaseName};", connection);
-            await command.ExecuteNonQueryAsync();
+            // Defensive/idempotent guard (resolves QA finding I-1). PostgreSQL has no
+            // `CREATE DATABASE IF NOT EXISTS`, and a bare CREATE against an already-existing catalogue
+            // throws SQLSTATE 42P04. In the normal lifecycle this path is reached exactly once — each
+            // ContainerFixture owns a fresh, empty container and xUnit invokes InitializeAsync a single
+            // time — so `identity` is guaranteed absent here. This existence check simply makes a repeat
+            // invocation safe (a no-op) so the method is robust regardless of how it is called. The
+            // database name is compared as a parameter value (safe from injection); it cannot be
+            // parameterised in the CREATE statement below because it is an identifier, but it is a
+            // compile-time constant (not user input), so interpolation there is safe.
+            await using (var existsCommand = new NpgsqlCommand(
+                "SELECT 1 FROM pg_database WHERE datname = @databaseName;", connection))
+            {
+                existsCommand.Parameters.AddWithValue("databaseName", IdentityDatabaseName);
+                var alreadyExists = await existsCommand.ExecuteScalarAsync();
+                if (alreadyExists != null)
+                {
+                    return;
+                }
+            }
+
+            // CREATE DATABASE cannot execute inside a transaction; issuing it over a plain command on this
+            // open connection runs it in autocommit mode.
+            using var createCommand =
+                new NpgsqlCommand($"CREATE DATABASE {IdentityDatabaseName};", connection);
+            await createCommand.ExecuteNonQueryAsync();
         }
 
         /// <summary>
