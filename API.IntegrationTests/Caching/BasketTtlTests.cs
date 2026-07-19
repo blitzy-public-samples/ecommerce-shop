@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -44,10 +45,23 @@ namespace API.IntegrationTests.Caching
     /// </para>
     ///
     /// <para>
-    /// <b>Isolation.</b> The shared <c>"Integration"</c> collection runs sequentially, but to guarantee
-    /// keys never collide with sibling tests every test uses a fresh, unique basket id
-    /// (<c>basket-ttl-{Guid:N}</c>) and asserts against that exact key. No <c>FLUSHDB</c> and no
-    /// deletion of other keys is ever performed.
+    /// <b>Isolation (CR-01) + deterministic cleanup (MJ-04).</b> This class consumes
+    /// <see cref="ContainerFixture"/> as an <c>IClassFixture&lt;ContainerFixture&gt;</c>, so it owns its own
+    /// Redis instance and runs sequentially (assembly-wide parallelization is disabled). To guarantee keys
+    /// never collide with sibling tests within this class, every test uses a fresh, unique basket id
+    /// (<c>basket-ttl-{Guid:N}</c>) and asserts against that exact key. Each test records the key it writes
+    /// and <see cref="Dispose"/> deletes ONLY those keys — never a <c>FLUSHDB</c> and never any other key.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>Redis key isolation (CR-03) — scope note.</b> <c>BasketRepository</c> stores baskets under the
+    /// verbatim, un-namespaced key <c>basket.Id</c>, which shares one Redis database with the <c>[Cached]</c>
+    /// response entries, so a crafted basket id can collide with a response-cache key. Namespacing keys
+    /// (<c>basket:</c> / <c>response:</c>) and validating/authorizing basket ids are PRODUCTION changes,
+    /// <b>deferred / separately authorized</b> under this test-only engagement's frozen-production constraint
+    /// (AAP §0.8.2, §0.10.1). At the harness level the CR-01 per-class fixture already removes the
+    /// cross-class dimension (each class owns its own disposable Redis), and this class cleans up every key
+    /// it writes (MJ-04).
     /// </para>
     ///
     /// <para>
@@ -55,13 +69,12 @@ namespace API.IntegrationTests.Caching
     /// with an Arrange-Act-Assert structure and FluentAssertions (AAP §0.10.2).
     /// </para>
     /// </summary>
-    [Collection("Integration")]
-    public class BasketTtlTests : IDisposable
+    public class BasketTtlTests : IClassFixture<ContainerFixture>, IDisposable
     {
         /// <summary>
-        /// The shared, already-started/migrated/seeded Testcontainers fixture injected by xUnit for
-        /// every class in the <c>"Integration"</c> collection. Provides the in-process HTTP client
-        /// factory and the real Redis endpoint the application writes to.
+        /// This class's dedicated, already-started/migrated/seeded Testcontainers fixture injected by xUnit
+        /// (via <c>IClassFixture&lt;ContainerFixture&gt;</c>). Provides the in-process HTTP client factory
+        /// and the real Redis endpoint the application writes to.
         /// </summary>
         private readonly ContainerFixture _fixture;
 
@@ -76,10 +89,16 @@ namespace API.IntegrationTests.Caching
         private readonly IDatabase _db;
 
         /// <summary>
-        /// Constructs the test class. xUnit injects the shared <see cref="ContainerFixture"/> (the
-        /// containers are already running, migrated and seeded before this constructor executes).
+        /// Every basket (Redis) key this test instance writes, recorded so <see cref="Dispose"/> can delete
+        /// them deterministically (MJ-04), leaving this class's own Redis instance clean between its tests.
         /// </summary>
-        /// <param name="fixture">The shared integration fixture supplying the HTTP client and Redis endpoint.</param>
+        private readonly List<string> _writtenKeys = new List<string>();
+
+        /// <summary>
+        /// Constructs the test class. xUnit injects this class's dedicated <see cref="ContainerFixture"/>
+        /// (the containers are already running, migrated and seeded before this constructor executes).
+        /// </summary>
+        /// <param name="fixture">This class's isolated integration fixture supplying the HTTP client and Redis endpoint.</param>
         public BasketTtlTests(ContainerFixture fixture)
         {
             _fixture = fixture;
@@ -141,17 +160,18 @@ namespace API.IntegrationTests.Caching
         [Fact]
         public async Task UpdateBasketAsync_WhenBasketPostedViaApi_StoresKeyWith30DayTtl()
         {
-            // Arrange — a unique key so this test never collides with siblings in the shared collection.
+            // Arrange — a unique key so this test never collides with sibling tests in this class.
             var basketId = $"basket-ttl-{Guid.NewGuid():N}";
+            _writtenKeys.Add(basketId);
             using var content = BuildOneItemBasketContent(basketId);
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Pre-condition: the key must not exist before the POST (a fresh, unique id in real Redis).
             _db.KeyExists(basketId).Should().BeFalse("a freshly-generated basket id must not exist in Redis yet");
 
             // Act — post the basket through the genuine ASP.NET Core pipeline. UpdateBasketAsync awaits
             // the Redis write before this response returns, so the key/TTL are queryable immediately.
-            var response = await client.PostAsync("api/basket", content);
+            using var response = await client.PostAsync("api/basket", content);
 
             // Assert — the write succeeded and the ~30-day TTL was applied to the verbatim basket key.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -182,14 +202,15 @@ namespace API.IntegrationTests.Caching
         {
             // Arrange — unique key; post the one-item basket and confirm it was accepted.
             var basketId = $"basket-ttl-{Guid.NewGuid():N}";
+            _writtenKeys.Add(basketId);
             using var content = BuildOneItemBasketContent(basketId);
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
-            var postResponse = await client.PostAsync("api/basket", content);
+            using var postResponse = await client.PostAsync("api/basket", content);
             postResponse.StatusCode.Should().Be(HttpStatusCode.OK, "the one-item basket satisfies all model-validation rules");
 
             // Act — read the basket back through the pipeline; it is re-read from real Redis by the controller.
-            var getResp = await client.GetAsync($"api/basket?id={basketId}");
+            using var getResp = await client.GetAsync($"api/basket?id={basketId}");
             var getBody = await getResp.Content.ReadAsStringAsync();
 
             // Assert (round-trip through real Redis) — the persisted basket comes back with its id + item.
@@ -210,9 +231,23 @@ namespace API.IntegrationTests.Caching
         }
 
         /// <summary>
-        /// Disposes the dedicated Redis multiplexer opened by this test class so no connection leaks
-        /// between tests. The shared containers themselves are owned and disposed by <see cref="ContainerFixture"/>.
+        /// Deletes every basket key this test instance wrote (MJ-04 deterministic cleanup) and then disposes
+        /// the dedicated Redis multiplexer opened by this test class so no connection leaks between tests. The
+        /// containers themselves are owned and disposed by this class's <see cref="ContainerFixture"/>.
         /// </summary>
-        public void Dispose() => _redis?.Dispose();
+        public void Dispose()
+        {
+            try
+            {
+                foreach (var key in _writtenKeys)
+                {
+                    _db.KeyDelete(key);
+                }
+            }
+            finally
+            {
+                _redis?.Dispose();
+            }
+        }
     }
 }

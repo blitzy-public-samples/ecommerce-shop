@@ -54,8 +54,8 @@ namespace API.IntegrationTests.Resilience
     /// <c>finally</c> block, and the spawned process is killed by pid (never a broad signal). Readiness is
     /// established by <b>polling</b> the captured output and the TCP port (a wait strategy), never a fixed
     /// <c>Thread.Sleep</c>, so the test is deterministic and needs <b>no Docker/Testcontainers</b> (an
-    /// unreachable endpoint needs no container). Accordingly this class is intentionally NOT part of the
-    /// shared <c>"Integration"</c> collection.
+    /// unreachable endpoint needs no container). Accordingly this class needs no container fixture at all and
+    /// is not part of any shared collection.
     /// </para>
     ///
     /// <para>
@@ -116,7 +116,8 @@ namespace API.IntegrationTests.Resilience
             startInfo.ArgumentList.Add(apiDll);
 
             // ProcessStartInfo.Environment is pre-seeded from the current process; override only the keys
-            // that force a genuine migration failure and isolate all machine-global state.
+            // that force a genuine migration failure and isolate all machine-global state (including the
+            // ambient logging configuration — see the MJ-15 note below).
             startInfo.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";                    // no dependency on appsettings.Development.json
             startInfo.Environment["ASPNETCORE_URLS"] = $"http://127.0.0.1:{port}";              // HTTP-only ephemeral bind (no dev cert needed)
             startInfo.Environment["ConnectionStrings__DefaultConnection"] = UnreachableConnectionString;
@@ -128,6 +129,20 @@ namespace API.IntegrationTests.Resilience
             startInfo.Environment["HOME"] = homeDir;                                            // isolate Data Protection key ring under the temp tree
             startInfo.Environment["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1";
             startInfo.Environment["DOTNET_NOLOGO"] = "1";
+
+            // MJ-15 — pin the child's logging levels EXPLICITLY. Because ProcessStartInfo.Environment is
+            // seeded from this (parent) process, the child would otherwise INHERIT any ambient logging
+            // override such as `Logging__LogLevel__Default=Critical`. That would SUPPRESS the Error-level log
+            // the production Program.Main writes on migration failure ("An error occured during migration",
+            // category "API.Program"), leaving the readiness poll to spin for the full timeout and fail
+            // spuriously (the ~120 s failure this test previously exhibited). Overriding these keys guarantees
+            // the required Error log is emitted regardless of the ambient configuration, and keeps framework
+            // (Microsoft.*) chatter down so the captured output stays focused. NOTE the dotted category name:
+            // "API.Program" maps to the config key "Logging:LogLevel:API.Program"; only the ':' separators
+            // become '__' as an env var, while the '.' inside the category name is preserved.
+            startInfo.Environment["Logging__LogLevel__Default"] = "Information";                // permits Error (>= Information)
+            startInfo.Environment["Logging__LogLevel__Microsoft"] = "Warning";                  // trim EF/hosting noise; errors still surface
+            startInfo.Environment["Logging__LogLevel__API.Program"] = "Information";            // guarantee the production migration-error log
 
             var output = new StringBuilder();
             var sync = new object();
@@ -194,7 +209,9 @@ namespace API.IntegrationTests.Resilience
                 process.HasExited.Should().BeFalse(
                     "the production host must keep running (fail-closed continuity to host.Run()). " + diagnostic);
 
-                // Isolation + logging: the real production catch logged the migration failure.
+                // Isolation + logging: the real production catch logged the migration failure. (MJ-15: the
+                // child's logging levels are pinned in the environment block above so this Error-level log is
+                // never suppressed by an inherited ambient override such as Logging__LogLevel__Default=Critical.)
                 captured.Should().Contain(ProductionMigrationErrorMessage,
                     "Program.Main's catch must log the migration failure. " + diagnostic);
 

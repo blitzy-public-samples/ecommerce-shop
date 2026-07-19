@@ -9,6 +9,8 @@ using API.Dtos;
 using API.IntegrationTests.Infrastructure;
 using Core.Entities;
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;  // CreateScope, GetRequiredService (MJ-04 cleanup)
+using StackExchange.Redis;                        // IConnectionMultiplexer — MJ-04 Redis key cleanup
 using Xunit;
 
 namespace API.IntegrationTests.Concurrency
@@ -33,8 +35,8 @@ namespace API.IntegrationTests.Concurrency
     ///
     /// <para>
     /// <b>Real infrastructure only (AAP §0.10.1).</b> Nothing is mocked: the Testcontainers Redis instance
-    /// supplied by the shared <see cref="ContainerFixture"/> and the in-process HTTP transport are both
-    /// genuine, and the shared <c>docker-compose</c> stack is never reused (Testcontainers assigns dynamic
+    /// supplied by this class's dedicated <see cref="ContainerFixture"/> and the in-process HTTP transport
+    /// are both genuine, and the shared <c>docker-compose</c> stack is never reused (Testcontainers assigns dynamic
     /// ports). Concurrency is driven exclusively via a single <see cref="Task.WhenAll(System.Collections.Generic.IEnumerable{Task})"/>
     /// over all requests — there is no <c>Thread.Sleep</c>; the fixture guarantees container readiness via
     /// its wait strategies before any test runs. All test code is isolated in this file and no production
@@ -42,12 +44,12 @@ namespace API.IntegrationTests.Concurrency
     /// </para>
     ///
     /// <para>
-    /// <b>Shared collection.</b> This class joins the shared <c>"Integration"</c> collection (via
-    /// <c>[Collection("Integration")]</c>) so it reuses the one already-started PostgreSQL + Redis pair and
-    /// the wired <see cref="CustomWebApplicationFactory"/>. It uses the anonymous
+    /// <b>Per-class isolated containers (CR-01).</b> This class consumes <see cref="ContainerFixture"/> as
+    /// an <c>IClassFixture&lt;ContainerFixture&gt;</c>, so it owns a dedicated already-started PostgreSQL +
+    /// Redis pair and its own wired <see cref="CustomWebApplicationFactory"/>. It uses the anonymous
     /// <see cref="ContainerFixture.CreateClient"/> (no bearer token) because the basket endpoints are not
     /// gated by <c>[Authorize]</c>. Each test uses <b>unique GUID-based basket ids</b> so its keys never
-    /// collide with sibling tests on the shared Redis instance.
+    /// collide with sibling tests within this class's Redis instance.
     /// </para>
     ///
     /// <para>
@@ -55,8 +57,7 @@ namespace API.IntegrationTests.Concurrency
     /// Arrange-Act-Assert structure and FluentAssertions.
     /// </para>
     /// </summary>
-    [Collection("Integration")]
-    public class BasketConcurrencyTests
+    public class BasketConcurrencyTests : IClassFixture<ContainerFixture>
     {
         /// <summary>Number of simultaneous <c>POST api/basket</c> requests fired per test.</summary>
         private const int ConcurrentRequestCount = 20;
@@ -69,16 +70,15 @@ namespace API.IntegrationTests.Concurrency
         private const decimal TestItemPrice = 10.5m;
 
         /// <summary>
-        /// Shared fixture (started once for the whole <c>"Integration"</c> collection) providing the real
-        /// Testcontainers PostgreSQL + Redis and the wired in-process host. Injected by xUnit through the
-        /// collection fixture.
+        /// This class's dedicated fixture (started once for THIS class) providing the real Testcontainers
+        /// PostgreSQL + Redis and the wired in-process host. Injected by xUnit through the class fixture.
         /// </summary>
         private readonly ContainerFixture _fixture;
 
         /// <summary>
-        /// Receives the shared <see cref="ContainerFixture"/> from xUnit's collection-fixture machinery.
+        /// Receives this class's dedicated <see cref="ContainerFixture"/> from xUnit's class-fixture machinery.
         /// </summary>
-        /// <param name="fixture">The shared container fixture for the <c>"Integration"</c> collection.</param>
+        /// <param name="fixture">This class's isolated container fixture.</param>
         public BasketConcurrencyTests(ContainerFixture fixture) => _fixture = fixture;
 
         /// <summary>
@@ -137,6 +137,10 @@ namespace API.IntegrationTests.Concurrency
                 {
                     response?.Dispose();
                 }
+
+                // MJ-04 deterministic cleanup: delete every basket key this test wrote to Redis so no key
+                // lingers in this class's cache between its tests.
+                await CleanupBasketsAsync(ids);
             }
         }
 
@@ -187,6 +191,22 @@ namespace API.IntegrationTests.Concurrency
                     basket.Items.Should().HaveCount(2,
                         "each response echoes the canonical 2-item payload, never a torn/merged document");
                 }
+
+                // Assert (final Redis state via GET): because every concurrent write sent an IDENTICAL
+                // payload, the value persisted in Redis is deterministic despite the write race — so the
+                // stored basket must be a coherent 2-item document matching the canonical payload exactly.
+                using var getResponse = await client.GetAsync($"api/basket?id={basketId}");
+                getResponse.StatusCode.Should().Be(HttpStatusCode.OK,
+                    "the basket persisted in Redis must be retrievable through the real pipeline");
+
+                var finalBasket = await getResponse.Content.ReadFromJsonAsync<CustomerBasket>();
+                AssertWellFormed(finalBasket, basketId);
+                finalBasket.Items.Should().HaveCount(2,
+                    "the persisted basket must contain exactly the two canonical items " +
+                    "(proving the stored document is not corrupted, partial, or merged)");
+                finalBasket.Items.Should().OnlyContain(
+                    bi => bi.Quantity == 1 && bi.Price == TestItemPrice,
+                    "every persisted item must match the canonical payload, confirming a coherent final state");
             }
             finally
             {
@@ -194,23 +214,10 @@ namespace API.IntegrationTests.Concurrency
                 {
                     response?.Dispose();
                 }
+
+                // MJ-04 deterministic cleanup: delete the basket key this test wrote to Redis.
+                await CleanupBasketsAsync(new[] { basketId });
             }
-
-            // Assert (final Redis state via GET): because every concurrent write sent an IDENTICAL payload,
-            // the value persisted in Redis is deterministic despite the write race — so the stored basket
-            // must be a coherent 2-item document matching the canonical payload exactly.
-            using var getResponse = await client.GetAsync($"api/basket?id={basketId}");
-            getResponse.StatusCode.Should().Be(HttpStatusCode.OK,
-                "the basket persisted in Redis must be retrievable through the real pipeline");
-
-            var finalBasket = await getResponse.Content.ReadFromJsonAsync<CustomerBasket>();
-            AssertWellFormed(finalBasket, basketId);
-            finalBasket.Items.Should().HaveCount(2,
-                "the persisted basket must contain exactly the two canonical items " +
-                "(proving the stored document is not corrupted, partial, or merged)");
-            finalBasket.Items.Should().OnlyContain(
-                bi => bi.Quantity == 1 && bi.Price == TestItemPrice,
-                "every persisted item must match the canonical payload, confirming a coherent final state");
         }
 
         // ----------------------------------------------------------------------------------------------
@@ -263,6 +270,23 @@ namespace API.IntegrationTests.Concurrency
             basket.Items.Should().OnlyContain(
                 bi => bi.Quantity >= 1 && bi.Price >= 0.1m,
                 "every deserialized item must be non-corrupted (a valid quantity and price)");
+        }
+
+        /// <summary>
+        /// MJ-04 deterministic cleanup: deletes each given basket key from the real Redis instance (a basket
+        /// id IS its Redis key) through the application's own <see cref="IConnectionMultiplexer"/>, so no key
+        /// this test wrote lingers in this class's cache between its tests.
+        /// </summary>
+        /// <param name="basketIds">The basket ids / Redis keys to delete.</param>
+        private async Task CleanupBasketsAsync(IEnumerable<string> basketIds)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var database = scope.ServiceProvider.GetRequiredService<IConnectionMultiplexer>().GetDatabase();
+
+            foreach (var basketId in basketIds)
+            {
+                await database.KeyDeleteAsync(basketId);
+            }
         }
 
         /// <summary>

@@ -211,7 +211,13 @@ namespace API.IntegrationTests.Infrastructure
                     services.Remove(paymentServiceDescriptor);
                 }
 
-                services.AddScoped<IPaymentService, StripePaymentServiceStub>();
+                // MJ-09: register the stub as a SINGLETON (not Scoped). This makes delegation observable —
+                // the instance the controller resolves within each request scope is the SAME instance a
+                // webhook test resolves from Factory.Services, so the stub's recorded Calls reflect exactly
+                // the controller's delegations. The stub holds only in-memory, thread-safe call metadata and
+                // returns deterministic values (and has no injected dependencies), so a singleton lifetime is
+                // safe: a scoped/transient consumer depending on a singleton is always a valid DI lifetime.
+                services.AddSingleton<IPaymentService, StripePaymentServiceStub>();
             });
 
             // NOTE: Program.Main is intentionally NOT invoked and no migration/seed is run here — that is
@@ -253,10 +259,12 @@ namespace API.IntegrationTests.Infrastructure
             if (!response.IsSuccessStatusCode)
             {
                 var errorBody = await response.Content.ReadAsStringAsync();
+                // MD-04: log only the response schema (top-level field names), never the raw body, which
+                // could carry sensitive material on some failure envelopes.
                 throw new InvalidOperationException(
                     $"Login failed for '{email}': HTTP {(int)response.StatusCode} ({response.StatusCode}). " +
                     "Ensure ContainerFixture has migrated and seeded the identity database (so the user " +
-                    $"exists) before requesting a token. Response body: {errorBody}");
+                    $"exists) before requesting a token. Response schema: {DescribeJsonSchema(errorBody)}");
             }
 
             var json = await response.Content.ReadAsStringAsync();
@@ -264,9 +272,12 @@ namespace API.IntegrationTests.Infrastructure
 
             if (string.IsNullOrWhiteSpace(user?.Token))
             {
+                // MD-04: a SUCCESSFUL login response body contains a valid JWT, so it must never be logged
+                // verbatim. Emit only the response schema (field names present) so a genuinely missing/
+                // mis-cased token field is still diagnosable without leaking a credential.
                 throw new InvalidOperationException(
                     $"Login for '{email}' returned HTTP {(int)response.StatusCode} but no JWT was present " +
-                    $"in the response. Response body: {json}");
+                    $"in the response. Response schema: {DescribeJsonSchema(json)} (body redacted — MD-04).");
             }
 
             return user.Token;
@@ -327,6 +338,38 @@ namespace API.IntegrationTests.Infrastructure
                     "and RedisConnectionString to be set to the Testcontainers endpoints BEFORE the first " +
                     "client is created. ContainerFixture owns these dynamic connection strings; the factory " +
                     "must never fall back to the shared docker-compose ports (5432/6379).");
+            }
+        }
+
+        /// <summary>
+        /// Produces a redacted, non-sensitive description of a JSON response for diagnostics (MD-04): only
+        /// the top-level property NAMES (the response schema) are reported — never their values — so a
+        /// message can convey response shape without ever leaking a JWT or other sensitive field. Returns a
+        /// safe placeholder for empty, non-object, or unparseable payloads.
+        /// </summary>
+        /// <param name="json">The raw response body to describe (its values are never emitted).</param>
+        /// <returns>A schema description such as <c>fields: [token, email, displayName]</c>.</returns>
+        private static string DescribeJsonSchema(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return "<empty response body>";
+            }
+
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                if (document.RootElement.ValueKind != JsonValueKind.Object)
+                {
+                    return $"<non-object {document.RootElement.ValueKind} payload>";
+                }
+
+                var fieldNames = document.RootElement.EnumerateObject().Select(property => property.Name);
+                return $"fields: [{string.Join(", ", fieldNames)}]";
+            }
+            catch (JsonException)
+            {
+                return "<unparseable JSON body>";
             }
         }
 

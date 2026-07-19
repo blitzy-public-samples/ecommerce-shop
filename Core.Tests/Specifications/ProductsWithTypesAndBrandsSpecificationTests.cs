@@ -275,7 +275,7 @@ namespace Core.Tests.Specifications
         // ---------------------------------------------------------------------------------------
 
         [Fact]
-        public void IdConstructor_SetsCriteriaMatchingThatId()
+        public void IdConstructor_WithId_SetsCriteriaMatchingThatId()
         {
             // Act
             var spec = new ProductsWithTypesAndBrandsSpecification(5);
@@ -288,7 +288,7 @@ namespace Core.Tests.Specifications
         }
 
         [Fact]
-        public void IdConstructor_AddsProductTypeAndProductBrandIncludes()
+        public void IdConstructor_WithId_AddsProductTypeAndProductBrandIncludes()
         {
             // Act
             var spec = new ProductsWithTypesAndBrandsSpecification(5);
@@ -305,7 +305,7 @@ namespace Core.Tests.Specifications
         }
 
         [Fact]
-        public void IdConstructor_DoesNotEnablePagingOrOrdering()
+        public void IdConstructor_WithId_DoesNotEnablePagingOrOrdering()
         {
             // Act
             var spec = new ProductsWithTypesAndBrandsSpecification(5);

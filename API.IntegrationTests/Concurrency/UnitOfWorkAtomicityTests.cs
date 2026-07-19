@@ -7,6 +7,7 @@ using FluentAssertions;                          // Fluent, diagnostic assertion
 using Infrastructure.Data;                       // StoreContext + UnitOfWork — the system under test
 using Microsoft.EntityFrameworkCore;             // CountAsync, DbUpdateException
 using Microsoft.Extensions.DependencyInjection;  // CreateScope, GetRequiredService
+using Npgsql;                                     // PostgresException — SqlState / ConstraintName (MD-02)
 using Xunit;
 
 namespace API.IntegrationTests.Concurrency
@@ -14,9 +15,9 @@ namespace API.IntegrationTests.Concurrency
     /// <summary>
     /// Integration tests proving the <b>transactional atomicity</b> of
     /// <see cref="Infrastructure.Data.UnitOfWork.Complete"/> <b>across multiple repositories</b>, exercised
-    /// against a <b>real</b> PostgreSQL database provisioned by Testcontainers through the shared
-    /// <see cref="ContainerFixture"/> (AAP §0.10.1 — real infrastructure only; never the shared
-    /// <c>docker-compose</c> stack, never a mock).
+    /// against a <b>real</b> PostgreSQL database provisioned by Testcontainers through this class's own
+    /// <see cref="ContainerFixture"/> (an <c>IClassFixture</c> — CR-01) (AAP §0.10.1 — real infrastructure
+    /// only; never the shared <c>docker-compose</c> stack, never a mock).
     ///
     /// <para>
     /// <b>SUT behaviour under test.</b> <c>UnitOfWork.Repository&lt;TEntity&gt;()</c> lazily creates and
@@ -56,12 +57,14 @@ namespace API.IntegrationTests.Concurrency
     /// </para>
     ///
     /// <para>
-    /// <b>Shared database — DELTA assertions only.</b> The whole <c>"Integration"</c> collection shares one
-    /// seeded database, and xUnit runs the classes in a collection sequentially. These tests therefore
-    /// NEVER assert absolute row counts; they compare a <i>before</i> snapshot to an <i>after</i> snapshot
-    /// (taken in a FRESH scope, so no stale change-tracking masks the persisted truth) and assert the
-    /// deltas. The positive-control test additionally removes the row it commits so sibling classes that
-    /// DO assert absolute counts (e.g. the migration tests) remain correct regardless of execution order.
+    /// <b>DELTA assertions + deterministic cleanup.</b> Under CR-01 this class owns its own isolated,
+    /// disposable database (an <c>IClassFixture&lt;ContainerFixture&gt;</c>), but its two tests still share
+    /// that one database and xUnit runs a class's tests sequentially. To stay robust to execution order and
+    /// re-runs these tests therefore NEVER assert absolute row counts; they compare a <i>before</i> snapshot
+    /// to an <i>after</i> snapshot (taken in a FRESH scope, so no stale change-tracking masks the persisted
+    /// truth) and assert the deltas. The positive-control test additionally removes the row it commits in a
+    /// <c>finally</c> block (MJ-04 deterministic cleanup) so the sibling test's before/after deltas are
+    /// unaffected regardless of intra-class execution order.
     /// </para>
     ///
     /// <para>
@@ -70,8 +73,7 @@ namespace API.IntegrationTests.Concurrency
     /// <c>Thread.Sleep</c> or retry loop is used (a running Docker daemon is required for Testcontainers).
     /// </para>
     /// </summary>
-    [Collection("Integration")]
-    public class UnitOfWorkAtomicityTests
+    public class UnitOfWorkAtomicityTests : IClassFixture<ContainerFixture>
     {
         /// <summary>
         /// A delivery-method identifier that is guaranteed NOT to exist in the seeded
@@ -89,17 +91,18 @@ namespace API.IntegrationTests.Concurrency
         private const string DeliveryMethodIdShadowProperty = "DeliveryMethodId";
 
         /// <summary>
-        /// The shared fixture exposing the wired <c>CustomWebApplicationFactory</c> (and thus the
-        /// application's real service provider) over the Testcontainers PostgreSQL/Redis endpoints.
-        /// Injected by xUnit because this class joins the <c>"Integration"</c> collection.
+        /// This class's dedicated fixture exposing the wired <c>CustomWebApplicationFactory</c> (and thus
+        /// the application's real service provider) over the Testcontainers PostgreSQL/Redis endpoints.
+        /// Injected by xUnit because this class implements <c>IClassFixture&lt;ContainerFixture&gt;</c>.
         /// </summary>
         private readonly ContainerFixture _fixture;
 
         /// <summary>
-        /// xUnit injects the single shared <see cref="ContainerFixture"/> for the <c>"Integration"</c>
-        /// collection so this class runs against the already-started, migrated and seeded containers.
+        /// xUnit injects this class's dedicated <see cref="ContainerFixture"/>
+        /// (<c>IClassFixture&lt;ContainerFixture&gt;</c>) so this class runs against its own already-started,
+        /// migrated and seeded containers.
         /// </summary>
-        /// <param name="fixture">The shared container fixture supplied by the collection.</param>
+        /// <param name="fixture">This class's isolated container fixture.</param>
         public UnitOfWorkAtomicityTests(ContainerFixture fixture)
         {
             _fixture = fixture;
@@ -186,11 +189,28 @@ namespace API.IntegrationTests.Concurrency
 
                 // Act & Assert (failure surfaced) — one SaveChangesAsync => one transaction. The order's FK
                 // violation is the only possible failure (the sibling is valid), and it must bubble up as a
-                // DbUpdateException; it is asserted, never swallowed.
+                // DbUpdateException; it is captured (not swallowed) so its ROOT CAUSE can be interrogated.
                 Func<Task> act = async () => await uow.Complete();
-                await act.Should().ThrowAsync<DbUpdateException>(
+                var thrown = await act.Should().ThrowAsync<DbUpdateException>(
                     "the order's DeliveryMethodId references a non-existent DeliveryMethod, so PostgreSQL " +
                     "rejects the INSERT with foreign-key violation 23503");
+
+                // MD-02: assert the failure is PRECISELY the intended delivery-method foreign-key violation,
+                // not some incidental error that merely happens to surface as a DbUpdateException. Npgsql
+                // wraps the underlying database failure as a PostgresException on InnerException, exposing
+                // both the SQLSTATE code and the exact violated constraint name — so both are asserted.
+                var postgresException = thrown.Which.InnerException
+                    .Should().BeOfType<PostgresException>(
+                        "Npgsql surfaces the underlying database failure as the DbUpdateException's inner " +
+                        "PostgresException")
+                    .Which;
+                postgresException.SqlState.Should().Be("23503",
+                    "SQLSTATE 23503 is PostgreSQL's foreign-key-violation code " +
+                    "(Npgsql PostgresErrorCodes.ForeignKeyViolation)");
+                postgresException.ConstraintName.Should().Be("FK_Orders_DeliveryMethods_DeliveryMethodId",
+                    "the violated constraint is the Orders->DeliveryMethods shadow foreign key, confirming " +
+                    "the failure is the intended non-existent delivery-method reference and not an " +
+                    "unrelated constraint");
             }
 
             // Assert (rollback / no orphans) — snapshot AFTER in a FRESH scope so the persisted truth is
@@ -215,7 +235,7 @@ namespace API.IntegrationTests.Concurrency
         /// it proves the SAME code path (<see cref="UnitOfWork"/> + repository <c>Add</c> + <c>Complete</c>)
         /// genuinely persists rows when nothing violates a constraint, so the rollback test's zero-delta
         /// result is meaningful (something really was being inserted) rather than a no-op. The committed
-        /// order is removed afterwards to keep the shared collection database pristine.
+        /// order is removed afterwards to keep this class's database pristine.
         /// </summary>
         [Fact]
         public async Task Complete_WhenAllEntitiesValid_CommitsAllAndReturnsPositive()
@@ -275,15 +295,15 @@ namespace API.IntegrationTests.Concurrency
             }
             finally
             {
-                // Keep the SHARED collection database pristine: remove the committed order so sibling
-                // classes that assert ABSOLUTE counts are unaffected regardless of execution order within
-                // the sequentially-run "Integration" collection.
+                // MJ-04 deterministic cleanup: remove the committed order so this class's own database is
+                // restored between its sequentially-run tests, keeping the sibling test's before/after
+                // deltas unaffected regardless of intra-class execution order.
                 await CleanupOrderAsync(committedOrderId);
             }
         }
 
         /// <summary>
-        /// Removes the given order (by primary key) in a fresh scope, restoring the shared database to its
+        /// Removes the given order (by primary key) in a fresh scope, restoring this class's database to its
         /// pre-test state. Deleting the order also removes its order items: the
         /// <c>FK_OrderItems_Orders_OrderId</c> constraint is declared <c>onDelete: Cascade</c>, so
         /// PostgreSQL cascades the delete.

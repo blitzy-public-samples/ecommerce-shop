@@ -64,7 +64,7 @@ namespace Core.Tests.Specifications
         // ---------------------------------------------------------------------------------------
 
         [Fact]
-        public void EmailConstructor_SetsCriteriaMatchingBuyerEmail()
+        public void EmailConstructor_WithBuyerEmail_SetsCriteriaMatchingBuyerEmail()
         {
             // Arrange & Act
             var spec = new OrdersWithItemsAndOrderingSpecification(MatchingEmail);
@@ -78,7 +78,7 @@ namespace Core.Tests.Specifications
         }
 
         [Fact]
-        public void EmailConstructor_AddsOrderItemsAndDeliveryMethodIncludes()
+        public void EmailConstructor_WithBuyerEmail_AddsOrderItemsAndDeliveryMethodIncludes()
         {
             // Arrange & Act
             var spec = new OrdersWithItemsAndOrderingSpecification(MatchingEmail);
@@ -97,7 +97,7 @@ namespace Core.Tests.Specifications
         }
 
         [Fact]
-        public void EmailConstructor_OrdersByOrderDateDescending()
+        public void EmailConstructor_WithBuyerEmail_OrdersByOrderDateDescending()
         {
             // Arrange
             var spec = new OrdersWithItemsAndOrderingSpecification(MatchingEmail);
@@ -115,7 +115,7 @@ namespace Core.Tests.Specifications
         }
 
         [Fact]
-        public void EmailConstructor_DoesNotEnablePaging()
+        public void EmailConstructor_WithBuyerEmail_DoesNotEnablePaging()
         {
             // Arrange & Act
             var spec = new OrdersWithItemsAndOrderingSpecification(MatchingEmail);
@@ -162,7 +162,7 @@ namespace Core.Tests.Specifications
         }
 
         [Fact]
-        public void IdAndEmailConstructor_AddsOrderItemsAndDeliveryMethodIncludes()
+        public void IdAndEmailConstructor_WithIdAndEmail_AddsOrderItemsAndDeliveryMethodIncludes()
         {
             // Arrange & Act
             var spec = new OrdersWithItemsAndOrderingSpecification(3, MatchingEmail);
@@ -179,7 +179,7 @@ namespace Core.Tests.Specifications
         }
 
         [Fact]
-        public void IdAndEmailConstructor_DoesNotSetOrdering()
+        public void IdAndEmailConstructor_WithIdAndEmail_DoesNotSetOrdering()
         {
             // Arrange & Act
             var spec = new OrdersWithItemsAndOrderingSpecification(3, MatchingEmail);

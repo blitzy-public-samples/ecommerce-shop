@@ -16,7 +16,7 @@ namespace API.IntegrationTests.Contract
     /// for the whole API surface (AAP §0.1.1 Part B, §0.4.1, §0.5.1/§0.5.2): it drives the <b>real</b>
     /// ASP.NET Core application in-process — through the shared <see cref="CustomWebApplicationFactory"/>
     /// over genuine <see cref="HttpClient"/>s — against <b>real</b> PostgreSQL and Redis provisioned by
-    /// Testcontainers (via the shared <see cref="ContainerFixture"/>) with the documented seed data, and
+    /// Testcontainers (via this class's dedicated <see cref="ContainerFixture"/>) with the documented seed data, and
     /// asserts the <b>status code</b> plus the <b>serialized JSON DTO shape</b> for <b>every documented
     /// endpoint</b> across <c>API/Controllers/*</c>. If any controller's route, HTTP status code, or
     /// serialized property names/casing change, a test here fails.
@@ -32,12 +32,13 @@ namespace API.IntegrationTests.Contract
     /// </para>
     ///
     /// <para>
-    /// <b>Shared containers, one set per collection.</b> The class is annotated
-    /// <c>[Collection("Integration")]</c> and receives the shared <see cref="ContainerFixture"/> through its
-    /// constructor, so it joins the single set of containers started once and disposed once for the whole
-    /// integration suite (never a destructive test — this class only reads/echoes, never stops a container).
-    /// Any state created in the shared containers is uniquely keyed with a <see cref="Guid"/> (basket ids,
-    /// registration e-mails) so it can never collide with sibling classes.
+    /// <b>Per-class isolated containers (CR-01).</b> The class consumes <see cref="ContainerFixture"/> as an
+    /// <c>IClassFixture&lt;ContainerFixture&gt;</c>, so xUnit provisions a dedicated PostgreSQL + Redis pair
+    /// (and in-process host) for THIS class alone — started once before its first test and disposed once
+    /// after its last (AAP §0.10.1; binding Rule 1). This class is never destructive: it only reads/echoes,
+    /// never stops a container. State it creates is still uniquely keyed with a <see cref="Guid"/> (basket
+    /// ids, registration e-mails) so tests within the class cannot collide, and nothing can leak to any
+    /// other class's isolated containers.
     /// </para>
     ///
     /// <para>
@@ -52,18 +53,18 @@ namespace API.IntegrationTests.Contract
     /// Arrange-Act-Assert structure and FluentAssertions.
     /// </para>
     /// </summary>
-    [Collection("Integration")]
-    public class EndpointContractRegressionTests
+    public class EndpointContractRegressionTests : IClassFixture<ContainerFixture>
     {
-        /// <summary>Shared, already-started PostgreSQL + Redis + in-process host harness (injected by xUnit).</summary>
+        /// <summary>This class's dedicated, already-started PostgreSQL + Redis + in-process host harness (injected by xUnit).</summary>
         private readonly ContainerFixture _fixture;
 
         /// <summary>
-        /// Receives the shared <see cref="ContainerFixture"/> for the <c>"Integration"</c> collection. xUnit
-        /// constructs one fixture for the whole collection and injects the same instance into every class
-        /// annotated <c>[Collection("Integration")]</c>.
+        /// Receives this class's dedicated <see cref="ContainerFixture"/>. Because the class implements
+        /// <c>IClassFixture&lt;ContainerFixture&gt;</c>, xUnit constructs exactly one fixture for THIS class
+        /// (its <c>IAsyncLifetime</c> runs once before the first test and once after the last) and injects
+        /// it here.
         /// </summary>
-        /// <param name="fixture">The shared container/host fixture.</param>
+        /// <param name="fixture">This class's isolated container/host fixture.</param>
         public EndpointContractRegressionTests(ContainerFixture fixture)
         {
             _fixture = fixture;
@@ -106,6 +107,93 @@ namespace API.IntegrationTests.Contract
             }
         }
 
+        /// <summary>
+        /// Seeds a real single-item <c>CustomerBasket</c> in Redis so that
+        /// <c>OrderService.CreateOrderAsync</c> can build a genuine order server-side (MJ-12). A genuinely
+        /// seeded product is discovered via <c>GET api/products</c> (ids are DB-assigned, so never
+        /// hardcoded) and echoed into a <c>BasketItemDto</c> that satisfies every <c>[Required]</c>/
+        /// <c>[Range]</c> rule; the basket is persisted with <c>POST api/basket</c>. Returns the
+        /// uniquely-keyed basket id so the caller can delete the Redis key in a <c>finally</c>
+        /// (MJ-04 deterministic cleanup). All intermediate responses are disposed (MD-01).
+        /// </summary>
+        /// <param name="client">The HTTP client used to seed the basket.</param>
+        /// <returns>The unique basket id of the seeded single-item basket.</returns>
+        private async Task<string> SeedRealSingleItemBasketAsync(HttpClient client)
+        {
+            using var productsResponse = await client.GetAsync("api/products");
+            productsResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+            var product = (await ReadRootAsync(productsResponse)).GetProperty("data")[0];
+
+            var basketId = "contract-order-" + Guid.NewGuid();
+            var payload = new
+            {
+                id = basketId,
+                items = new[]
+                {
+                    new
+                    {
+                        // BasketItemDto: every member is [Required]; id is the product id the server
+                        // re-prices authoritatively in CreateOrderAsync (client price is never trusted).
+                        id = product.GetProperty("id").GetInt32(),
+                        productName = product.GetProperty("name").GetString(),
+                        price = product.GetProperty("price").GetDecimal(),
+                        quantity = 1,
+                        pictureUrl = product.GetProperty("pictureUrl").GetString(),
+                        brand = product.GetProperty("productBrand").GetString(),
+                        type = product.GetProperty("productType").GetString()
+                    }
+                },
+                shippingPrice = 0m
+            };
+
+            using var basketResponse = await client.PostAsJsonAsync("api/basket", payload);
+            basketResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+            return basketId;
+        }
+
+        /// <summary>
+        /// Posts a valid <c>OrderDto</c> (delivery method 1 and a complete, <c>[Required]</c>-satisfying
+        /// address) for the already-seeded <paramref name="basketId"/>, asserts <c>200 OK</c>, and returns
+        /// the created order's <c>id</c>. Used by the order-detail and cross-buyer-isolation tests that need
+        /// a real, owned order id. The response is disposed (MD-01).
+        /// </summary>
+        /// <param name="client">An authenticated HTTP client (the order is owned by that client's user).</param>
+        /// <param name="basketId">The id of a basket already seeded via <see cref="SeedRealSingleItemBasketAsync"/>.</param>
+        /// <returns>The DB-assigned id of the newly created order.</returns>
+        private async Task<int> CreateOrderReturningIdAsync(HttpClient client, string basketId)
+        {
+            using var response = await client.PostAsJsonAsync("api/orders", new
+            {
+                basketId,
+                deliveryMethodId = 1,
+                shipToAddress = new
+                {
+                    id = 1,
+                    firstName = "Bob",
+                    lastName = "Bobbity",
+                    street = "10 The Street",
+                    city = "NY",
+                    state = "NY",
+                    zipCode = "90210"
+                }
+            });
+
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            return root.GetProperty("id").GetInt32();
+        }
+
+        /// <summary>
+        /// Best-effort deletion of a Redis basket key created by a test, invoked from a <c>finally</c> block
+        /// so no basket outlives the test that created it (MJ-04). The response is disposed (MD-01).
+        /// </summary>
+        /// <param name="client">The HTTP client used to delete the basket.</param>
+        /// <param name="basketId">The basket id to delete.</param>
+        private static async Task TryDeleteBasketAsync(HttpClient client, string basketId)
+        {
+            using var response = await client.DeleteAsync($"api/basket?id={Uri.EscapeDataString(basketId)}");
+        }
+
         // ---------------------------------------------------------------------------------------------
         // PHASE 1 — Products endpoints (anonymous client)
         // ---------------------------------------------------------------------------------------------
@@ -119,10 +207,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetProducts_DefaultParams_Returns200WithPaginationEnvelope()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/products");
+            using var response = await client.GetAsync("api/products");
 
             // Assert — status + pagination envelope contract (camelCase).
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -151,12 +239,13 @@ namespace API.IntegrationTests.Contract
         public async Task GetProduct_ExistingId_Returns200WithProductDto()
         {
             // Arrange — discover a real, seeded product id dynamically (ids are DB-assigned, never hardcoded).
-            var client = _fixture.CreateClient();
-            var listRoot = await ReadRootAsync(await client.GetAsync("api/products"));
+            using var client = _fixture.CreateClient();
+            using var listResponse = await client.GetAsync("api/products"); // MD-01: dispose the discovery response too.
+            var listRoot = await ReadRootAsync(listResponse);
             var existingId = listRoot.GetProperty("data")[0].GetProperty("id").GetInt32();
 
             // Act
-            var response = await client.GetAsync($"api/products/{existingId}");
+            using var response = await client.GetAsync($"api/products/{existingId}");
 
             // Assert — status + single-product DTO shape + id echo.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -175,10 +264,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetProduct_NonexistentId_Returns404ApiResponse()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/products/9999");
+            using var response = await client.GetAsync("api/products/9999");
 
             // Assert — status + ApiResponse contract.
             response.StatusCode.Should().Be(HttpStatusCode.NotFound);
@@ -196,10 +285,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetProductBrands_Seeded_Returns200With6Brands()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/products/brands");
+            using var response = await client.GetAsync("api/products/brands");
 
             // Assert — status + array length + element shape.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -217,10 +306,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetProductTypes_Seeded_Returns200With4Types()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/products/types");
+            using var response = await client.GetAsync("api/products/types");
 
             // Assert — status + array length + element shape.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -244,11 +333,11 @@ namespace API.IntegrationTests.Contract
         public async Task GetBasket_NonexistentId_Returns200EmptyBasket()
         {
             // Arrange — a guaranteed-absent, uniquely-keyed basket id.
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
             var basketId = "contract-missing-" + Guid.NewGuid();
 
             // Act
-            var response = await client.GetAsync($"api/basket?id={Uri.EscapeDataString(basketId)}");
+            using var response = await client.GetAsync($"api/basket?id={Uri.EscapeDataString(basketId)}");
 
             // Assert — status + empty-basket contract.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -271,11 +360,11 @@ namespace API.IntegrationTests.Contract
         public async Task UpdateBasket_ValidDto_Returns200EchoedBasket()
         {
             // Arrange — a minimal, valid CustomerBasketDto with a unique id and no items.
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
             var basketId = "contract-basket-" + Guid.NewGuid();
 
             // Act
-            var response = await client.PostAsJsonAsync("api/basket", new { id = basketId, items = new object[0] });
+            using var response = await client.PostAsJsonAsync("api/basket", new { id = basketId, items = new object[0] });
 
             // Assert — status + echoed-basket contract.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -283,6 +372,47 @@ namespace API.IntegrationTests.Contract
             ShouldExposeCamelCaseProperties(root, "id", "items");
             root.GetProperty("id").GetString().Should().Be(basketId);
             root.GetProperty("items").ValueKind.Should().Be(JsonValueKind.Array);
+        }
+
+        /// <summary>
+        /// <c>POST api/basket</c> with a fully-populated <c>CustomerBasketDto</c> carrying one genuinely
+        /// seeded product, then <c>GET api/basket</c>, returns <c>200 OK</c> and — critically for MJ-12 —
+        /// locks the complete <b>BasketItem</b> wire contract: each item exposes camelCase <c>id</c>,
+        /// <c>productName</c>, <c>price</c>, <c>quantity</c>, <c>pictureUrl</c>, <c>brand</c> and <c>type</c>,
+        /// alongside the basket-level <c>id</c>, <c>items</c> and <c>shippingPrice</c>. This complements the
+        /// minimal empty-items echo above (which only proves the envelope) by asserting the full per-item
+        /// shape after a real Redis round-trip. The unique basket key is deleted in <c>finally</c> (MJ-04).
+        /// </summary>
+        [Fact]
+        public async Task UpdateBasket_WithSeededItem_Returns200EchoedBasketItemContract()
+        {
+            // Arrange — a complete, valid basket built from a genuinely-seeded product.
+            using var client = _fixture.CreateClient();
+            string basketId = null;
+            try
+            {
+                basketId = await SeedRealSingleItemBasketAsync(client);
+
+                // Act — read the persisted basket back to assert its serialized contract after a real round-trip.
+                using var response = await client.GetAsync($"api/basket?id={Uri.EscapeDataString(basketId)}");
+
+                // Assert — status + basket envelope + complete per-item BasketItem envelope.
+                response.StatusCode.Should().Be(HttpStatusCode.OK);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(root, "id", "items", "shippingPrice");
+                root.GetProperty("id").GetString().Should().Be(basketId);
+                var items = root.GetProperty("items");
+                items.ValueKind.Should().Be(JsonValueKind.Array);
+                items.GetArrayLength().Should().Be(1);
+                ShouldExposeCamelCaseProperties(
+                    items[0], "id", "productName", "price", "quantity", "pictureUrl", "brand", "type");
+                items[0].GetProperty("quantity").GetInt32().Should().Be(1);
+            }
+            finally
+            {
+                // MJ-04: no basket may outlive the test that created it.
+                if (basketId != null) await TryDeleteBasketAsync(client, basketId);
+            }
         }
 
         /// <summary>
@@ -294,13 +424,13 @@ namespace API.IntegrationTests.Contract
         public async Task DeleteBasket_ExistingId_Returns200()
         {
             // Arrange — create a real basket to delete, uniquely keyed.
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
             var basketId = "contract-delete-" + Guid.NewGuid();
-            var created = await client.PostAsJsonAsync("api/basket", new { id = basketId, items = new object[0] });
+            using var created = await client.PostAsJsonAsync("api/basket", new { id = basketId, items = new object[0] }); // MD-01: dispose intermediate response.
             created.StatusCode.Should().Be(HttpStatusCode.OK);
 
             // Act
-            var response = await client.DeleteAsync($"api/basket?id={Uri.EscapeDataString(basketId)}");
+            using var response = await client.DeleteAsync($"api/basket?id={Uri.EscapeDataString(basketId)}");
 
             // Assert — void action => empty 200 body; assert the transport status only.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -318,10 +448,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetCurrentUser_Unauthenticated_Returns401()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/account");
+            using var response = await client.GetAsync("api/account");
 
             // Assert
             response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -335,11 +465,11 @@ namespace API.IntegrationTests.Contract
         public async Task CheckEmailExists_SeededUser_Returns200True()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
             var email = CustomWebApplicationFactory.DefaultTestUserEmail; // bob@test.com
 
             // Act
-            var response = await client.GetAsync($"api/account/emailexists?email={Uri.EscapeDataString(email)}");
+            using var response = await client.GetAsync($"api/account/emailexists?email={Uri.EscapeDataString(email)}");
 
             // Assert — status + boolean literal contract.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -356,11 +486,11 @@ namespace API.IntegrationTests.Contract
         public async Task CheckEmailExists_UnknownEmail_Returns200False()
         {
             // Arrange — a guaranteed-unknown address.
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
             var email = "nobody-" + Guid.NewGuid().ToString("N") + "@test.com";
 
             // Act
-            var response = await client.GetAsync($"api/account/emailexists?email={Uri.EscapeDataString(email)}");
+            using var response = await client.GetAsync($"api/account/emailexists?email={Uri.EscapeDataString(email)}");
 
             // Assert — status + boolean literal contract.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -378,10 +508,10 @@ namespace API.IntegrationTests.Contract
         public async Task Login_ValidCredentials_Returns200UserDto()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.PostAsJsonAsync(
+            using var response = await client.PostAsJsonAsync(
                 "api/account/login",
                 new
                 {
@@ -405,10 +535,10 @@ namespace API.IntegrationTests.Contract
         public async Task Login_WrongPassword_Returns401()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.PostAsJsonAsync(
+            using var response = await client.PostAsJsonAsync(
                 "api/account/login",
                 new { email = CustomWebApplicationFactory.DefaultTestUserEmail, password = "wrongpass" });
 
@@ -431,10 +561,10 @@ namespace API.IntegrationTests.Contract
         public async Task Register_ExistingEmail_Returns400ValidationErrors()
         {
             // Arrange — a fully valid DTO whose e-mail collides with the seeded user.
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.PostAsJsonAsync(
+            using var response = await client.PostAsJsonAsync(
                 "api/account/register",
                 new
                 {
@@ -462,11 +592,11 @@ namespace API.IntegrationTests.Contract
         public async Task Register_NewUniqueUser_Returns200UserDto()
         {
             // Arrange — a unique, policy-compliant registration (password Pa$$w0rd satisfies RegisterDto's regex).
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
             var email = "contract-" + Guid.NewGuid().ToString("N") + "@test.com";
 
             // Act
-            var response = await client.PostAsJsonAsync(
+            using var response = await client.PostAsJsonAsync(
                 "api/account/register",
                 new { displayName = "Contract", email, password = CustomWebApplicationFactory.DefaultTestUserPassword });
 
@@ -486,10 +616,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetCurrentUser_Authenticated_Returns200UserDto()
         {
             // Arrange — an authenticated client for the seeded user.
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
 
             // Act
-            var response = await client.GetAsync("api/account");
+            using var response = await client.GetAsync("api/account");
 
             // Assert — status + UserDto contract.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -508,16 +638,118 @@ namespace API.IntegrationTests.Contract
         public async Task GetUserAddress_Authenticated_Returns200AddressDto()
         {
             // Arrange — an authenticated client for the seeded user (who has a pre-seeded address).
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
 
             // Act
-            var response = await client.GetAsync("api/account/address");
+            using var response = await client.GetAsync("api/account/address");
 
             // Assert — status + AddressDto contract.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
             var root = await ReadRootAsync(response);
             ShouldExposeCamelCaseProperties(
                 root, "id", "firstName", "lastName", "street", "city", "state", "zipCode");
+        }
+
+        /// <summary>
+        /// <c>PUT api/account/address</c> with a valid bearer token and a complete <c>AddressDto</c> returns
+        /// <c>200 OK</c> echoing the updated address with the full camelCase contract (<c>id</c>,
+        /// <c>firstName</c>, <c>lastName</c>, <c>street</c>, <c>city</c>, <c>state</c>, <c>zipCode</c>) and
+        /// the new field values (MJ-11 success path). The seeded user's ORIGINAL address is captured first
+        /// and RESTORED in a <c>finally</c> (MJ-04 state restoration) so this mutation cannot leak into any
+        /// sibling test (e.g. the <c>GetUserAddress</c> contract test). All responses are disposed (MD-01).
+        /// </summary>
+        [Fact]
+        public async Task UpdateUserAddress_AuthenticatedWithCompleteAddress_Returns200UpdatedAddressDto()
+        {
+            // Arrange — authenticated seeded user; capture the current address so it can be restored.
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
+            JsonElement original;
+            using (var getResponse = await client.GetAsync("api/account/address"))
+            {
+                getResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+                original = await ReadRootAsync(getResponse);
+            }
+
+            try
+            {
+                var updated = new
+                {
+                    id = original.GetProperty("id").GetInt32(),
+                    firstName = "Contract",
+                    lastName = "Updated",
+                    street = "1 Regression Way",
+                    city = "Testville",
+                    state = "TS",
+                    zipCode = "01010"
+                };
+
+                // Act
+                using var response = await client.PutAsJsonAsync("api/account/address", updated);
+
+                // Assert — status + complete AddressDto contract + echoed new values.
+                response.StatusCode.Should().Be(HttpStatusCode.OK);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(
+                    root, "id", "firstName", "lastName", "street", "city", "state", "zipCode");
+                root.GetProperty("firstName").GetString().Should().Be("Contract");
+                root.GetProperty("lastName").GetString().Should().Be("Updated");
+                root.GetProperty("street").GetString().Should().Be("1 Regression Way");
+                root.GetProperty("city").GetString().Should().Be("Testville");
+                root.GetProperty("state").GetString().Should().Be("TS");
+                root.GetProperty("zipCode").GetString().Should().Be("01010");
+            }
+            finally
+            {
+                // MJ-04: restore the seeded user's original address so no state leaks to sibling tests.
+                var restore = new
+                {
+                    id = original.GetProperty("id").GetInt32(),
+                    firstName = original.GetProperty("firstName").GetString(),
+                    lastName = original.GetProperty("lastName").GetString(),
+                    street = original.GetProperty("street").GetString(),
+                    city = original.GetProperty("city").GetString(),
+                    state = original.GetProperty("state").GetString(),
+                    zipCode = original.GetProperty("zipCode").GetString()
+                };
+                using var restoreResponse = await client.PutAsJsonAsync("api/account/address", restore);
+                restoreResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+            }
+        }
+
+        /// <summary>
+        /// <c>PUT api/account/address</c> with a valid bearer token but a body missing a <c>[Required]</c>
+        /// string member (<c>firstName</c> omitted) is rejected by the custom
+        /// <c>InvalidModelStateResponseFactory</c> with <c>400 BadRequest</c> and the
+        /// <c>ApiValidationErrorResponose</c> envelope: a non-empty camelCase <c>errors</c> string array plus
+        /// the inherited <c>statusCode</c>/<c>message</c> (MJ-11 validation path / MJ-12 model-validation
+        /// envelope). The action body never runs, so no address is mutated and no cleanup is required.
+        /// </summary>
+        [Fact]
+        public async Task UpdateUserAddress_MissingRequiredField_Returns400ValidationErrors()
+        {
+            // Arrange — authenticated, but omit the [Required] firstName so model validation fails first.
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
+            var invalid = new
+            {
+                id = 1,
+                lastName = "Updated",
+                street = "1 Regression Way",
+                city = "Testville",
+                state = "TS",
+                zipCode = "01010"
+            };
+
+            // Act
+            using var response = await client.PutAsJsonAsync("api/account/address", invalid);
+
+            // Assert — status + ApiValidationErrorResponose envelope (statusCode + message + errors array).
+            response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+            var root = await ReadRootAsync(response);
+            ShouldExposeCamelCaseProperties(root, "statusCode", "message", "errors");
+            root.GetProperty("statusCode").GetInt32().Should().Be(400);
+            var errors = root.GetProperty("errors");
+            errors.ValueKind.Should().Be(JsonValueKind.Array);
+            errors.GetArrayLength().Should().BeGreaterThan(0);
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -532,10 +764,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetOrders_Unauthenticated_Returns401()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/orders");
+            using var response = await client.GetAsync("api/orders");
 
             // Assert
             response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -550,10 +782,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetOrders_Authenticated_Returns200List()
         {
             // Arrange
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
 
             // Act
-            var response = await client.GetAsync("api/orders");
+            using var response = await client.GetAsync("api/orders");
 
             // Assert — status + array shape.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -571,10 +803,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetDeliveryMethods_Authenticated_Returns200With4Methods()
         {
             // Arrange
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
 
             // Act
-            var response = await client.GetAsync("api/orders/deliveryMethods");
+            using var response = await client.GetAsync("api/orders/deliveryMethods");
 
             // Assert — status + array length + element shape.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -593,10 +825,10 @@ namespace API.IntegrationTests.Contract
         public async Task GetOrderById_NonexistentId_Returns404()
         {
             // Arrange
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
 
             // Act
-            var response = await client.GetAsync("api/orders/9999");
+            using var response = await client.GetAsync("api/orders/9999");
 
             // Assert — status + ApiResponse contract.
             response.StatusCode.Should().Be(HttpStatusCode.NotFound);
@@ -628,7 +860,7 @@ namespace API.IntegrationTests.Contract
         public async Task CreateOrder_NonexistentBasket_Returns500()
         {
             // Arrange — a valid OrderDto whose basket does not exist (uniquely keyed) and a complete address.
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
             var payload = new
             {
                 basketId = "no-basket-" + Guid.NewGuid(),
@@ -646,7 +878,7 @@ namespace API.IntegrationTests.Contract
             };
 
             // Act
-            var response = await client.PostAsJsonAsync("api/orders", payload);
+            using var response = await client.PostAsJsonAsync("api/orders", payload);
 
             // Assert — status + structured ApiException contract (statusCode + non-empty message).
             response.StatusCode.Should().Be(HttpStatusCode.InternalServerError);
@@ -654,6 +886,136 @@ namespace API.IntegrationTests.Contract
             ShouldExposeCamelCaseProperties(root, "statusCode", "message");
             root.GetProperty("statusCode").GetInt32().Should().Be(500);
             root.GetProperty("message").GetString().Should().NotBeNullOrWhiteSpace();
+        }
+
+        /// <summary>
+        /// <c>POST api/orders</c> with a valid <c>OrderDto</c> referencing a REAL seeded basket returns
+        /// <c>200 OK</c> serialising the created <b>Order entity</b> (MJ-12 create contract). Locks the raw
+        /// entity wire shape: camelCase <c>id</c>, <c>buyerEmail</c>, <c>orderDate</c>, <c>shipToAddress</c>
+        /// (object), <c>deliveryMethod</c> (the full DeliveryMethod OBJECT — not the mapped string),
+        /// <c>orderItems</c> (each with <c>itemOrdered</c>, <c>price</c>, <c>quantity</c>), <c>subtotal</c>,
+        /// <c>status</c> and <c>paymentId</c>. It additionally asserts the entity exposes NO <c>total</c>
+        /// member (<c>Order.GetTotal()</c> is a method, not a serialised property) and that <c>subtotal</c>
+        /// is the SERVER-side price (server pricing authority). The basket is deleted in <c>finally</c>
+        /// (MJ-04); the created order row lives only in this class's isolated PostgreSQL (CR-01) and is
+        /// disposed at class teardown — <c>GetOrders_Authenticated</c> asserts only array shape, so it is
+        /// unaffected.
+        /// </summary>
+        [Fact]
+        public async Task CreateOrder_ValidBasketAndAddress_Returns200OrderEntityContract()
+        {
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
+            string basketId = null;
+            try
+            {
+                basketId = await SeedRealSingleItemBasketAsync(client);
+
+                // Act — create the order for the seeded basket with a complete address.
+                using var response = await client.PostAsJsonAsync("api/orders", new
+                {
+                    basketId,
+                    deliveryMethodId = 1,
+                    shipToAddress = new
+                    {
+                        id = 1,
+                        firstName = "Bob",
+                        lastName = "Bobbity",
+                        street = "10 The Street",
+                        city = "NY",
+                        state = "NY",
+                        zipCode = "90210"
+                    }
+                });
+
+                // Assert — status + raw Order-entity contract.
+                response.StatusCode.Should().Be(HttpStatusCode.OK);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(
+                    root, "id", "buyerEmail", "orderDate", "shipToAddress", "deliveryMethod",
+                    "orderItems", "subtotal", "status", "paymentId");
+                root.GetProperty("buyerEmail").GetString()
+                    .Should().Be(CustomWebApplicationFactory.DefaultTestUserEmail);
+
+                // shipToAddress is the OrderAggregate.Address object.
+                ShouldExposeCamelCaseProperties(
+                    root.GetProperty("shipToAddress"),
+                    "firstName", "lastName", "street", "city", "state", "zipCode");
+
+                // deliveryMethod on the RAW entity is the full DeliveryMethod object (contrast the DTO string).
+                root.GetProperty("deliveryMethod").ValueKind.Should().Be(JsonValueKind.Object);
+                ShouldExposeCamelCaseProperties(
+                    root.GetProperty("deliveryMethod"),
+                    "id", "shortName", "deliveryTime", "description", "price");
+
+                // orderItems: server-priced from the seeded product; itemOrdered carries the product snapshot.
+                var orderItems = root.GetProperty("orderItems");
+                orderItems.ValueKind.Should().Be(JsonValueKind.Array);
+                orderItems.GetArrayLength().Should().BeGreaterThan(0);
+                ShouldExposeCamelCaseProperties(orderItems[0], "id", "itemOrdered", "price", "quantity");
+                ShouldExposeCamelCaseProperties(
+                    orderItems[0].GetProperty("itemOrdered"), "productItemId", "productName", "pictureUrl");
+
+                // Server-side authority: subtotal derives from the DB product price, never the client's.
+                root.GetProperty("subtotal").GetDecimal().Should().BeGreaterThan(0);
+
+                // The raw entity exposes GetTotal() as a METHOD, so no 'total' member is serialised.
+                root.TryGetProperty("total", out _).Should()
+                    .BeFalse("the raw Order entity serialises no 'total' (GetTotal() is a method, not a property)");
+            }
+            finally
+            {
+                if (basketId != null) await TryDeleteBasketAsync(client, basketId);
+            }
+        }
+
+        /// <summary>
+        /// <c>GET api/orders/{id}</c> for an order OWNED by the caller returns <c>200 OK</c> with the
+        /// <c>OrderToReturnDto</c> contract (MJ-12 detail contract) — deliberately DISTINCT from the raw
+        /// create-entity shape: <c>deliveryMethod</c> is the mapped STRING (ShortName), <c>shippingPrice</c>
+        /// and <c>total</c> ARE present, <c>orderItems</c> use <c>productId</c>/<c>productName</c>/
+        /// <c>pictureUrl</c>/<c>price</c>/<c>quantity</c>, and <c>status</c> is the enum member name string
+        /// "Pending". The basket is deleted in <c>finally</c> (MJ-04).
+        /// </summary>
+        [Fact]
+        public async Task GetOrderById_OwnedOrder_Returns200OrderToReturnDtoContract()
+        {
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
+            string basketId = null;
+            try
+            {
+                basketId = await SeedRealSingleItemBasketAsync(client);
+                var orderId = await CreateOrderReturningIdAsync(client, basketId);
+
+                // Act — fetch the just-created, caller-owned order back.
+                using var response = await client.GetAsync($"api/orders/{orderId}");
+
+                // Assert — status + OrderToReturnDto contract.
+                response.StatusCode.Should().Be(HttpStatusCode.OK);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(
+                    root, "id", "buyerEmail", "orderDate", "shipToAddress", "deliveryMethod",
+                    "shippingPrice", "orderItems", "subtotal", "total", "status");
+                root.GetProperty("id").GetInt32().Should().Be(orderId);
+                root.GetProperty("buyerEmail").GetString()
+                    .Should().Be(CustomWebApplicationFactory.DefaultTestUserEmail);
+
+                // On the DTO, deliveryMethod is the mapped ShortName STRING (not the entity object).
+                root.GetProperty("deliveryMethod").ValueKind.Should().Be(JsonValueKind.String);
+
+                // OrderItemDto per-item contract (productId, not the entity's itemOrdered snapshot).
+                var orderItems = root.GetProperty("orderItems");
+                orderItems.ValueKind.Should().Be(JsonValueKind.Array);
+                orderItems.GetArrayLength().Should().BeGreaterThan(0);
+                ShouldExposeCamelCaseProperties(
+                    orderItems[0], "productId", "productName", "pictureUrl", "price", "quantity");
+
+                // AutoMapper maps the OrderStatus enum to its member NAME; a freshly created order is "Pending".
+                root.GetProperty("status").GetString().Should().Be("Pending");
+            }
+            finally
+            {
+                if (basketId != null) await TryDeleteBasketAsync(client, basketId);
+            }
         }
 
         // ---------------------------------------------------------------------------------------------
@@ -668,10 +1030,10 @@ namespace API.IntegrationTests.Contract
         public async Task CreatePaymentIntent_Unauthenticated_Returns401()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act — no body is needed (basketId comes from the route); [Authorize] short-circuits first.
-            var response = await client.PostAsync("api/payments/anybasket", null);
+            using var response = await client.PostAsync("api/payments/anybasket", null);
 
             // Assert
             response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -692,11 +1054,11 @@ namespace API.IntegrationTests.Contract
         public async Task CreatePaymentIntent_Authenticated_Returns200BasketWithStubIntent()
         {
             // Arrange — an authenticated client and a uniquely-keyed basket id.
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
             var basketId = "contract-pi-" + Guid.NewGuid();
 
             // Act — no body needed; the stub echoes the route basketId with fixed payment-intent fields.
-            var response = await client.PostAsync($"api/payments/{basketId}", null);
+            using var response = await client.PostAsync($"api/payments/{basketId}", null);
 
             // Assert — status + stubbed payment-intent contract.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -719,11 +1081,11 @@ namespace API.IntegrationTests.Contract
         public async Task StripeWebhook_UnsignedRequest_Returns500()
         {
             // Arrange — an unsigned webhook POST (no Stripe-Signature header).
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
             using var content = new StringContent("{}");
 
             // Act — ConstructEvent throws on the missing/invalid signature => middleware returns a 500.
-            var response = await client.PostAsync("api/payments/webhook", content);
+            using var response = await client.PostAsync("api/payments/webhook", content);
 
             // Assert — status + structured ApiException contract.
             response.StatusCode.Should().Be(HttpStatusCode.InternalServerError);
@@ -758,10 +1120,10 @@ namespace API.IntegrationTests.Contract
         public async Task Error_StatusCode_ReturnsApiResponseBody(int code)
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync($"errors/{code}");
+            using var response = await client.GetAsync($"errors/{code}");
 
             // Assert — the BODY carries the code (transport status is 200 for the direct route; not asserted).
             var root = await ReadRootAsync(response);
@@ -782,10 +1144,10 @@ namespace API.IntegrationTests.Contract
         public async Task Buggy_TestAuth_Unauthenticated_Returns401()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/buggy/testauth");
+            using var response = await client.GetAsync("api/buggy/testauth");
 
             // Assert
             response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -800,10 +1162,10 @@ namespace API.IntegrationTests.Contract
         public async Task Buggy_TestAuth_Authenticated_Returns200SecretText()
         {
             // Arrange
-            var client = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
 
             // Act
-            var response = await client.GetAsync("api/buggy/testauth");
+            using var response = await client.GetAsync("api/buggy/testauth");
 
             // Assert — status + payload substring.
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -820,10 +1182,10 @@ namespace API.IntegrationTests.Contract
         public async Task Buggy_NotFound_Returns404()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/buggy/notfound");
+            using var response = await client.GetAsync("api/buggy/notfound");
 
             // Assert — status + ApiResponse contract.
             response.StatusCode.Should().Be(HttpStatusCode.NotFound);
@@ -843,10 +1205,10 @@ namespace API.IntegrationTests.Contract
         public async Task Buggy_ServerError_Returns500ApiException()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/buggy/servererror");
+            using var response = await client.GetAsync("api/buggy/servererror");
 
             // Assert — status + structured ApiException contract.
             response.StatusCode.Should().Be(HttpStatusCode.InternalServerError);
@@ -863,10 +1225,10 @@ namespace API.IntegrationTests.Contract
         public async Task Buggy_BadRequest_Returns400()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/buggy/badrequest");
+            using var response = await client.GetAsync("api/buggy/badrequest");
 
             // Assert — status + ApiResponse contract.
             response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
@@ -883,10 +1245,10 @@ namespace API.IntegrationTests.Contract
         public async Task Buggy_BadRequestWithId_Returns200()
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync("api/buggy/badrequest/5");
+            using var response = await client.GetAsync("api/buggy/badrequest/5");
 
             // Assert
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -909,10 +1271,10 @@ namespace API.IntegrationTests.Contract
         public async Task AnonymousGetEndpoint_PublicRoute_Returns200WithJsonBody(string path)
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync(path);
+            using var response = await client.GetAsync(path);
 
             // Assert — status + a structured JSON body (object or array).
             response.StatusCode.Should().Be(HttpStatusCode.OK);
@@ -934,13 +1296,102 @@ namespace API.IntegrationTests.Contract
         public async Task AuthorizedGetEndpoint_Anonymous_Returns401(string path)
         {
             // Arrange
-            var client = _fixture.CreateClient();
+            using var client = _fixture.CreateClient();
 
             // Act
-            var response = await client.GetAsync(path);
+            using var response = await client.GetAsync(path);
 
             // Assert
             response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        }
+
+        /// <summary>
+        /// Every <c>[Authorize]</c>-protected route rejects an anonymous caller with <c>401 Unauthorized</c>
+        /// across the NON-GET verbs and parameterised paths that the GET-only sweep above omits (MJ-13):
+        /// <c>POST api/orders</c>, <c>GET api/orders/{id}</c>, <c>PUT api/account/address</c> and
+        /// <c>POST api/payments/{basketId}</c>. The authorization middleware short-circuits before any model
+        /// binding, so a bodyless request is sufficient to observe the gate. The request and response are
+        /// disposed (MD-01).
+        /// </summary>
+        /// <param name="method">The HTTP verb to exercise.</param>
+        /// <param name="path">The protected relative path.</param>
+        [Theory]
+        [InlineData("POST", "api/orders")]
+        [InlineData("GET", "api/orders/1")]
+        [InlineData("PUT", "api/account/address")]
+        [InlineData("POST", "api/payments/any-basket")]
+        public async Task ProtectedEndpoint_AnonymousAcrossVerbs_Returns401(string method, string path)
+        {
+            // Arrange — an anonymous client and a bodyless request for the given verb/path.
+            using var client = _fixture.CreateClient();
+            using var request = new HttpRequestMessage(new HttpMethod(method), path);
+
+            // Act — authorization runs before model binding, so no body is needed.
+            using var response = await client.SendAsync(request);
+
+            // Assert — the gate rejects the anonymous caller.
+            response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        }
+
+        /// <summary>
+        /// Cross-buyer authorization isolation (MJ-13): a genuine order created by the seeded buyer
+        /// (<c>bob@test.com</c>) CANNOT be read by a different, freshly-registered buyer. The seeded buyer
+        /// first creates a real order and confirms he can read it (so the <c>404</c> below is a true scoping
+        /// result, not a missing-order false positive); a second, distinct buyer then requests the SAME
+        /// order id and receives <c>404 NotFound</c> because <c>OrderService.GetOrderByIdAsync</c> filters by
+        /// <c>buyerEmail</c> as well as id. The basket is deleted in <c>finally</c> (MJ-04); the created order
+        /// and the second identity user live only in this class's isolated PostgreSQL/Identity databases
+        /// (CR-01) and are discarded at class teardown — there is no production API to delete either, and a
+        /// second user is required to prove the isolation.
+        /// </summary>
+        [Fact]
+        public async Task GetOrderById_OrderOwnedByAnotherBuyer_Returns404()
+        {
+            // Arrange — the seeded buyer creates a real, owned order.
+            using var bobClient = await _fixture.CreateAuthenticatedClientAsync();
+            string basketId = null;
+            try
+            {
+                basketId = await SeedRealSingleItemBasketAsync(bobClient);
+                var bobOrderId = await CreateOrderReturningIdAsync(bobClient, basketId);
+
+                // Sanity — the owner CAN read his own order, so the id is real and the 404 below is genuine isolation.
+                using (var bobFetch = await bobClient.GetAsync($"api/orders/{bobOrderId}"))
+                {
+                    bobFetch.StatusCode.Should().Be(HttpStatusCode.OK);
+                }
+
+                // Register + authenticate a SECOND, distinct buyer (unique e-mail keeps the identity DB clean).
+                var otherEmail = "contract-other-" + Guid.NewGuid().ToString("N") + "@test.com";
+                using (var anon = _fixture.CreateClient())
+                using (var registration = await anon.PostAsJsonAsync(
+                    "api/account/register",
+                    new
+                    {
+                        displayName = "Other",
+                        email = otherEmail,
+                        password = CustomWebApplicationFactory.DefaultTestUserPassword
+                    }))
+                {
+                    registration.StatusCode.Should().Be(HttpStatusCode.OK);
+                }
+
+                using var otherClient = await _fixture.CreateAuthenticatedClientAsync(
+                    otherEmail, CustomWebApplicationFactory.DefaultTestUserPassword);
+
+                // Act — the second buyer requests the first buyer's order id.
+                using var response = await otherClient.GetAsync($"api/orders/{bobOrderId}");
+
+                // Assert — buyer-scoped lookup yields 404 (not 200 and not 403) with the ApiResponse envelope.
+                response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(root, "statusCode");
+                root.GetProperty("statusCode").GetInt32().Should().Be(404);
+            }
+            finally
+            {
+                if (basketId != null) await TryDeleteBasketAsync(bobClient, basketId);
+            }
         }
     }
 }

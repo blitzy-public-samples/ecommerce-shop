@@ -77,7 +77,7 @@ namespace Core.Tests.Specifications
         /// requested payment intent id.
         /// </summary>
         [Fact]
-        public void Constructor_SetsCriteriaMatchingPaymentId()
+        public void Constructor_WithPaymentIntentId_SetsCriteriaMatchingThatPaymentId()
         {
             // Arrange & Act
             var spec = new OrderByPaymentIntentIdSpecification(MatchingPaymentIntentId);
@@ -100,7 +100,7 @@ namespace Core.Tests.Specifications
         /// <see cref="Order.PaymentId"/> differs from the requested payment intent id.
         /// </summary>
         [Fact]
-        public void Constructor_CriteriaRejectsDifferentPaymentId()
+        public void Constructor_WithPaymentIntentId_CriteriaRejectsDifferentPaymentId()
         {
             // Arrange & Act
             var spec = new OrderByPaymentIntentIdSpecification(MatchingPaymentIntentId);
@@ -118,7 +118,7 @@ namespace Core.Tests.Specifications
         /// <see cref="BaseSpecification{T}.Includes"/> collection must exist and be empty.
         /// </summary>
         [Fact]
-        public void Constructor_HasNoIncludes()
+        public void Constructor_WithPaymentIntentId_HasNoIncludes()
         {
             // Arrange & Act
             var spec = new OrderByPaymentIntentIdSpecification(MatchingPaymentIntentId);
@@ -135,7 +135,7 @@ namespace Core.Tests.Specifications
         /// so both ordering expressions must be null.
         /// </summary>
         [Fact]
-        public void Constructor_HasNoOrdering()
+        public void Constructor_WithPaymentIntentId_HasNoOrdering()
         {
             // Arrange & Act
             var spec = new OrderByPaymentIntentIdSpecification(MatchingPaymentIntentId);
@@ -151,7 +151,7 @@ namespace Core.Tests.Specifications
         /// <see cref="BaseSpecification{T}.Take"/> must remain at their defaults.
         /// </summary>
         [Fact]
-        public void Constructor_DoesNotEnablePaging()
+        public void Constructor_WithPaymentIntentId_DoesNotEnablePaging()
         {
             // Arrange & Act
             var spec = new OrderByPaymentIntentIdSpecification(MatchingPaymentIntentId);

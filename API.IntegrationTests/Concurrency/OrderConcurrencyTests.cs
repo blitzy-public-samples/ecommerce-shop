@@ -4,6 +4,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Threading;                          // Barrier — genuine concurrent "starting gun" (CR-02)
 using System.Threading.Tasks;
 using API.Dtos;
 using API.IntegrationTests.Infrastructure;
@@ -13,6 +14,7 @@ using FluentAssertions;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using StackExchange.Redis;                       // IConnectionMultiplexer — MJ-04 Redis key cleanup
 using Xunit;
 
 namespace API.IntegrationTests.Concurrency
@@ -20,7 +22,7 @@ namespace API.IntegrationTests.Concurrency
     /// <summary>
     /// End-to-end <b>integration</b> tests for <c>Infrastructure.Services.OrderService.CreateOrderAsync</c>,
     /// driven through the <b>real</b> ASP.NET Core HTTP pipeline (<c>POST api/orders</c>) against <b>real</b>
-    /// PostgreSQL + Redis provisioned by Testcontainers (via the shared <see cref="ContainerFixture"/>).
+    /// PostgreSQL + Redis provisioned by Testcontainers (via this class's dedicated <see cref="ContainerFixture"/>).
     /// The two behaviours under verification are the ones with the greatest financial blast radius, so they
     /// carry the highest coverage priority (AAP §0.1.4, §0.10.3):
     ///
@@ -52,15 +54,16 @@ namespace API.IntegrationTests.Concurrency
     /// </para>
     ///
     /// <para>
-    /// <b>Isolation on shared infrastructure.</b> The PostgreSQL/Redis instances are shared across the whole
-    /// <c>"Integration"</c> collection, so every test uses a fresh GUID-based <c>basketId</c> and
-    /// <c>paymentIntentId</c> and asserts DB state through its own short-lived <see cref="StoreContext"/>
-    /// scope with <c>AsNoTracking()</c>. There are no fixed delays anywhere — readiness is guaranteed by the
-    /// fixture's Testcontainers wait strategies and all work is awaited directly (AAP §0.10.1, §0.7.2).
+    /// <b>Per-class isolation + deterministic cleanup.</b> Under CR-01 this class owns its own isolated,
+    /// disposable PostgreSQL/Redis pair (an <c>IClassFixture&lt;ContainerFixture&gt;</c>). Within the class
+    /// every test still uses a fresh GUID-based <c>basketId</c> and <c>paymentIntentId</c>, asserts DB state
+    /// through its own short-lived <see cref="StoreContext"/> scope with <c>AsNoTracking()</c>, and restores
+    /// state in a <c>finally</c> block (MJ-04 deterministic cleanup of the orders it persists and the basket
+    /// key it writes). There are no fixed delays anywhere — readiness is guaranteed by the fixture's
+    /// Testcontainers wait strategies and all work is awaited directly (AAP §0.10.1, §0.7.2).
     /// </para>
     /// </summary>
-    [Collection("Integration")]
-    public class OrderConcurrencyTests
+    public class OrderConcurrencyTests : IClassFixture<ContainerFixture>
     {
         /// <summary>
         /// Number of duplicate submissions fired simultaneously by the concurrency test. Deliberately
@@ -77,11 +80,11 @@ namespace API.IntegrationTests.Concurrency
         private readonly ContainerFixture _fixture;
 
         /// <summary>
-        /// xUnit injects the shared <see cref="ContainerFixture"/> (started once for the whole
-        /// <c>"Integration"</c> collection) that exposes the wired <c>CustomWebApplicationFactory</c> and
-        /// HTTP-client factory methods this class drives.
+        /// xUnit injects this class's dedicated <see cref="ContainerFixture"/> (an
+        /// <c>IClassFixture&lt;ContainerFixture&gt;</c> started once for THIS class) that exposes the wired
+        /// <c>CustomWebApplicationFactory</c> and HTTP-client factory methods this class drives.
         /// </summary>
-        /// <param name="fixture">The shared, already-initialised container fixture.</param>
+        /// <param name="fixture">This class's isolated, already-initialised container fixture.</param>
         public OrderConcurrencyTests(ContainerFixture fixture) => _fixture = fixture;
 
         // -----------------------------------------------------------------------------------------------
@@ -118,13 +121,22 @@ namespace API.IntegrationTests.Concurrency
             using var first = await client.PostAsJsonAsync("api/orders", orderDto);
             using var second = await client.PostAsJsonAsync("api/orders", orderDto);
 
-            // Assert ------------------------------------------------------------------------------------
-            first.StatusCode.Should().Be(HttpStatusCode.OK);
-            second.StatusCode.Should().Be(HttpStatusCode.OK);
+            try
+            {
+                // Assert --------------------------------------------------------------------------------
+                first.StatusCode.Should().Be(HttpStatusCode.OK);
+                second.StatusCode.Should().Be(HttpStatusCode.OK);
 
-            // The second CreateOrderAsync found the first order (same PaymentIntentId), deleted it, and
-            // inserted its replacement — so exactly one order remains for this payment intent.
-            (await CountOrdersByPaymentIntentIdAsync(paymentIntentId)).Should().Be(1);
+                // The second CreateOrderAsync found the first order (same PaymentIntentId), deleted it, and
+                // inserted its replacement — so exactly one order remains for this payment intent.
+                (await CountOrdersByPaymentIntentIdAsync(paymentIntentId)).Should().Be(1);
+            }
+            finally
+            {
+                // MJ-04 deterministic cleanup: remove the persisted order and the basket key this test wrote.
+                await CleanupOrdersByPaymentIntentIdAsync(paymentIntentId);
+                await CleanupBasketAsync(basketId);
+            }
         }
 
         /// <summary>
@@ -154,35 +166,62 @@ namespace API.IntegrationTests.Concurrency
 
             // Act ---------------------------------------------------------------------------------------
             using var resp = await client.PostAsJsonAsync("api/orders", orderDto);
-            resp.StatusCode.Should().Be(HttpStatusCode.OK);
 
-            // Assert ------------------------------------------------------------------------------------
-            // Read the persisted order (with its items) back from PostgreSQL through a fresh, no-tracking
-            // scope so the assertion reflects what was actually committed, not any in-request state.
-            using var scope = _fixture.Factory.Services.CreateScope();
-            var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
+            try
+            {
+                resp.StatusCode.Should().Be(HttpStatusCode.OK);
 
-            var order = await ctx.Orders.AsNoTracking()
-                .Include(o => o.OrderItems)
-                .SingleAsync(o => o.PaymentId == paymentIntentId);
+                // Assert --------------------------------------------------------------------------------
+                // Read the persisted order (with its items) back from PostgreSQL through a fresh, no-tracking
+                // scope so the assertion reflects what was actually committed, not any in-request state.
+                using var scope = _fixture.Factory.Services.CreateScope();
+                var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
 
-            // The line item price equals the DB product price (productPrice, >= 8) and NOT the tampered
-            // client price (0.1m) — proving OrderService built the OrderItem from productItem.Price and
-            // ignored the client-supplied basket price (server-side price authority).
-            order.OrderItems.Should().OnlyContain(oi => oi.Price == productPrice);
+                var order = await ctx.Orders.AsNoTracking()
+                    .Include(o => o.OrderItems)
+                    .SingleAsync(o => o.PaymentId == paymentIntentId);
 
-            // Subtotal = server price * quantity (NOT the manipulated client price * quantity).
-            order.Subtotal.Should().Be(productPrice * quantity);
+                // The line item price equals the DB product price (productPrice, >= 8) and NOT the tampered
+                // client price (0.1m) — proving OrderService built the OrderItem from productItem.Price and
+                // ignored the client-supplied basket price (server-side price authority).
+                order.OrderItems.Should().OnlyContain(oi => oi.Price == productPrice);
+
+                // Subtotal = server price * quantity (NOT the manipulated client price * quantity).
+                order.Subtotal.Should().Be(productPrice * quantity);
+            }
+            finally
+            {
+                // MJ-04 deterministic cleanup: remove the persisted order and the basket key this test wrote.
+                await CleanupOrdersByPaymentIntentIdAsync(paymentIntentId);
+                await CleanupBasketAsync(basketId);
+            }
         }
 
         /// <summary>
-        /// SECONDARY consistency-under-contention check. Firing <see cref="ConcurrentSubmissionCount"/>
-        /// duplicate submissions simultaneously must never surface an unhandled server error (HTTP 500) and
-        /// must leave the database in a consistent state. It intentionally does NOT assert "exactly one":
-        /// the stale-order check → delete → re-create sequence is not wrapped in a DB lock, so concurrent
-        /// callers may both miss the (initially absent) order and both insert, yielding 1 OR 2 persisted
-        /// orders depending on timing. The authoritative exactly-one guarantee is proven by the sequential
-        /// test above; this test proves no corruption/crash under contention (AAP §0.7.2 zero-flakiness).
+        /// SECONDARY consistency-under-contention check that HONESTLY reproduces the documented duplicate-
+        /// order race (CR-02). Firing <see cref="ConcurrentSubmissionCount"/> duplicate submissions with a
+        /// genuinely synchronized start (a <see cref="Barrier"/> "starting gun"; see the Act section) must
+        /// never surface an unhandled server error (HTTP 500) and must leave the database in a consistent
+        /// state.
+        ///
+        /// <para>
+        /// <b>Why this does NOT assert "exactly one".</b> <c>CreateOrderAsync</c>'s stale-order
+        /// check → delete → re-create sequence is a classic Time-Of-Check-To-Time-Of-Use (TOCTOU) window: it
+        /// is not wrapped in a database lock/transaction and <c>Order.PaymentId</c> has no unique index, so
+        /// under TRUE concurrency both callers can miss the (initially absent) order and both insert —
+        /// yielding 1 OR 2 persisted orders depending on timing (the review reproduced two inserts / zero
+        /// deletes). Guaranteeing exactly-one <i>even under concurrency</i> would require a PRODUCTION
+        /// idempotency change — a unique constraint on <c>PaymentId</c> and/or a transactional
+        /// check-and-insert in <c>OrderService</c>. That production change is deliberately
+        /// <b>DEFERRED / separately authorized</b>: this is a test-only engagement whose production code,
+        /// controllers and services are frozen (AAP §0.8.2 "Any production fix for discovered races ... is
+        /// out of scope"; AAP §0.10.1). This test therefore asserts ONLY the invariants that are truthful
+        /// without that change (no 500; every response 200; between 1 and
+        /// <see cref="ConcurrentSubmissionCount"/> orders), never a false/flaky "exactly one". The
+        /// authoritative exactly-one guarantee for the SEQUENTIAL delete-then-recreate path is proven by
+        /// <see cref="CreateOrder_WhenSecondOrderReusesSamePaymentIntentId_PersistsExactlyOneOrder"/>
+        /// (AAP §0.7.2 zero-flakiness).
+        /// </para>
         /// </summary>
         [Fact]
         public async Task CreateOrder_TwoConcurrentSubmissionsSamePaymentIntentId_NoServerErrorAndStateConsistent()
@@ -201,23 +240,44 @@ namespace API.IntegrationTests.Concurrency
             using var client = await _fixture.CreateAuthenticatedClientAsync();
 
             // Act ---------------------------------------------------------------------------------------
-            // Fire the duplicate submissions simultaneously and await them all (no Thread.Sleep anywhere).
-            var responses = await Task.WhenAll(
-                Enumerable.Range(0, ConcurrentSubmissionCount)
-                    .Select(_ => client.PostAsJsonAsync("api/orders", orderDto)));
+            // Genuinely synchronize the start (CR-02): rather than relying on eager LINQ enumeration to
+            // launch the requests "roughly together", every submission runs on its own thread-pool thread
+            // and rendezvouses at a Barrier "starting gun", so all callers are released to issue their POST
+            // at the same instant. This makes the stale-order check->delete->insert sequences genuinely
+            // overlap (a real TOCTOU race) rather than incidentally serializing. The Barrier is a
+            // synchronization primitive, not a fixed Thread.Sleep, so there is still no fixed delay anywhere.
+            using var startingGun = new Barrier(ConcurrentSubmissionCount);
+            var submissions = Enumerable.Range(0, ConcurrentSubmissionCount)
+                .Select(_ => Task.Run(async () =>
+                {
+                    startingGun.SignalAndWait();
+                    return await client.PostAsJsonAsync("api/orders", orderDto);
+                }))
+                .ToList();
+
+            var responses = await Task.WhenAll(submissions);
 
             try
             {
                 // Assert --------------------------------------------------------------------------------
                 // No submission surfaced an unhandled exception as a 500; each completed successfully.
-                responses.Should().NotContain(r => r.StatusCode == HttpStatusCode.InternalServerError);
-                responses.Should().OnlyContain(r => r.StatusCode == HttpStatusCode.OK);
+                responses.Should().NotContain(r => r.StatusCode == HttpStatusCode.InternalServerError,
+                    "the TOCTOU duplicate-order race must degrade gracefully, never into an unhandled 500");
+                responses.Should().OnlyContain(r => r.StatusCode == HttpStatusCode.OK,
+                    "with a fresh PaymentIntentId and two callers no delete can ever target an " +
+                    "already-deleted row, and PaymentId has no unique index, so every concurrent " +
+                    "submission returns 200 OK");
 
-                // State stays consistent: between 1 (a delete-then-recreate interleaving won the race) and
-                // ConcurrentSubmissionCount (all callers missed the absent order and inserted). Never 0,
-                // never more than the number of submissions. The sequential test is the exactly-one oracle.
+                // HONEST invariant (CR-02): between 1 (one caller observed the other's committed order and
+                // took the delete-then-recreate branch) and ConcurrentSubmissionCount (both callers missed
+                // the initially-absent order and both inserted duplicates). Never 0, never more than the
+                // number of submissions. This deliberately tolerates the duplicate outcome the review
+                // documented (two inserts / zero deletes) because the exactly-one PRODUCTION fix is deferred
+                // (see this method's summary); the exactly-one oracle is the sequential test above.
                 var count = await CountOrdersByPaymentIntentIdAsync(paymentIntentId);
-                count.Should().BeInRange(1, ConcurrentSubmissionCount);
+                count.Should().BeInRange(1, ConcurrentSubmissionCount,
+                    "under true concurrency without a production unique/transactional guard the stale-order " +
+                    "path yields 1 or 2 orders; exactly-one is proven only for the sequential path");
             }
             finally
             {
@@ -226,6 +286,11 @@ namespace API.IntegrationTests.Concurrency
                 {
                     response.Dispose();
                 }
+
+                // MJ-04 deterministic cleanup: remove every order persisted for this payment intent and the
+                // basket key this test wrote, restoring this class's own infrastructure between its tests.
+                await CleanupOrdersByPaymentIntentIdAsync(paymentIntentId);
+                await CleanupBasketAsync(basketId);
             }
         }
 
@@ -340,6 +405,43 @@ namespace API.IntegrationTests.Concurrency
             var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
 
             return await ctx.Orders.AsNoTracking().CountAsync(o => o.PaymentId == paymentIntentId);
+        }
+
+        /// <summary>
+        /// MJ-04 deterministic cleanup: removes every order whose <c>PaymentId</c> equals
+        /// <paramref name="paymentIntentId"/> (and, via the <c>onDelete: Cascade</c>
+        /// <c>FK_OrderItems_Orders_OrderId</c> constraint, their order items) through a fresh scope, so this
+        /// class's own database is restored between its sequentially-run tests regardless of how many
+        /// duplicate orders the concurrent test happened to persist.
+        /// </summary>
+        /// <param name="paymentIntentId">The payment intent whose persisted orders should be removed.</param>
+        private async Task CleanupOrdersByPaymentIntentIdAsync(string paymentIntentId)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
+
+            var orders = await ctx.Orders.Where(o => o.PaymentId == paymentIntentId).ToListAsync();
+            if (orders.Count == 0)
+            {
+                return;
+            }
+
+            ctx.Orders.RemoveRange(orders);
+            await ctx.SaveChangesAsync();
+        }
+
+        /// <summary>
+        /// MJ-04 deterministic cleanup: deletes the basket key this test wrote from the real Redis instance
+        /// (the basket id IS the Redis key) through the application's own
+        /// <see cref="IConnectionMultiplexer"/>, so no key lingers in this class's cache between its tests.
+        /// </summary>
+        /// <param name="basketId">The basket id / Redis key to delete.</param>
+        private async Task CleanupBasketAsync(string basketId)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var mux = scope.ServiceProvider.GetRequiredService<IConnectionMultiplexer>();
+
+            await mux.GetDatabase().KeyDeleteAsync(basketId);
         }
     }
 }

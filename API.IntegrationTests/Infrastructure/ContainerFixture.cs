@@ -5,6 +5,7 @@ using Core.Entities.Identity;
 using Infrastructure.Data;
 using Infrastructure.Identity;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -16,17 +17,20 @@ using Xunit;
 namespace API.IntegrationTests.Infrastructure
 {
     /// <summary>
-    /// Shared xUnit fixture that provisions <b>real, isolated, disposable</b> PostgreSQL and Redis
+    /// Per-class xUnit fixture that provisions <b>real, isolated, disposable</b> PostgreSQL and Redis
     /// instances via <b>Testcontainers</b>, wires a <see cref="CustomWebApplicationFactory"/> to those
     /// dynamic endpoints, applies the production EF Core migrations, and seeds data — replicating the
-    /// <c>API/Program.cs</c> <c>Main</c> bootstrap — so every integration-test class in the shared
-    /// collection runs against a ready, genuine environment (AAP §0.4.4, §0.5.2, §0.7.2).
+    /// <c>API/Program.cs</c> <c>Main</c> bootstrap — so each integration-test class runs against its OWN
+    /// ready, genuine environment (AAP §0.10.1 per-class isolation; §0.4.4, §0.5.2, §0.7.2).
     ///
     /// <para>
     /// <b>Lifecycle.</b> Implementing <see cref="IAsyncLifetime"/> lets xUnit start the containers
-    /// <b>once per collection</b> (<see cref="InitializeAsync"/>) and tear them down at the end
-    /// (<see cref="DisposeAsync"/>). Bound to sibling classes through an <c>ICollectionFixture</c>, the
-    /// (expensive) container startup and migrate/seed cost is amortised across the whole collection.
+    /// <b>once per consuming class</b> (<see cref="InitializeAsync"/>, before that class's first test) and
+    /// tear them down after its last test (<see cref="DisposeAsync"/>). It is consumed as a per-class
+    /// <c>IClassFixture&lt;ContainerFixture&gt;</c> (CR-01), so each class owns its own container pair; the
+    /// (expensive) startup and migrate/seed cost is amortised across that class's tests. Assembly-wide test
+    /// parallelization is disabled (see <c>AssemblyInfo.cs</c>) so these per-class container pairs start
+    /// sequentially rather than all at once.
     /// </para>
     ///
     /// <para>
@@ -34,7 +38,8 @@ namespace API.IntegrationTests.Infrastructure
     /// Redis are used. The containers are provisioned with <b>dynamically-assigned host ports</b> (never
     /// the shared <c>docker-compose.yml</c> ports <c>5432</c>/<c>6379</c>, and never the compose stack
     /// itself). Only the engine images and credentials mirror <c>docker-compose.yml</c> for parity: the
-    /// <c>postgres</c> image with user <c>appuser</c> / password <c>secret</c>, and <c>redis:latest</c>.
+    /// <c>postgres</c> image (pinned by immutable digest — see <see cref="PostgresImage"/>) with user
+    /// <c>appuser</c> / password <c>secret</c>, and the digest-pinned Redis image (<see cref="RedisImage"/>).
     /// </para>
     ///
     /// <para>
@@ -56,13 +61,12 @@ namespace API.IntegrationTests.Infrastructure
     /// </para>
     ///
     /// <para>
-    /// <b>FailClosedTests nuance.</b> Because this fixture is <b>shared</b> across the <c>"Integration"</c>
-    /// collection, a test that deliberately <i>stops</i> a container mid-test (for example
-    /// <c>Resilience/FailClosedTests</c>, which stops PostgreSQL or Redis to assert a fail-closed,
-    /// structured <c>ApiException</c> 500) would disrupt every sibling class sharing these containers.
-    /// Such a test must therefore construct its <b>own</b> non-shared <see cref="ContainerFixture"/>
-    /// instance (via the public parameterless constructor and its own <see cref="IAsyncLifetime"/>),
-    /// <b>outside</b> the shared collection, and drive <see cref="PostgresContainer"/> /
+    /// <b>FailClosedTests nuance.</b> A test that deliberately <i>stops</i> a container mid-test (for
+    /// example <c>Resilience/FailClosedTests</c>, which stops PostgreSQL or Redis to assert a fail-closed,
+    /// structured <c>ApiException</c> 500) must never share a container with any other test. That class
+    /// therefore constructs its <b>own</b> <see cref="ContainerFixture"/> instance <b>per test method</b>
+    /// (via the public parameterless constructor and its own <see cref="IAsyncLifetime"/>) rather than
+    /// consuming the per-class fixture, and drives <see cref="PostgresContainer"/> /
     /// <see cref="RedisContainer"/> <c>StopAsync()</c> without affecting others. The
     /// <see cref="PostgresContainer"/> and <see cref="RedisContainer"/> handles are exposed precisely to
     /// enable that pattern.
@@ -78,11 +82,26 @@ namespace API.IntegrationTests.Infrastructure
         // --- Engine/credential parity with docker-compose.yml (REFERENCE ONLY; the compose stack is
         //     never reused). These are non-secret, test-only values. -------------------------------------
 
-        /// <summary>PostgreSQL image, matching <c>docker-compose.yml</c> (<c>image: postgres</c>).</summary>
-        private const string PostgresImage = "postgres:latest";
+        /// <summary>
+        /// PostgreSQL image, pinned to an IMMUTABLE content digest for deterministic, reproducible test
+        /// runs (MJ-01). The digest identifies the exact image content in use at authoring time —
+        /// <b>PostgreSQL 18.4</b>, the same content the mutable <c>postgres:latest</c> tag currently
+        /// resolves to — so the suite can never be silently upgraded by a moving <c>latest</c> tag.
+        /// Docker resolves a digest reference against the local image cache first, so this stays
+        /// offline-friendly. Engine/credential parity with <c>docker-compose.yml</c> (REFERENCE ONLY; the
+        /// compose stack is never reused).
+        /// </summary>
+        private const string PostgresImage =
+            "postgres@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500";
 
-        /// <summary>Redis image, matching <c>docker-compose.yml</c> (<c>redis:latest</c>).</summary>
-        private const string RedisImage = "redis:latest";
+        /// <summary>
+        /// Redis image, pinned to an IMMUTABLE content digest for deterministic, reproducible test runs
+        /// (MJ-01). The digest identifies the exact image content in use at authoring time — <b>Redis
+        /// 8.8.0</b>, the same content the mutable <c>redis:latest</c> tag currently resolves to. As with
+        /// PostgreSQL, a moving <c>latest</c> tag can never silently change the Redis version under test.
+        /// </summary>
+        private const string RedisImage =
+            "redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b";
 
         /// <summary>PostgreSQL superuser name (parity with <c>POSTGRES_USER</c> in <c>docker-compose.yml</c>).</summary>
         private const string PostgresUsername = "appuser";
@@ -100,10 +119,10 @@ namespace API.IntegrationTests.Infrastructure
         private readonly RedisContainer _redis;
 
         /// <summary>
-        /// Public parameterless constructor. Required by xUnit's <c>ICollectionFixture&lt;T&gt;</c> (xUnit
-        /// instantiates the fixture reflectively) and also lets specialised classes such as
-        /// <c>Resilience/FailClosedTests</c> <c>new</c> a private, non-shared instance so they can stop a
-        /// container without disturbing the shared collection. The containers are only <i>defined</i> here;
+        /// Public parameterless constructor. Required by xUnit's <c>IClassFixture&lt;T&gt;</c> (xUnit
+        /// instantiates the fixture reflectively, once per consuming class) and also lets specialised classes
+        /// such as <c>Resilience/FailClosedTests</c> <c>new</c> a private instance per test so they can stop
+        /// a container without disturbing any other test. The containers are only <i>defined</i> here;
         /// they are not started until <see cref="InitializeAsync"/> so construction stays cheap and
         /// side-effect free.
         /// </summary>
@@ -170,8 +189,19 @@ namespace API.IntegrationTests.Infrastructure
         /// <summary>
         /// Creates an anonymous <see cref="HttpClient"/> against the running application. Convenience
         /// pass-through to <see cref="CustomWebApplicationFactory"/>.
+        ///
+        /// <para>
+        /// <b>Explicit, tested redirect policy (MD-03).</b> The client is created with
+        /// <c>AllowAutoRedirect = false</c> so that any <c>UseHttpsRedirection</c> 307 surfaces as the real
+        /// status code instead of being silently followed. Under the in-process test host no HTTPS port is
+        /// configured, so redirection is inoperative and endpoints answer over HTTP directly; disabling
+        /// auto-redirect makes that contract explicit and guarantees the suite asserts the genuine response
+        /// (never a transparently-followed redirect). This matches the authenticated-client behaviour in
+        /// <see cref="CustomWebApplicationFactory.CreateAuthenticatedClientAsync"/>.
+        /// </para>
         /// </summary>
-        public HttpClient CreateClient() => Factory.CreateClient();
+        public HttpClient CreateClient() =>
+            Factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
 
         /// <summary>
         /// Creates an <see cref="HttpClient"/> pre-authenticated with a <c>Bearer</c> token for the given
@@ -199,62 +229,72 @@ namespace API.IntegrationTests.Infrastructure
         // --- IAsyncLifetime -----------------------------------------------------------------------------
 
         /// <summary>
-        /// Called once by xUnit before any test in the collection runs. Starts both containers (relying on
-        /// their built-in readiness wait strategies — no <c>Thread.Sleep</c>), provisions the second
-        /// (Identity) database on the same PostgreSQL server, computes the three connection strings, wires
-        /// the <see cref="CustomWebApplicationFactory"/>, and finally applies migrations and seeds both
-        /// databases — replicating the <c>API/Program.cs</c> bootstrap so tests see the documented seed
-        /// data (6 brands / 4 types / 18 products / 4 delivery methods and the <c>bob@test.com</c> user).
+        /// Called once by xUnit before the first test in each consuming test class runs (this fixture is
+        /// consumed as a per-class <c>IClassFixture&lt;ContainerFixture&gt;</c>, so every class receives its
+        /// own isolated PostgreSQL+Redis pair — AAP §0.10.1). Starts both containers (relying on their
+        /// built-in readiness wait strategies — no <c>Thread.Sleep</c>), provisions the second (Identity)
+        /// database on the same PostgreSQL server, computes the three connection strings, wires the
+        /// <see cref="CustomWebApplicationFactory"/>, applies migrations and seeds both databases —
+        /// replicating the <c>API/Program.cs</c> bootstrap so tests see the documented seed data (6 brands /
+        /// 4 types / 18 products / 4 delivery methods and the <c>bob@test.com</c> user) — and finally
+        /// verifies those seed postconditions fail-loud before declaring readiness.
+        ///
+        /// <para>
+        /// The entire sequence is wrapped so a failure at any step reverse-disposes whatever was already
+        /// started before rethrowing (MJ-02): xUnit does not invoke <see cref="DisposeAsync"/> when
+        /// <see cref="InitializeAsync"/> throws, so cleanup must happen here to avoid leaking containers.
+        /// </para>
         /// </summary>
         public async Task InitializeAsync()
         {
-            // 1) Start the PostgreSQL container. StartAsync only returns once the module's built-in wait
-            //    strategy reports the server is accepting connections (a polling wait strategy, not a sleep).
-            await _pg.StartAsync();
-
-            // 2) Start the Redis container (same built-in readiness guarantee).
-            await _redis.StartAsync();
-
-            // 3) Compute the connection strings and provision the second database on the SAME server.
-            //    GetConnectionString() carries the dynamic host port assigned by Docker (never 5432/6379).
-            StoreConnectionString = _pg.GetConnectionString();
-
-            // The Store container ships a single database (e-commerce). The application also needs a
-            // separate Identity database, so create it now on the same server. CREATE DATABASE cannot run
-            // inside a transaction, so it is issued over a direct autocommit Npgsql connection.
-            await CreateIdentityDatabaseAsync(StoreConnectionString);
-
-            // Derive the Identity connection string from the Store one by switching only the database name
-            // (same host/port/credentials, different catalogue).
-            IdentityConnectionString =
-                new NpgsqlConnectionStringBuilder(StoreConnectionString) { Database = IdentityDatabaseName }
-                    .ConnectionString;
-
-            // Redis returns a host:port connection string parseable by StackExchange.Redis' ConfigurationOptions.
-            RedisConnectionString = _redis.GetConnectionString();
-
-            // 4) Wire the in-process host harness to the dynamic Testcontainers endpoints BEFORE its host is
-            //    built. The factory validates these three values on first host build and never falls back to
-            //    the docker-compose defaults.
-            Factory = new CustomWebApplicationFactory
-            {
-                StoreConnectionString = StoreConnectionString,
-                IdentityConnectionString = IdentityConnectionString,
-                RedisConnectionString = RedisConnectionString
-            };
-
-            // 5) Migrate + seed BOTH contexts, replicating API/Program.cs Main. Accessing Factory.Services
-            //    lazily builds the real host (running Startup.ConfigureServices) against the real endpoints.
-            //    Unlike Program.Main — which logs and CONTINUES on failure so the site still starts — a
-            //    test fixture must fail LOUDLY: a broken migration/seed means the environment is not ready,
-            //    so the caught exception is logged and then rethrown to abort collection initialisation.
-            using var scope = Factory.Services.CreateScope();
-            var services = scope.ServiceProvider;
-            var loggerFactory = services.GetRequiredService<ILoggerFactory>();
-            var logger = loggerFactory.CreateLogger<ContainerFixture>();
-
+            // The COMPLETE initialisation sequence is wrapped so a failure at ANY step (container start,
+            // Identity-database creation, host build, migration, seed, or seed verification) reverse-disposes
+            // whatever has already been acquired before rethrowing (MJ-02). xUnit does NOT call DisposeAsync
+            // when InitializeAsync throws, so without this the already-started PostgreSQL/Redis containers and
+            // the wired factory would leak for the remainder of the test run.
             try
             {
+                // 1) Start the PostgreSQL container. StartAsync only returns once the module's built-in wait
+                //    strategy reports the server is accepting connections (a polling wait strategy, not a sleep).
+                await _pg.StartAsync();
+
+                // 2) Start the Redis container (same built-in readiness guarantee).
+                await _redis.StartAsync();
+
+                // 3) Compute the connection strings and provision the second database on the SAME server.
+                //    GetConnectionString() carries the dynamic host port assigned by Docker (never 5432/6379).
+                StoreConnectionString = _pg.GetConnectionString();
+
+                // The Store container ships a single database (e-commerce). The application also needs a
+                // separate Identity database, so create it now on the same server. CREATE DATABASE cannot run
+                // inside a transaction, so it is issued over a direct autocommit Npgsql connection.
+                await CreateIdentityDatabaseAsync(StoreConnectionString);
+
+                // Derive the Identity connection string from the Store one by switching only the database name
+                // (same host/port/credentials, different catalogue).
+                IdentityConnectionString =
+                    new NpgsqlConnectionStringBuilder(StoreConnectionString) { Database = IdentityDatabaseName }
+                        .ConnectionString;
+
+                // Redis returns a host:port connection string parseable by StackExchange.Redis' ConfigurationOptions.
+                RedisConnectionString = _redis.GetConnectionString();
+
+                // 4) Wire the in-process host harness to the dynamic Testcontainers endpoints BEFORE its host is
+                //    built. The factory validates these three values on first host build and never falls back to
+                //    the docker-compose defaults.
+                Factory = new CustomWebApplicationFactory
+                {
+                    StoreConnectionString = StoreConnectionString,
+                    IdentityConnectionString = IdentityConnectionString,
+                    RedisConnectionString = RedisConnectionString
+                };
+
+                // 5) Migrate + seed BOTH contexts, replicating API/Program.cs Main. Accessing Factory.Services
+                //    lazily builds the real host (running Startup.ConfigureServices) against the real endpoints.
+                using var scope = Factory.Services.CreateScope();
+                var services = scope.ServiceProvider;
+                var loggerFactory = services.GetRequiredService<ILoggerFactory>();
+
                 // Store database: apply the Npgsql-specific migrations, then seed reference data. The seed
                 // JSON files (Data/SeedData/*.json) are link-copied into this test project's output by
                 // API.IntegrationTests.csproj so StoreContextSeed can locate them beside Infrastructure.dll.
@@ -268,14 +308,126 @@ namespace API.IntegrationTests.Infrastructure
                 await identityContext.Database.MigrateAsync();
                 var userManager = services.GetRequiredService<UserManager<AppUser>>();
                 await AppIdentityDbContextSeed.SeedUserAsync(userManager);
+
+                // 6) Fail-LOUD seed verification (MJ-03). StoreContextSeed.SeedAsync catches and logs its own
+                //    exceptions internally and never rethrows, so a partial/skipped seed would otherwise leave
+                //    the fixture "ready" with missing reference data and produce confusing downstream failures.
+                //    Assert the documented postconditions before declaring readiness.
+                await VerifySeedPostconditionsAsync(storeContext, userManager);
             }
-            catch (Exception ex)
+            catch
             {
-                logger.LogError(
-                    ex,
-                    "ContainerFixture failed to migrate/seed the Testcontainers databases during " +
-                    "InitializeAsync; aborting collection initialisation so the failure surfaces loudly.");
+                // MJ-02: reverse-dispose everything already acquired (factory -> Redis -> PostgreSQL) so a
+                //    partial initialisation leaks nothing, then rethrow so the failure aborts this class's
+                //    initialisation loudly (the original exception is preserved and surfaced by xUnit).
+                await DisposePartialInitializationAsync();
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Fail-loud verification (MJ-03) that both databases were seeded with the documented reference data
+        /// before the fixture declares itself ready. <see cref="StoreContextSeed"/> swallows its own
+        /// exceptions (it logs and returns rather than rethrowing), so an under-seeded database would not
+        /// otherwise surface until confusing downstream assertions failed. Throws
+        /// <see cref="InvalidOperationException"/> if any documented postcondition is unmet.
+        /// </summary>
+        private static async Task VerifySeedPostconditionsAsync(
+            StoreContext storeContext,
+            UserManager<AppUser> userManager)
+        {
+            // Documented seed set (AAP §0.4.4; tech-spec §6.2.2): 6 brands, 4 types, 18 products, 4 methods.
+            const int expectedBrands = 6;
+            const int expectedTypes = 4;
+            const int expectedProducts = 18;
+            const int expectedDeliveryMethods = 4;
+
+            var brands = await storeContext.ProductBrands.CountAsync();
+            var types = await storeContext.ProductTypes.CountAsync();
+            var products = await storeContext.Products.CountAsync();
+            var deliveryMethods = await storeContext.DeliveryMethods.CountAsync();
+
+            if (brands != expectedBrands || types != expectedTypes ||
+                products != expectedProducts || deliveryMethods != expectedDeliveryMethods)
+            {
+                throw new InvalidOperationException(
+                    "ContainerFixture seed verification FAILED: the Store database was not seeded with the " +
+                    $"documented reference data. Expected {expectedBrands} brands / {expectedTypes} types / " +
+                    $"{expectedProducts} products / {expectedDeliveryMethods} delivery methods but found " +
+                    $"{brands} / {types} / {products} / {deliveryMethods}. StoreContextSeed.SeedAsync " +
+                    "swallows its own exceptions, so this check prevents tests running against an " +
+                    "under-seeded database.");
+            }
+
+            // The Identity user (bob@test.com) and its pre-seeded Address underpin the address/checkout and
+            // authenticated-order contract tests; verify both are present (the Address is a related entity,
+            // so it must be eagerly loaded to confirm it exists).
+            var seededUser = await userManager.Users
+                .Include(u => u.Address)
+                .SingleOrDefaultAsync(u => u.Email == CustomWebApplicationFactory.DefaultTestUserEmail);
+
+            if (seededUser is null)
+            {
+                throw new InvalidOperationException(
+                    "ContainerFixture seed verification FAILED: the integration user " +
+                    $"'{CustomWebApplicationFactory.DefaultTestUserEmail}' was not created by " +
+                    "AppIdentityDbContextSeed.SeedUserAsync.");
+            }
+
+            if (seededUser.Address is null)
+            {
+                throw new InvalidOperationException(
+                    "ContainerFixture seed verification FAILED: the integration user " +
+                    $"'{CustomWebApplicationFactory.DefaultTestUserEmail}' was created without the " +
+                    "pre-seeded Address required by the address/checkout contract tests.");
+            }
+        }
+
+        /// <summary>
+        /// Reverse-disposes any resources already acquired by a PARTIALLY-completed
+        /// <see cref="InitializeAsync"/> (MJ-02): the factory first (releasing host connections, DbContexts
+        /// and the Redis multiplexer), then the Redis container, then the PostgreSQL container. Secondary
+        /// failures during cleanup are written to stderr and swallowed so they cannot mask the original
+        /// initialisation exception, which the caller rethrows.
+        /// </summary>
+        private async Task DisposePartialInitializationAsync()
+        {
+            if (Factory != null)
+            {
+                try
+                {
+                    Factory.Dispose();
+                }
+                catch (Exception disposeEx)
+                {
+                    Console.Error.WriteLine(
+                        "[ContainerFixture] Ignoring factory-dispose error during failed " +
+                        $"initialisation: {disposeEx.Message}");
+                }
+
+                Factory = null;
+            }
+
+            try
+            {
+                await _redis.DisposeAsync();
+            }
+            catch (Exception disposeEx)
+            {
+                Console.Error.WriteLine(
+                    "[ContainerFixture] Ignoring Redis-container-dispose error during failed " +
+                    $"initialisation: {disposeEx.Message}");
+            }
+
+            try
+            {
+                await _pg.DisposeAsync();
+            }
+            catch (Exception disposeEx)
+            {
+                Console.Error.WriteLine(
+                    "[ContainerFixture] Ignoring PostgreSQL-container-dispose error during failed " +
+                    $"initialisation: {disposeEx.Message}");
             }
         }
 
@@ -299,7 +451,7 @@ namespace API.IntegrationTests.Infrastructure
         }
 
         /// <summary>
-        /// Called once by xUnit after all tests in the collection have run. Disposes the factory first so
+        /// Called once by xUnit after the consuming class's last test has run. Disposes the factory first so
         /// the in-process host, its Redis multiplexer and its <c>DbContext</c>s release their connections
         /// before the containers are torn down, then disposes both containers (which removes them entirely,
         /// honouring the isolated-and-disposable constraint).
