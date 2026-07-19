@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Coverlet (coverlet.collector 3.2.0) configuration for `dotnet test`.
+     Usage: run dotnet test with the settings option set to this file
+       (coverage.runsettings) and the collect option set to "XPlat Code Coverage".
+     Emits coverage.cobertura.xml + coverage.info (lcov) under TestResults/<guid>/.
+     Per-namespace/per-class rollups: reportgenerator -reports:**/coverage.cobertura.xml -targetdir:coveragereport -->
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <!-- Emit both Cobertura (default) and LCOV so CI dashboards and threshold tooling can consume either -->
+          <Format>cobertura,lcov</Format>
+          <!-- Measure only the three production assemblies; format is [assembly]namespace.type -->
+          <Include>[Core]*,[Infrastructure]*,[API]*</Include>
+          <!-- Never measure the test assemblies themselves -->
+          <Exclude>[Core.Tests]*,[Infrastructure.Tests]*,[API.Tests]*,[API.IntegrationTests]*,[xunit.*]*</Exclude>
+          <!-- Exclude EF Core auto-generated migration/snapshot files (Store + Identity) so they do not dilute Infrastructure coverage -->
+          <ExcludeByFile>**/Migrations/*.cs</ExcludeByFile>
+          <!-- Exclude compiler/framework generated members and explicit opt-outs -->
+          <ExcludeByAttribute>Obsolete,GeneratedCodeAttribute,CompilerGeneratedAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>
+          <SingleHit>false</SingleHit>
+          <UseSourceLink>true</UseSourceLink>
+          <IncludeTestAssembly>false</IncludeTestAssembly>
+          <SkipAutoProps>true</SkipAutoProps>
+          <DeterministicReport>false</DeterministicReport>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

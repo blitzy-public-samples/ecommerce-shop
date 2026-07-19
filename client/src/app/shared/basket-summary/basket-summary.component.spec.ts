@@ -1,0 +1,130 @@
+import { NO_ERRORS_SCHEMA } from '@angular/core';
+import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { CommonModule } from '@angular/common';
+import { RouterTestingModule } from '@angular/router/testing';
+
+import { BasketSummaryComponent } from './basket-summary.component';
+import { IBasketItem } from '../models/basket';
+import { IOrderItem } from '../models/order';
+
+describe('BasketSummaryComponent', () => {
+  let component: BasketSummaryComponent;
+  let fixture: ComponentFixture<BasketSummaryComponent>;
+
+  const mockBasketItems: IBasketItem[] = [
+    {
+      id: 1,
+      productName: 'Angular Speedster Board 2000',
+      price: 200,
+      quantity: 1,
+      pictureUrl: 'https://test.com/images/product-1.png',
+      brand: 'Angular',
+      type: 'Boards'
+    },
+    {
+      id: 2,
+      productName: 'Green Angular Board 3000',
+      price: 150,
+      quantity: 2,
+      pictureUrl: 'https://test.com/images/product-2.png',
+      brand: 'Angular',
+      type: 'Boards'
+    }
+  ];
+
+  const mockOrderItems: IOrderItem[] = [
+    {
+      productId: 10,
+      productName: 'Core Purple Boots',
+      price: 250,
+      quantity: 1,
+      pictureUrl: 'https://test.com/images/product-10.png'
+    }
+  ];
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [CommonModule, RouterTestingModule],
+      declarations: [BasketSummaryComponent],
+      schemas: [NO_ERRORS_SCHEMA]
+    }).compileComponents();
+  });
+
+  beforeEach(() => {
+    fixture = TestBed.createComponent(BasketSummaryComponent);
+    component = fixture.componentInstance;
+  });
+
+  it('should create', () => {
+    expect(component).toBeTruthy();
+  });
+
+  it('should not render a table when there are no items', () => {
+    component.items = [];
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('table')).toBeNull();
+    expect(fixture.nativeElement.querySelectorAll('tbody tr').length).toEqual(0);
+  });
+
+  it('should render one row per item when items are provided', () => {
+    component.items = mockBasketItems;
+    fixture.detectChanges();
+
+    const rows = fixture.nativeElement.querySelectorAll('tbody tr');
+    expect(rows.length).toEqual(mockBasketItems.length);
+    expect(fixture.nativeElement.textContent).toContain('Angular Speedster Board 2000');
+  });
+
+  it('should show quantity and remove controls in basket mode', () => {
+    component.items = mockBasketItems;
+    component.isBasket = true;
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelectorAll('.fa-minus-circle').length).toEqual(mockBasketItems.length);
+    expect(fixture.nativeElement.querySelectorAll('.fa-plus-circle').length).toEqual(mockBasketItems.length);
+    expect(fixture.nativeElement.querySelectorAll('.fa-trash').length).toEqual(mockBasketItems.length);
+  });
+
+  it('should hide quantity and remove controls when not in basket mode', () => {
+    component.items = mockOrderItems;
+    component.isBasket = false;
+    component.isOrder = true;
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelectorAll('.fa-minus-circle').length).toEqual(0);
+    expect(fixture.nativeElement.querySelectorAll('.fa-plus-circle').length).toEqual(0);
+    expect(fixture.nativeElement.querySelectorAll('.fa-trash').length).toEqual(0);
+    expect(fixture.nativeElement.querySelectorAll('tbody tr').length).toEqual(mockOrderItems.length);
+  });
+
+  it('should emit the item on decrement when decrementItemQuantity is called', () => {
+    const item = mockBasketItems[0];
+    let emitted: IBasketItem | undefined;
+    component.decrement.subscribe((value: IBasketItem) => (emitted = value));
+
+    component.decrementItemQuantity(item);
+
+    expect(emitted).toBe(item);
+  });
+
+  it('should emit the item on increment when incrementItemQuantity is called', () => {
+    const item = mockBasketItems[0];
+    let emitted: IBasketItem | undefined;
+    component.increment.subscribe((value: IBasketItem) => (emitted = value));
+
+    component.incrementItemQuantity(item);
+
+    expect(emitted).toBe(item);
+  });
+
+  it('should emit the item on remove when removeBasketItem is called', () => {
+    const item = mockBasketItems[0];
+    let emitted: IBasketItem | undefined;
+    component.remove.subscribe((value: IBasketItem) => (emitted = value));
+
+    component.removeBasketItem(item);
+
+    expect(emitted).toBe(item);
+  });
+});
