@@ -130,9 +130,14 @@ namespace API.Tests.Controllers
             // Arrange
             var controller = CreateController(out var userManager, out var signInManager, out _, out _);
             var loginDto = new LoginDto { Email = "bob@test.com", Password = "wrong" };
+            // Hold the exact instance FindByEmailAsync resolves so we can prove the controller
+            // forwards *that* user (not some other/any user) into the credential check.
+            var resolvedUser = new AppUser { Email = loginDto.Email };
             userManager.Setup(m => m.FindByEmailAsync(loginDto.Email))
-                .ReturnsAsync(new AppUser { Email = loginDto.Email });
-            signInManager.Setup(s => s.CheckPasswordSignInAsync(It.IsAny<AppUser>(), It.IsAny<string>(), false))
+                .ReturnsAsync(resolvedUser);
+            // Match ONLY the exact resolved user + the exact DTO password (persistent=false). A
+            // regression that checked a different user or a different password would not match.
+            signInManager.Setup(s => s.CheckPasswordSignInAsync(resolvedUser, loginDto.Password, false))
                 .ReturnsAsync(Microsoft.AspNetCore.Identity.SignInResult.Failed);
 
             // Act
@@ -143,6 +148,10 @@ namespace API.Tests.Controllers
             var unauthorized = (UnauthorizedObjectResult)result.Result;
             unauthorized.Value.Should().BeOfType<ApiResponse>();
             ((ApiResponse)unauthorized.Value).StatusCode.Should().Be(401);
+            // Prove exact credential propagation: the resolved user and the DTO password reached
+            // CheckPasswordSignInAsync exactly once with persistent=false.
+            signInManager.Verify(
+                s => s.CheckPasswordSignInAsync(resolvedUser, loginDto.Password, false), Times.Once);
         }
 
         [Fact]
@@ -151,11 +160,17 @@ namespace API.Tests.Controllers
             // Arrange
             var controller = CreateController(out var userManager, out var signInManager, out var tokenService, out _);
             var loginDto = new LoginDto { Email = "bob@test.com", Password = "Pa$$w0rd" };
+            // Hold the exact resolved user so both the credential check and the token issuance
+            // can be proven to operate on *this* user.
+            var resolvedUser = new AppUser { Email = "bob@test.com", DisplayName = "Bob" };
             userManager.Setup(m => m.FindByEmailAsync(loginDto.Email))
-                .ReturnsAsync(new AppUser { Email = "bob@test.com", DisplayName = "Bob" });
-            signInManager.Setup(s => s.CheckPasswordSignInAsync(It.IsAny<AppUser>(), It.IsAny<string>(), false))
+                .ReturnsAsync(resolvedUser);
+            // Exact user + exact password (persistent=false) — a wrong-credential regression fails to match.
+            signInManager.Setup(s => s.CheckPasswordSignInAsync(resolvedUser, loginDto.Password, false))
                 .ReturnsAsync(Microsoft.AspNetCore.Identity.SignInResult.Success);
-            tokenService.Setup(t => t.CreateToken(It.IsAny<AppUser>())).Returns("test-token");
+            // Mint the token ONLY for the exact resolved user; a token minted for any other user
+            // would not match this setup and the token assertion below would observe the default (null).
+            tokenService.Setup(t => t.CreateToken(resolvedUser)).Returns("test-token");
 
             // Act
             var result = await controller.Login(loginDto);
@@ -165,6 +180,11 @@ namespace API.Tests.Controllers
             result.Value.Email.Should().Be("bob@test.com");
             result.Value.DisplayName.Should().Be("Bob");
             result.Value.Token.Should().Be("test-token");
+            // Prove exact credential + token-subject propagation: the resolved user + DTO password
+            // reached CheckPasswordSignInAsync once, and the token was minted for that same user once.
+            signInManager.Verify(
+                s => s.CheckPasswordSignInAsync(resolvedUser, loginDto.Password, false), Times.Once);
+            tokenService.Verify(t => t.CreateToken(resolvedUser), Times.Once);
         }
 
         // ==================================================================
@@ -201,7 +221,11 @@ namespace API.Tests.Controllers
             var dto = new RegisterDto { Email = "new@test.com", DisplayName = "New", Password = "Pa$$w0rd" };
             userManager.Setup(m => m.FindByEmailAsync(dto.Email))
                 .ReturnsAsync((AppUser)null);
+            // Capture the AppUser the controller constructs internally so we can prove it is built
+            // from the exact registration DTO fields (not defaulted or mis-mapped).
+            AppUser createdUser = null;
             userManager.Setup(m => m.CreateAsync(It.IsAny<AppUser>(), dto.Password))
+                .Callback<AppUser, string>((u, p) => createdUser = u)
                 .ReturnsAsync(IdentityResult.Failed(new IdentityError { Code = "WeakPassword", Description = "weak" }));
 
             // Act
@@ -212,6 +236,19 @@ namespace API.Tests.Controllers
             var badRequest = (BadRequestObjectResult)result.Result;
             badRequest.Value.Should().BeOfType<ApiResponse>();
             ((ApiResponse)badRequest.Value).StatusCode.Should().Be(400);
+            // Prove exact account-creation data flow: email, display name, and username (== email)
+            // are taken from the DTO, and the DTO password is the credential passed to CreateAsync once.
+            createdUser.Should().NotBeNull();
+            createdUser.Email.Should().Be(dto.Email);
+            createdUser.DisplayName.Should().Be(dto.DisplayName);
+            createdUser.UserName.Should().Be(dto.Email);
+            userManager.Verify(
+                m => m.CreateAsync(
+                    It.Is<AppUser>(u => u.Email == dto.Email
+                                        && u.DisplayName == dto.DisplayName
+                                        && u.UserName == dto.Email),
+                    dto.Password),
+                Times.Once);
         }
 
         [Fact]
@@ -222,7 +259,11 @@ namespace API.Tests.Controllers
             var dto = new RegisterDto { Email = "new@test.com", DisplayName = "New", Password = "Pa$$w0rd" };
             userManager.Setup(m => m.FindByEmailAsync(dto.Email))
                 .ReturnsAsync((AppUser)null);
+            // Capture the internally-constructed user so we can prove the token is minted for the
+            // exact user that was just created (same instance), not for any/other user.
+            AppUser createdUser = null;
             userManager.Setup(m => m.CreateAsync(It.IsAny<AppUser>(), dto.Password))
+                .Callback<AppUser, string>((u, p) => createdUser = u)
                 .ReturnsAsync(IdentityResult.Success);
             tokenService.Setup(t => t.CreateToken(It.IsAny<AppUser>())).Returns("test-token");
 
@@ -234,6 +275,21 @@ namespace API.Tests.Controllers
             result.Value.Email.Should().Be(dto.Email);
             result.Value.DisplayName.Should().Be(dto.DisplayName);
             result.Value.Token.Should().Be("test-token");
+            // Prove exact account-creation data flow and token subject: the created user carries the
+            // exact DTO fields, CreateAsync received it with the DTO password once, and the token was
+            // minted for that exact created user once.
+            createdUser.Should().NotBeNull();
+            createdUser.Email.Should().Be(dto.Email);
+            createdUser.DisplayName.Should().Be(dto.DisplayName);
+            createdUser.UserName.Should().Be(dto.Email);
+            userManager.Verify(
+                m => m.CreateAsync(
+                    It.Is<AppUser>(u => u.Email == dto.Email
+                                        && u.DisplayName == dto.DisplayName
+                                        && u.UserName == dto.Email),
+                    dto.Password),
+                Times.Once);
+            tokenService.Verify(t => t.CreateToken(createdUser), Times.Once);
         }
 
         // ==================================================================
@@ -245,11 +301,15 @@ namespace API.Tests.Controllers
         {
             // Arrange
             var controller = CreateController(out var userManager, out _, out var tokenService, out _);
-            var user = new AppUser { Email = "bob@test.com", DisplayName = "Bob" };
-            // FindByEmailFromClaimsPrinciple runs Users.SingleOrDefaultAsync(x => x.Email == email);
-            // wire an async-queryable Users so the static extension resolves against the in-memory list.
-            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { user });
-            tokenService.Setup(t => t.CreateToken(It.IsAny<AppUser>())).Returns("test-token");
+            // Seed MORE THAN ONE user so the email predicate is actually exercised. The production
+            // extension runs Users.SingleOrDefaultAsync(x => x.Email == email): with two distinct
+            // emails a missing/incorrect predicate would either throw (>1 match) or select the wrong
+            // user, so a green result proves the authenticated email scopes to exactly one user.
+            var bob = new AppUser { Email = "bob@test.com", DisplayName = "Bob" };
+            var alice = new AppUser { Email = "alice@test.com", DisplayName = "Alice" };
+            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { alice, bob });
+            // Mint a token ONLY for Bob so the token subject is provably the authenticated user.
+            tokenService.Setup(t => t.CreateToken(bob)).Returns("bob-token");
             controller.WithUser(ControllerTestHelpers.GetClaimsPrincipal("bob@test.com"));
 
             // Act
@@ -259,7 +319,10 @@ namespace API.Tests.Controllers
             result.Value.Should().NotBeNull();
             result.Value.Email.Should().Be("bob@test.com");
             result.Value.DisplayName.Should().Be("Bob");
-            result.Value.Token.Should().Be("test-token");
+            result.Value.Token.Should().Be("bob-token");
+            // The token must be issued for Bob (the authenticated user) and never for Alice.
+            tokenService.Verify(t => t.CreateToken(bob), Times.Once);
+            tokenService.Verify(t => t.CreateToken(alice), Times.Never);
         }
 
         // ==================================================================
@@ -271,18 +334,27 @@ namespace API.Tests.Controllers
         {
             // Arrange
             var controller = CreateController(out var userManager, out _, out _, out var mapper);
-            var address = new Address { FirstName = "Bob" };
-            var user = new AppUser { Email = "bob@test.com", Address = address };
-            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { user });
-            var dto = new AddressDto();
-            mapper.Setup(m => m.Map<Address, AddressDto>(address)).Returns(dto);
+            // Seed two users, each with a distinct address, so correct email scoping is provable:
+            // FindUserByClaimsPrincipleWithAddressAsync must select Bob and map Bob's address.
+            var bobAddress = new Address { FirstName = "Bob", City = "Gotham" };
+            var aliceAddress = new Address { FirstName = "Alice", City = "Metropolis" };
+            var bob = new AppUser { Email = "bob@test.com", Address = bobAddress };
+            var alice = new AppUser { Email = "alice@test.com", Address = aliceAddress };
+            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { alice, bob });
+            var bobDto = new AddressDto { FirstName = "Bob", City = "Gotham" };
+            // Only Bob's address maps to a known DTO; selecting the wrong user would map an
+            // unconfigured address and fail the reference-equality assertion below.
+            mapper.Setup(m => m.Map<Address, AddressDto>(bobAddress)).Returns(bobDto);
             controller.WithUser(ControllerTestHelpers.GetClaimsPrincipal("bob@test.com"));
 
             // Act
             var result = await controller.GetUserAddress();
 
             // Assert
-            result.Value.Should().BeSameAs(dto);
+            result.Value.Should().BeSameAs(bobDto);
+            // The authenticated user's address (Bob's) is the one mapped — never Alice's.
+            mapper.Verify(m => m.Map<Address, AddressDto>(bobAddress), Times.Once);
+            mapper.Verify(m => m.Map<Address, AddressDto>(aliceAddress), Times.Never);
         }
 
         // ==================================================================
@@ -294,14 +366,34 @@ namespace API.Tests.Controllers
         {
             // Arrange
             var controller = CreateController(out var userManager, out _, out _, out var mapper);
-            var user = new AppUser { Email = "bob@test.com" };
-            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { user });
-            var inputDto = new AddressDto();
-            var mappedAddress = new Address();
+            // Two seeded users prove the authenticated email selects Bob for the update (not Alice).
+            var bob = new AppUser { Email = "bob@test.com", Address = new Address { FirstName = "OldBob" } };
+            var alice = new AppUser { Email = "alice@test.com", Address = new Address { FirstName = "Alice" } };
+            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { alice, bob });
+            // A fully-populated DTO and its mapped Address let us assert every field is persisted.
+            var inputDto = new AddressDto
+            {
+                Id = 5, FirstName = "Bob", LastName = "Smith", Street = "1 Main St",
+                City = "Gotham", State = "NY", ZipCode = "10001"
+            };
+            var mappedAddress = new Address
+            {
+                Id = 5, FirstName = "Bob", LastName = "Smith", Street = "1 Main St",
+                City = "Gotham", State = "NY", ZipCode = "10001"
+            };
             mapper.Setup(m => m.Map<AddressDto, Address>(inputDto)).Returns(mappedAddress);
-            var returnDto = new AddressDto();
-            mapper.Setup(m => m.Map<Address, AddressDto>(It.IsAny<Address>())).Returns(returnDto);
-            userManager.Setup(m => m.UpdateAsync(It.IsAny<AppUser>())).ReturnsAsync(IdentityResult.Success);
+            var returnDto = new AddressDto
+            {
+                Id = 5, FirstName = "Bob", LastName = "Smith", Street = "1 Main St",
+                City = "Gotham", State = "NY", ZipCode = "10001"
+            };
+            // Map back ONLY the mutated address instance — proves the persisted address is echoed.
+            mapper.Setup(m => m.Map<Address, AddressDto>(mappedAddress)).Returns(returnDto);
+            // Capture the exact user handed to UpdateAsync so we can assert scoping + mutation.
+            AppUser updatedUser = null;
+            userManager.Setup(m => m.UpdateAsync(It.IsAny<AppUser>()))
+                .Callback<AppUser>(u => updatedUser = u)
+                .ReturnsAsync(IdentityResult.Success);
             controller.WithUser(ControllerTestHelpers.GetClaimsPrincipal("bob@test.com"));
 
             // Act
@@ -311,6 +403,22 @@ namespace API.Tests.Controllers
             result.Result.Should().BeOfType<OkObjectResult>();
             var ok = (OkObjectResult)result.Result;
             ok.Value.Should().BeSameAs(returnDto);
+            // Correct user selected by the authenticated email.
+            updatedUser.Should().BeSameAs(bob);
+            updatedUser.Email.Should().Be("bob@test.com");
+            // The address was mutated to the mapped Address (all seven fields) before persistence.
+            updatedUser.Address.Should().BeSameAs(mappedAddress);
+            updatedUser.Address.Id.Should().Be(5);
+            updatedUser.Address.FirstName.Should().Be("Bob");
+            updatedUser.Address.LastName.Should().Be("Smith");
+            updatedUser.Address.Street.Should().Be("1 Main St");
+            updatedUser.Address.City.Should().Be("Gotham");
+            updatedUser.Address.State.Should().Be("NY");
+            updatedUser.Address.ZipCode.Should().Be("10001");
+            // Exactly one persistence call, made for the correct user, with both mappings used once.
+            userManager.Verify(m => m.UpdateAsync(bob), Times.Once);
+            mapper.Verify(m => m.Map<AddressDto, Address>(inputDto), Times.Once);
+            mapper.Verify(m => m.Map<Address, AddressDto>(mappedAddress), Times.Once);
         }
 
         [Fact]
@@ -318,13 +426,25 @@ namespace API.Tests.Controllers
         {
             // Arrange
             var controller = CreateController(out var userManager, out _, out _, out var mapper);
-            var user = new AppUser { Email = "bob@test.com" };
-            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { user });
-            var inputDto = new AddressDto();
-            var mappedAddress = new Address();
+            // Two seeded users prove the failed-update path also scopes to the authenticated user.
+            var bob = new AppUser { Email = "bob@test.com", Address = new Address { FirstName = "OldBob" } };
+            var alice = new AppUser { Email = "alice@test.com", Address = new Address { FirstName = "Alice" } };
+            ControllerTestHelpers.MockUserManagerUsers(userManager, new List<AppUser> { alice, bob });
+            var inputDto = new AddressDto
+            {
+                Id = 7, FirstName = "Bob", LastName = "Smith", Street = "1 Main St",
+                City = "Gotham", State = "NY", ZipCode = "10001"
+            };
+            var mappedAddress = new Address
+            {
+                Id = 7, FirstName = "Bob", LastName = "Smith", Street = "1 Main St",
+                City = "Gotham", State = "NY", ZipCode = "10001"
+            };
             mapper.Setup(m => m.Map<AddressDto, Address>(inputDto)).Returns(mappedAddress);
-            mapper.Setup(m => m.Map<Address, AddressDto>(It.IsAny<Address>())).Returns(new AddressDto());
+            // Capture the persisted user to prove scoping even on the failure branch.
+            AppUser updatedUser = null;
             userManager.Setup(m => m.UpdateAsync(It.IsAny<AppUser>()))
+                .Callback<AppUser>(u => updatedUser = u)
                 .ReturnsAsync(IdentityResult.Failed(new IdentityError { Code = "UpdateFailed", Description = "nope" }));
             controller.WithUser(ControllerTestHelpers.GetClaimsPrincipal("bob@test.com"));
 
@@ -336,6 +456,11 @@ namespace API.Tests.Controllers
             var badRequest = (BadRequestObjectResult)result.Result;
             // NOTE: exact production string, "then" typo included — do NOT "correct" it.
             badRequest.Value.Should().Be("Problem updating then user");
+            // The failed update was attempted exactly once, for the correct (authenticated) user,
+            // whose address had already been mutated to the mapped Address before persistence.
+            updatedUser.Should().BeSameAs(bob);
+            updatedUser.Address.Should().BeSameAs(mappedAddress);
+            userManager.Verify(m => m.UpdateAsync(bob), Times.Once);
         }
     }
 }
