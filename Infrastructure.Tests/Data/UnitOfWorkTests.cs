@@ -25,16 +25,20 @@ namespace Infrastructure.Tests.Data
     public class UnitOfWorkTests
     {
         /// <summary>
-        /// Builds a minimal, valid <see cref="Product"/> for staging through a repository.
-        /// Only the columns needed to persist a bare product are populated; under the
-        /// InMemory provider no foreign keys are enforced, so brand/type are omitted.
+        /// Builds a <see cref="DeliveryMethod"/> for staging through a repository.
+        /// DeliveryMethod is used in preference to Product deliberately: it is a
+        /// relationally self-contained entity with no foreign keys, so the fixture is valid
+        /// under every provider (the EF Core InMemory provider used here and the real
+        /// PostgreSQL schema exercised by the integration suite). Foreign-key and
+        /// relational-integrity behavior is proven separately against PostgreSQL and is
+        /// intentionally out of scope for these provider-agnostic InMemory unit tests.
         /// </summary>
-        private static Product MakeProduct(string name, decimal price) =>
-            new Product
+        private static DeliveryMethod MakeDeliveryMethod(string shortName, decimal price) =>
+            new DeliveryMethod
             {
-                Name = name,
-                Description = name + " description",
-                PictureUrl = "images/products/" + name + ".png",
+                ShortName = shortName,
+                DeliveryTime = "1-2 Days",
+                Description = shortName + " delivery",
                 Price = price
             };
 
@@ -74,7 +78,7 @@ namespace Infrastructure.Tests.Data
             // Arrange
             using var context = TestStoreContextFactory.CreateInMemoryContext();
             var unitOfWork = new UnitOfWork(context);
-            unitOfWork.Repository<Product>().Add(MakeProduct("Complete Product", 12m));
+            unitOfWork.Repository<DeliveryMethod>().Add(MakeDeliveryMethod("Complete Method", 12m));
 
             // Act
             var result = await unitOfWork.Complete();
@@ -84,20 +88,38 @@ namespace Infrastructure.Tests.Data
         }
 
         [Fact]
-        public async Task Complete_WhenChangesStaged_PersistsRowsQueryableAfterwards()
+        public async Task Complete_WhenChangesStaged_ExclusivelyOwnsPersistence()
         {
-            // Arrange
-            using var context = TestStoreContextFactory.CreateInMemoryContext();
-            var unitOfWork = new UnitOfWork(context);
-            unitOfWork.Repository<Product>().Add(MakeProduct("Persisted Product", 20m));
+            // Arrange - one InMemory store observed through independent context instances.
+            // A shared database name lets separate contexts read the same backing store that
+            // the unit of work writes through, so persistence is proven across a context
+            // boundary rather than merely within the writer's own change tracker.
+            var databaseName = Guid.NewGuid().ToString();
+            using var writeContext = TestStoreContextFactory.CreateInMemoryContext(databaseName);
+            var unitOfWork = new UnitOfWork(writeContext);
+            unitOfWork.Repository<DeliveryMethod>().Add(MakeDeliveryMethod("Priority", 25m));
 
-            // Act
-            await unitOfWork.Complete();
+            // Assert (pre-Complete) - staging through the repository must NOT persist on its
+            // own. An independent context sees an empty store, proving Repository<T>.Add does
+            // not hide a SaveChanges call and that Complete() exclusively owns the commit.
+            using (var beforeContext = TestStoreContextFactory.CreateInMemoryContext(databaseName))
+            {
+                var beforeComplete = await beforeContext.DeliveryMethods.ToListAsync();
+                beforeComplete.Should().BeEmpty();
+            }
 
-            // Assert
-            var all = await unitOfWork.Repository<Product>().ListAllAsync();
-            all.Should().HaveCount(1);
-            all[0].Name.Should().Be("Persisted Product");
+            // Act - Complete() is the sole persistence operation.
+            var written = await unitOfWork.Complete();
+
+            // Assert (post-Complete) - the change is now visible to a fresh independent
+            // context, confirming Complete() (and nothing before it) committed exactly one row.
+            written.Should().Be(1);
+            using (var afterContext = TestStoreContextFactory.CreateInMemoryContext(databaseName))
+            {
+                var afterComplete = await afterContext.DeliveryMethods.ToListAsync();
+                afterComplete.Should().ContainSingle();
+                afterComplete[0].ShortName.Should().Be("Priority");
+            }
         }
 
         [Fact]
