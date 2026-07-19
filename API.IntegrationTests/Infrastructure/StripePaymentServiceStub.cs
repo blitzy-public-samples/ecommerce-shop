@@ -59,31 +59,73 @@ namespace API.IntegrationTests.Infrastructure
         }
 
         /// <summary>
-        /// Offline no-op for the "payment succeeded" webhook path. Returns <c>null</c>, which matches
-        /// the production contract where an unresolved payment intent yields no order. This stub is
-        /// only wired in where the SUT would otherwise call Stripe live; sibling tests that need real
-        /// webhook order transitions exercise the genuine <c>PaymentService</c> against the database
-        /// instead.
+        /// Offline, deterministic substitute for the "payment succeeded" webhook path. Returns a
+        /// non-null <see cref="Order"/> whose <c>PaymentId</c> echoes the supplied
+        /// <paramref name="paymentIntentId"/> and whose <c>Status</c> is
+        /// <see cref="OrderStatus.PaymentReceived"/> — mirroring the production
+        /// <c>PaymentService.UpdateOrderPaymentSucceeded</c> transition without any Stripe or database
+        /// access.
         /// </summary>
+        /// <remarks>
+        /// A non-null result is REQUIRED by the system under test: <c>PaymentsController.StripeWebhook</c>
+        /// dereferences <c>order.Id</c> immediately after this call (to log the updated order), so
+        /// returning <c>null</c> here would raise a <see cref="System.NullReferenceException"/> and
+        /// surface as an HTTP 500 instead of exercising the status transition. The returned order carries
+        /// the payment identity and the target status so webhook tests can assert the transition
+        /// deterministically.
+        /// </remarks>
         /// <param name="paymentIntentId">The Stripe payment-intent identifier from the webhook.</param>
-        /// <returns>A completed task wrapping <c>null</c>.</returns>
+        /// <returns>
+        /// A completed task wrapping an <see cref="Order"/> whose <c>PaymentId</c> equals
+        /// <paramref name="paymentIntentId"/> and whose <c>Status</c> is
+        /// <see cref="OrderStatus.PaymentReceived"/>.
+        /// </returns>
         public Task<Order> UpdateOrderPaymentSucceeded(string paymentIntentId)
         {
-            // offline stub: no Stripe, no DB access
-            return Task.FromResult<Order>(null);
+            // offline stub: no Stripe, no DB access. Return a deterministic, non-null order carrying the
+            // payment-intent id and the PaymentReceived status so the controller's order.Id dereference is
+            // safe and the webhook status transition is observable to integration tests.
+            var order = new Order
+            {
+                PaymentId = paymentIntentId,
+                Status = OrderStatus.PaymentReceived
+            };
+
+            return Task.FromResult(order);
         }
 
         /// <summary>
-        /// Offline no-op for the "payment failed" webhook path. Returns <c>null</c>, mirroring the
-        /// production contract where an unresolved payment intent yields no order. No Stripe SDK usage
-        /// and no database access occur.
+        /// Offline, deterministic substitute for the "payment failed" webhook path. Returns a non-null
+        /// <see cref="Order"/> whose <c>PaymentId</c> echoes the supplied
+        /// <paramref name="paymentIntentId"/> and whose <c>Status</c> is
+        /// <see cref="OrderStatus.PaymentFailed"/> — mirroring the production
+        /// <c>PaymentService.UpdateOrderPaymentFailed</c> transition without any Stripe or database
+        /// access.
         /// </summary>
+        /// <remarks>
+        /// As with the success path, a non-null result is REQUIRED because
+        /// <c>PaymentsController.StripeWebhook</c> dereferences <c>order.Id</c> right after this call;
+        /// returning <c>null</c> would raise a <see cref="System.NullReferenceException"/> (HTTP 500)
+        /// rather than exercising the failed-payment transition.
+        /// </remarks>
         /// <param name="paymentIntentId">The Stripe payment-intent identifier from the webhook.</param>
-        /// <returns>A completed task wrapping <c>null</c>.</returns>
+        /// <returns>
+        /// A completed task wrapping an <see cref="Order"/> whose <c>PaymentId</c> equals
+        /// <paramref name="paymentIntentId"/> and whose <c>Status</c> is
+        /// <see cref="OrderStatus.PaymentFailed"/>.
+        /// </returns>
         public Task<Order> UpdateOrderPaymentFailed(string paymentIntentId)
         {
-            // offline stub: no Stripe, no DB access
-            return Task.FromResult<Order>(null);
+            // offline stub: no Stripe, no DB access. Return a deterministic, non-null order carrying the
+            // payment-intent id and the PaymentFailed status so the controller's order.Id dereference is
+            // safe and the failed-payment transition is observable to integration tests.
+            var order = new Order
+            {
+                PaymentId = paymentIntentId,
+                Status = OrderStatus.PaymentFailed
+            };
+
+            return Task.FromResult(order);
         }
     }
 }

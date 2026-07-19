@@ -51,6 +51,23 @@ namespace Core.Tests.Specifications
                 Price = price
             };
 
+        /// <summary>
+        /// Builds a <see cref="Product"/> whose <c>ProductType</c> and <c>ProductBrand</c> reference
+        /// navigations are set to the supplied DISTINCT instances. Compiling an include selector and
+        /// invoking it against this product returns the exact navigation the selector targets, which
+        /// lets a test pin which member each include projects — not merely how many includes exist.
+        /// </summary>
+        private static Product MakeProductWithNavigations(ProductType productType, ProductBrand productBrand)
+            => new Product
+            {
+                Id = 1,
+                Name = "sample",
+                ProductType = productType,
+                ProductTypeId = productType.Id,
+                ProductBrand = productBrand,
+                ProductBrandId = productBrand.Id
+            };
+
         // ---------------------------------------------------------------------------------------
         // Phase 1 — Params constructor: includes and paging
         // ---------------------------------------------------------------------------------------
@@ -64,9 +81,19 @@ namespace Core.Tests.Specifications
             // Act
             var spec = new ProductsWithTypesAndBrandsSpecification(p);
 
-            // Assert
+            // Assert — exactly two includes, registered in order: [0] ProductType, [1] ProductBrand.
             spec.Includes.Should().NotBeNull();
             spec.Includes.Should().HaveCount(2);
+            // Compile each include selector and invoke it against a product carrying DISTINCT
+            // ProductType/ProductBrand instances. This pins the exact navigation each selector targets:
+            // a count-only assertion would still pass if both includes selected ProductType (silently
+            // dropping ProductBrand) or if the two selectors were reversed — either of which would break
+            // API DTO navigation loading. BeSameAs against distinct instances catches both mistakes.
+            var productType = new ProductType { Id = 7, Name = "Boards" };
+            var productBrand = new ProductBrand { Id = 9, Name = "Angular" };
+            var product = MakeProductWithNavigations(productType, productBrand);
+            spec.Includes[0].Compile().Invoke(product).Should().BeSameAs(productType);
+            spec.Includes[1].Compile().Invoke(product).Should().BeSameAs(productBrand);
         }
 
         [Fact]
@@ -157,10 +184,13 @@ namespace Core.Tests.Specifications
             spec.OrderByDescending.Should().NotBeNull();
             spec.OrderByDescending.Compile().Invoke(MakeProduct("zzz", 1, 1, price: 42m)).Should().Be(42m);
 
-            // NUANCE: OrderBy is deliberately NOT null here — the unconditional AddOrderBy(x => x.Name)
-            // runs before the switch and is not cleared by the priceDesc branch. Asserting NotBeNull
-            // documents this behavior and guards against a false "OrderBy should be null" expectation.
+            // NUANCE: OrderBy is deliberately NOT cleared by the priceDesc branch — the unconditional
+            // AddOrderBy(x => x.Name) runs before the sort switch and remains in effect. Assert that the
+            // retained OrderBy still SELECTS Name (compile + invoke), not merely that it is non-null, so
+            // a regression that repointed the retained OrderBy at a different member (or accidentally set
+            // it to Price) would be caught here.
             spec.OrderBy.Should().NotBeNull();
+            spec.OrderBy.Compile().Invoke(MakeProduct("widget", 1, 1)).Should().Be("widget");
         }
 
         [Fact]
@@ -227,8 +257,17 @@ namespace Core.Tests.Specifications
             criteria.Invoke(MakeProduct("Skate Board", 1, 2)).Should().BeTrue();
 
             // A product whose name lacks the search term fails the criteria even with matching
-            // brand and type.
+            // brand and type (Search conjunct fails).
             criteria.Invoke(MakeProduct("React Book", 1, 2)).Should().BeFalse();
+
+            // Wrong brand: name matches and type matches, but the brand differs -> the BrandId conjunct
+            // must fail. Without this case an omitted/short-circuited brand clause would go undetected
+            // while count and returned rows silently diverge.
+            criteria.Invoke(MakeProduct("Skate Board", 99, 2)).Should().BeFalse();
+
+            // Wrong type: name matches and brand matches, but the type differs -> the TypeId conjunct
+            // must fail. Guards the type clause the same way the wrong-brand case guards the brand clause.
+            criteria.Invoke(MakeProduct("Skate Board", 1, 99)).Should().BeFalse();
         }
 
         // ---------------------------------------------------------------------------------------
@@ -254,8 +293,15 @@ namespace Core.Tests.Specifications
             // Act
             var spec = new ProductsWithTypesAndBrandsSpecification(5);
 
-            // Assert
+            // Assert — the id constructor registers the SAME two includes, in the same order, as the
+            // params constructor: [0] ProductType, [1] ProductBrand. Pin each selector via compile +
+            // invoke against distinct instances so a wrong/duplicate/reordered include is caught.
             spec.Includes.Should().HaveCount(2);
+            var productType = new ProductType { Id = 7, Name = "Boards" };
+            var productBrand = new ProductBrand { Id = 9, Name = "Angular" };
+            var product = MakeProductWithNavigations(productType, productBrand);
+            spec.Includes[0].Compile().Invoke(product).Should().BeSameAs(productType);
+            spec.Includes[1].Compile().Invoke(product).Should().BeSameAs(productBrand);
         }
 
         [Fact]

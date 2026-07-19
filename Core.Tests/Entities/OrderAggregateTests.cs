@@ -5,6 +5,10 @@ using System.Runtime.Serialization;
 using Core.Entities.OrderAggregate;
 using FluentAssertions;
 using Xunit;
+// Alias the order-aggregate Address so its constructor/field assertions are unambiguous and
+// clearly distinct from the unrelated Core.Entities.Identity.Address type (same simple name,
+// different namespace). This mirrors the reviewer's suggested disambiguation.
+using OrderAddress = Core.Entities.OrderAggregate.Address;
 
 namespace Core.Tests.Entities
 {
@@ -65,7 +69,7 @@ namespace Core.Tests.Entities
             {
                 new OrderItem(new ProductItemOrdered(1, "Board", "https://test.com/b.png"), 10.00m, 2)
             };
-            var address = new Address("John", "Doe", "10 Main St", "New York", "NY", "10001");
+            var address = new OrderAddress("John", "Doe", "10 Main St", "New York", "NY", "10001");
             var deliveryMethod = new DeliveryMethod { ShortName = "UPS1", DeliveryTime = "1-2 Days", Description = "Fastest", Price = 10.00m };
 
             // Act
@@ -76,9 +80,60 @@ namespace Core.Tests.Entities
             order.OrderItems.Should().HaveCount(1);
             order.BuyerEmail.Should().Be("buyer@test.com");
             order.ShipToAddress.Should().BeSameAs(address);
+            // Prove the shipping address's field values (not merely its reference identity) survived
+            // construction. Previously only BeSameAs was asserted, so a broken address field assignment
+            // would have gone undetected. These assertions read the exact values back through the Order.
+            order.ShipToAddress.FirstName.Should().Be("John");
+            order.ShipToAddress.LastName.Should().Be("Doe");
+            order.ShipToAddress.Street.Should().Be("10 Main St");
+            order.ShipToAddress.City.Should().Be("New York");
+            order.ShipToAddress.State.Should().Be("NY");
+            order.ShipToAddress.ZipCode.Should().Be("10001");
             order.DeliveryMethod.Should().BeSameAs(deliveryMethod);
             order.Subtotal.Should().Be(20.00m);
             order.PaymentId.Should().Be("pi_123");
+        }
+
+        /// <summary>
+        /// The six-argument <see cref="Address"/> constructor (order-aggregate value object, aliased
+        /// here as <c>OrderAddress</c> to distinguish it from the unrelated
+        /// <c>Core.Entities.Identity.Address</c>) must map every positional argument onto the matching
+        /// property in order: <c>firstName</c>, <c>lastName</c>, <c>street</c>, <c>city</c>,
+        /// <c>state</c>, <c>zipCode</c>. This directly guards the address-assignment logic that the
+        /// order construction relies on, so a transposed or dropped field is caught here.
+        /// </summary>
+        [Fact]
+        public void Address_Constructor_WithArguments_SetsAllProperties()
+        {
+            // Arrange &amp; Act
+            var address = new OrderAddress("Jane", "Smith", "221B Baker Street", "London", "Greater London", "NW1 6XE");
+
+            // Assert — each argument lands on its matching property (positional-mapping correctness).
+            address.FirstName.Should().Be("Jane");
+            address.LastName.Should().Be("Smith");
+            address.Street.Should().Be("221B Baker Street");
+            address.City.Should().Be("London");
+            address.State.Should().Be("Greater London");
+            address.ZipCode.Should().Be("NW1 6XE");
+        }
+
+        /// <summary>
+        /// The parameterless <see cref="Address"/> constructor (used by EF Core / model binding) leaves
+        /// every string property at its <c>null</c> default and assigns nothing implicitly.
+        /// </summary>
+        [Fact]
+        public void Address_DefaultConstructor_LeavesPropertiesNull()
+        {
+            // Arrange &amp; Act
+            var address = new OrderAddress();
+
+            // Assert
+            address.FirstName.Should().BeNull();
+            address.LastName.Should().BeNull();
+            address.Street.Should().BeNull();
+            address.City.Should().BeNull();
+            address.State.Should().BeNull();
+            address.ZipCode.Should().BeNull();
         }
 
         /// <summary>

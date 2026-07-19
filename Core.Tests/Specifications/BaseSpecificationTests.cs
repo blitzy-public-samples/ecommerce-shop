@@ -157,8 +157,16 @@ namespace Core.Tests.Specifications
             // Act
             spec.CallAddInclude(p => p.ProductType);
 
-            // Assert
+            // Assert — exactly one include is registered AND it projects the ProductType navigation.
             spec.Includes.Should().HaveCount(1);
+            // Compile the captured selector and invoke it against a product carrying DISTINCT
+            // ProductType and ProductBrand instances. A wrong selector (e.g. ProductBrand) would return
+            // the other object, so BeSameAs pins the exact member the include targets — a plain count
+            // assertion could not detect a wrong/duplicate selector.
+            var productType = new ProductType { Id = 7, Name = "Boards" };
+            var productBrand = new ProductBrand { Id = 9, Name = "Angular" };
+            var product = new Product { ProductType = productType, ProductBrand = productBrand };
+            spec.Includes[0].Compile().Invoke(product).Should().BeSameAs(productType);
         }
 
         [Fact]
@@ -171,8 +179,16 @@ namespace Core.Tests.Specifications
             spec.CallAddInclude(p => p.ProductType);
             spec.CallAddInclude(p => p.ProductBrand);
 
-            // Assert
+            // Assert — both includes registered, in call order, each projecting the exact navigation.
             spec.Includes.Should().HaveCount(2);
+            // Distinct instances make each selector's target unambiguous: Includes[0] must select
+            // ProductType and Includes[1] must select ProductBrand. Duplicating or reordering the
+            // selectors would fail BeSameAs even though the count stays 2.
+            var productType = new ProductType { Id = 7, Name = "Boards" };
+            var productBrand = new ProductBrand { Id = 9, Name = "Angular" };
+            var product = new Product { ProductType = productType, ProductBrand = productBrand };
+            spec.Includes[0].Compile().Invoke(product).Should().BeSameAs(productType);
+            spec.Includes[1].Compile().Invoke(product).Should().BeSameAs(productBrand);
         }
 
         [Fact]
@@ -199,8 +215,11 @@ namespace Core.Tests.Specifications
             // Act
             spec.CallAddOrderByDescending(p => p.Price);
 
-            // Assert
+            // Assert — the descending selector is set AND resolves to the Price value (not merely
+            // non-null). The selector is Expression<Func<Product, object>>, so the decimal is boxed;
+            // compiling and invoking it proves it targets Price rather than any other member.
             spec.OrderByDescending.Should().NotBeNull();
+            spec.OrderByDescending.Compile().Invoke(new Product { Price = 42m }).Should().Be(42m);
         }
 
         [Fact]

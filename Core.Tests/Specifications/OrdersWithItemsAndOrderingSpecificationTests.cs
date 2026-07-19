@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq.Expressions;
 using Core.Entities.OrderAggregate;
 using FluentAssertions;
@@ -49,6 +50,15 @@ namespace Core.Tests.Specifications
         /// </summary>
         private static Order MakeOrder(int id, string email) => new Order { Id = id, BuyerEmail = email };
 
+        /// <summary>
+        /// Builds an <see cref="Order"/> whose <c>OrderItems</c> and <c>DeliveryMethod</c> reference
+        /// navigations are set to the supplied DISTINCT instances. Compiling an include selector and
+        /// invoking it against this order returns the exact navigation the selector targets, letting a
+        /// test pin which member each include projects rather than merely counting the includes.
+        /// </summary>
+        private static Order MakeOrderWithNavigations(IReadOnlyList<OrderItem> orderItems, DeliveryMethod deliveryMethod)
+            => new Order { Id = 1, BuyerEmail = MatchingEmail, OrderItems = orderItems, DeliveryMethod = deliveryMethod };
+
         // ---------------------------------------------------------------------------------------
         // Phase 1 — Email constructor: OrdersWithItemsAndOrderingSpecification(string email)
         // ---------------------------------------------------------------------------------------
@@ -73,8 +83,17 @@ namespace Core.Tests.Specifications
             // Arrange & Act
             var spec = new OrdersWithItemsAndOrderingSpecification(MatchingEmail);
 
-            // Assert — exactly two eager-load includes (OrderItems, DeliveryMethod) are registered.
+            // Assert — exactly two eager-load includes, in order: [0] OrderItems, [1] DeliveryMethod.
             spec.Includes.Should().HaveCount(2);
+            // Pin each selector via compile + invoke against an order carrying DISTINCT OrderItems and
+            // DeliveryMethod instances. A wrong/duplicate/reordered include would fail BeSameAs even
+            // though the count stays 2 — which would otherwise let order DTOs silently lose OrderItems
+            // or DeliveryMethod eager loading.
+            var orderItems = new List<OrderItem> { new OrderItem() };
+            var deliveryMethod = new DeliveryMethod { Id = 3, ShortName = "UPS1" };
+            var order = MakeOrderWithNavigations(orderItems, deliveryMethod);
+            spec.Includes[0].Compile().Invoke(order).Should().BeSameAs(orderItems);
+            spec.Includes[1].Compile().Invoke(order).Should().BeSameAs(deliveryMethod);
         }
 
         [Fact]
@@ -148,8 +167,15 @@ namespace Core.Tests.Specifications
             // Arrange & Act
             var spec = new OrdersWithItemsAndOrderingSpecification(3, MatchingEmail);
 
-            // Assert — same two eager-load includes as the email constructor.
+            // Assert — same two eager-load includes, same order, as the email constructor:
+            // [0] OrderItems, [1] DeliveryMethod. Pin each selector via compile + invoke against
+            // distinct instances so a wrong/duplicate/reordered include is caught, not just the count.
             spec.Includes.Should().HaveCount(2);
+            var orderItems = new List<OrderItem> { new OrderItem() };
+            var deliveryMethod = new DeliveryMethod { Id = 3, ShortName = "UPS1" };
+            var order = MakeOrderWithNavigations(orderItems, deliveryMethod);
+            spec.Includes[0].Compile().Invoke(order).Should().BeSameAs(orderItems);
+            spec.Includes[1].Compile().Invoke(order).Should().BeSameAs(deliveryMethod);
         }
 
         [Fact]
