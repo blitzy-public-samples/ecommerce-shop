@@ -17,8 +17,16 @@
           <Exclude>[Core.Tests]*,[Infrastructure.Tests]*,[API.Tests]*,[API.IntegrationTests]*,[xunit.*]*</Exclude>
           <!-- Exclude EF Core auto-generated migration/snapshot files (Store + Identity) so they do not dilute Infrastructure coverage -->
           <ExcludeByFile>**/Migrations/*.cs</ExcludeByFile>
-          <!-- Exclude compiler/framework generated members and explicit opt-outs -->
-          <ExcludeByAttribute>Obsolete,GeneratedCodeAttribute,CompilerGeneratedAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>
+          <!-- Exclude framework-generated and explicit opt-out members ONLY.
+               IMPORTANT: CompilerGeneratedAttribute is deliberately NOT listed here. Almost all
+               Infrastructure/API logic is async, and the C# compiler moves async method bodies
+               into [CompilerGenerated] state-machine types (<Method>d__N). Excluding that attribute
+               makes Coverlet ignore the real business logic (server-side price authority, payment
+               amount + shipping math, JWT issuance, cache serialization/TTL, and persistence),
+               leaving only constructors/synchronous lines measured. That yields a misleading "100%"
+               that cannot catch a deleted financial-logic test and defeats the per-class coverage
+               gates required by AAP 0.7.1. Keeping it measured is what makes those gates meaningful. -->
+          <ExcludeByAttribute>Obsolete,GeneratedCodeAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>
           <SingleHit>false</SingleHit>
           <UseSourceLink>true</UseSourceLink>
           <IncludeTestAssembly>false</IncludeTestAssembly>
