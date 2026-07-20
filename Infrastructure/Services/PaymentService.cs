@@ -24,6 +24,12 @@ namespace Infrastructure.Services
             _config = config;
         }
 
+        // Testability seam (test-only): overridable factory allowing unit tests to substitute the Stripe
+        // PaymentIntentService and avoid live Stripe API calls. Production behavior is unchanged — the
+        // default implementation still returns `new PaymentIntentService()`. Added per the automated
+        // test-suite special constraint (minimal, annotated production change).
+        protected virtual PaymentIntentService CreatePaymentIntentService() => new PaymentIntentService();
+
         public async Task<CustomerBasket> CreateOrUpdatePaymentIntent(string basketId)
         {
             StripeConfiguration.ApiKey = _config["StripeSettings:SecretKey"];
@@ -49,7 +55,7 @@ namespace Infrastructure.Services
                 }
             }
 
-            var service = new PaymentIntentService();
+            var service = CreatePaymentIntentService();
 
             PaymentIntent intent;
 

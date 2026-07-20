@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Coverlet (coverlet.collector 3.2.0) configuration for `dotnet test`.
+     Usage: run dotnet test with the settings option set to this file
+       (coverage.runsettings) and the collect option set to "XPlat Code Coverage".
+     Emits coverage.cobertura.xml + coverage.info (lcov) under TestResults/<guid>/.
+     Per-namespace/per-class rollups: reportgenerator -reports:**/coverage.cobertura.xml -targetdir:coveragereport -->
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <!-- Emit both Cobertura (default) and LCOV so CI dashboards and threshold tooling can consume either -->
+          <Format>cobertura,lcov</Format>
+          <!-- Measure only the three production assemblies; format is [assembly]namespace.type -->
+          <Include>[Core]*,[Infrastructure]*,[API]*</Include>
+          <!-- Never measure the test assemblies themselves -->
+          <Exclude>[Core.Tests]*,[Infrastructure.Tests]*,[API.Tests]*,[API.IntegrationTests]*,[xunit.*]*</Exclude>
+          <!-- Exclude EF Core auto-generated migration/snapshot files (Store + Identity) so they do not dilute Infrastructure coverage -->
+          <ExcludeByFile>**/Migrations/*.cs</ExcludeByFile>
+          <!-- Exclude framework-generated and explicit opt-out members ONLY.
+               IMPORTANT: CompilerGeneratedAttribute is deliberately NOT listed here. Almost all
+               Infrastructure/API logic is async, and the C# compiler moves async method bodies
+               into [CompilerGenerated] state-machine types (<Method>d__N). Excluding that attribute
+               makes Coverlet ignore the real business logic (server-side price authority, payment
+               amount + shipping math, JWT issuance, cache serialization/TTL, and persistence),
+               leaving only constructors/synchronous lines measured. That yields a misleading "100%"
+               that cannot catch a deleted financial-logic test and defeats the per-class coverage
+               gates required by AAP 0.7.1. Keeping it measured is what makes those gates meaningful. -->
+          <ExcludeByAttribute>Obsolete,GeneratedCodeAttribute,ExcludeFromCodeCoverageAttribute</ExcludeByAttribute>
+          <SingleHit>false</SingleHit>
+          <UseSourceLink>true</UseSourceLink>
+          <IncludeTestAssembly>false</IncludeTestAssembly>
+          <!-- Measure auto-implemented property get/set accessors so the Core entities
+               (Product, CustomerBasket, BasketItem, the Order aggregate and the Identity
+               entities) — which are predominantly auto-properties — are actually enumerated
+               and scored by the primary coverage gate. With SkipAutoProps=true those entity
+               files were omitted from the report, so the AAP §0.7.1 "Core entities >= 70%
+               line coverage" gate could not be verified against the committed artifact.
+               Keeping auto-props measured makes that per-class gate meaningful (the Core.Tests
+               entity suites construct each entity and exercise its properties). -->
+          <SkipAutoProps>false</SkipAutoProps>
+          <DeterministicReport>false</DeterministicReport>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>
