@@ -1,5 +1,6 @@
-import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { FormsModule } from '@angular/forms';
+import { PaginationModule } from 'ngx-bootstrap/pagination';
 
 import { PagerComponent } from './pager.component';
 
@@ -8,9 +9,13 @@ describe('PagerComponent', () => {
   let fixture: ComponentFixture<PagerComponent>;
 
   beforeEach(async () => {
+    // Real template compilation (no NO_ERRORS_SCHEMA masking) using the exact
+    // dependencies the production template renders: the ngx-bootstrap <pagination>
+    // component (same module SharedModule declares via forRoot()) and FormsModule
+    // for its [ngModel] two-way binding.
     await TestBed.configureTestingModule({
+      imports: [FormsModule, PaginationModule.forRoot()],
       declarations: [PagerComponent],
-      schemas: [NO_ERRORS_SCHEMA],
     }).compileComponents();
   });
 

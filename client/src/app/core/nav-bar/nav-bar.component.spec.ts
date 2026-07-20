@@ -1,6 +1,7 @@
 import { TestBed, ComponentFixture } from '@angular/core/testing';
-import { NO_ERRORS_SCHEMA } from '@angular/core';
+import { CommonModule } from '@angular/common';
 import { RouterTestingModule } from '@angular/router/testing';
+import { BsDropdownModule } from 'ngx-bootstrap/dropdown';
 import { of } from 'rxjs';
 
 import { NavBarComponent } from './nav-bar.component';
@@ -26,13 +27,15 @@ describe('NavBarComponent', () => {
         NavBarComponent
       ],
       imports: [
-        // Satisfies the template's routerLink / routerLinkActive directives.
-        RouterTestingModule
-      ],
-      schemas: [
-        // Neutralizes the unknown ngx-bootstrap dropdown directive trio
-        // (dropdown / dropdownToggle / *dropdownMenu) used by the template.
-        NO_ERRORS_SCHEMA
+        // Real template compilation (no NO_ERRORS_SCHEMA masking) using the exact
+        // dependencies the production template renders:
+        //   - CommonModule: the async pipe and *ngIf on basket$/currentUser$.
+        //   - RouterTestingModule: routerLink / routerLinkActive.
+        //   - BsDropdownModule: the ngx-bootstrap dropdown/dropdownToggle/*dropdownMenu
+        //     directive trio (the same module AppModule declares via forRoot()).
+        CommonModule,
+        RouterTestingModule,
+        BsDropdownModule.forRoot()
       ],
       providers: [
         { provide: BasketService, useValue: basketServiceStub },

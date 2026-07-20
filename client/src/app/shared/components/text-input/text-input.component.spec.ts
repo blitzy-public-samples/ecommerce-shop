@@ -1,4 +1,5 @@
-import { Component, NO_ERRORS_SCHEMA } from '@angular/core';
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { FormControl, ReactiveFormsModule, Validators } from '@angular/forms';
 import { By } from '@angular/platform-browser';
@@ -14,9 +15,11 @@ class TextInputHostComponent {
 describe('TextInputComponent', () => {
   beforeEach(async () => {
     await TestBed.configureTestingModule({
-      imports: [ReactiveFormsModule],
+      // Real template compilation (no NO_ERRORS_SCHEMA masking): CommonModule
+      // supplies [ngClass]/*ngIf and ReactiveFormsModule supplies [formControl],
+      // which are the component's only template dependencies.
+      imports: [CommonModule, ReactiveFormsModule],
       declarations: [TextInputComponent, TextInputHostComponent],
-      schemas: [NO_ERRORS_SCHEMA],
     }).compileComponents();
   });
 

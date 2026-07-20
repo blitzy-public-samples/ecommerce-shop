@@ -30,7 +30,15 @@
           <SingleHit>false</SingleHit>
           <UseSourceLink>true</UseSourceLink>
           <IncludeTestAssembly>false</IncludeTestAssembly>
-          <SkipAutoProps>true</SkipAutoProps>
+          <!-- Measure auto-implemented property get/set accessors so the Core entities
+               (Product, CustomerBasket, BasketItem, the Order aggregate and the Identity
+               entities) — which are predominantly auto-properties — are actually enumerated
+               and scored by the primary coverage gate. With SkipAutoProps=true those entity
+               files were omitted from the report, so the AAP §0.7.1 "Core entities >= 70%
+               line coverage" gate could not be verified against the committed artifact.
+               Keeping auto-props measured makes that per-class gate meaningful (the Core.Tests
+               entity suites construct each entity and exercise its properties). -->
+          <SkipAutoProps>false</SkipAutoProps>
           <DeterministicReport>false</DeterministicReport>
         </Configuration>
       </DataCollector>

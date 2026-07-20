@@ -2,7 +2,7 @@
 
 This repository contains the source code for an online web store application built with .NET 5.0 as the backend framework and Angular 11 as the frontend framework. This application allows users to browse products, add them to their cart, and make purchases online.
 
-Note: The project's original, step-by-step development and build process is documented in the historical `CHANGES.md` file (a dated 2021 development diary). Open it for background on how the application was initially built; for the current setup and stack, see the "Getting Started" section below.
+Note: All changes in building process are documented in `CHANGES.md` file. You can open file for more details on implementation.
 
 ## Getting Started
 
@@ -37,7 +37,7 @@ Before you can run the project, you will need to install the following software:
 4. **Start the backend server.**
     ```bash
     cd ..
-    dotnet run --project API
+    dotnet run
     ```
 
 5. **Start the Angular application in separate terminal session.**
@@ -51,6 +51,6 @@ Before you can run the project, you will need to install the following software:
 - Product browsing
 - Shopping cart functionalities
 - Order checkout and payment processing (demo)
-- Local infrastructure (PostgreSQL + Redis) provided via Docker Compose
+- Dockerized for easy hosting
 
 

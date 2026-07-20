@@ -1,4 +1,3 @@
-import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { CommonModule } from '@angular/common';
 import { RouterTestingModule } from '@angular/router/testing';
@@ -44,9 +43,11 @@ describe('BasketSummaryComponent', () => {
 
   beforeEach(async () => {
     await TestBed.configureTestingModule({
+      // Real template compilation (no NO_ERRORS_SCHEMA masking): CommonModule
+      // supplies *ngIf/*ngFor/currency and RouterTestingModule supplies routerLink,
+      // which are the only template dependencies BasketSummaryComponent renders.
       imports: [CommonModule, RouterTestingModule],
-      declarations: [BasketSummaryComponent],
-      schemas: [NO_ERRORS_SCHEMA]
+      declarations: [BasketSummaryComponent]
     }).compileComponents();
   });
 

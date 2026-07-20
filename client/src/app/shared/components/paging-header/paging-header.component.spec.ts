@@ -1,5 +1,4 @@
 import { CommonModule } from '@angular/common';
-import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { PagingHeaderComponent } from './paging-header.component';
 
@@ -9,9 +8,10 @@ describe('PagingHeaderComponent', () => {
 
   beforeEach(async () => {
     await TestBed.configureTestingModule({
+      // Real template compilation (no NO_ERRORS_SCHEMA masking): CommonModule
+      // supplies *ngIf and interpolation, the component's only template deps.
       imports: [CommonModule],
       declarations: [PagingHeaderComponent],
-      schemas: [NO_ERRORS_SCHEMA],
     }).compileComponents();
 
     fixture = TestBed.createComponent(PagingHeaderComponent);

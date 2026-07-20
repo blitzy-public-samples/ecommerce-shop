@@ -1,6 +1,5 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { CommonModule } from '@angular/common';
-import { NO_ERRORS_SCHEMA } from '@angular/core';
 import { OrderTotalsComponent } from './order-totals.component';
 
 describe('OrderTotalsComponent', () => {
@@ -9,9 +8,10 @@ describe('OrderTotalsComponent', () => {
 
   beforeEach(async () => {
     await TestBed.configureTestingModule({
+      // Real template compilation (no NO_ERRORS_SCHEMA masking): CommonModule
+      // supplies the currency pipe, the component's only template dependency.
       imports: [CommonModule],
       declarations: [OrderTotalsComponent],
-      schemas: [NO_ERRORS_SCHEMA],
     }).compileComponents();
 
     fixture = TestBed.createComponent(OrderTotalsComponent);
