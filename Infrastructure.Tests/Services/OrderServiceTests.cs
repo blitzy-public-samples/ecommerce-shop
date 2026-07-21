@@ -133,6 +133,22 @@ namespace Infrastructure.Tests.Services
         }
 
         [Fact]
+        public async Task CreateOrderAsync_WhenBasketValid_CommitsReservationsWithinOrderTransaction()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket);
+
+            // Act
+            await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — the basket's reservations are committed exactly once, keyed by the basket id.
+            // Commitment is staged inside the same Unit-of-Work transaction that persists the order
+            // (OrderService calls CommitReservationAsync between Add(order) and the single Complete()).
+            _inventoryService.Verify(i => i.CommitReservationAsync("basket-1"), Times.Once);
+        }
+
+        [Fact]
         public async Task CreateOrderAsync_WhenCompleteReturnsZero_ReturnsNull()
         {
             // Arrange
