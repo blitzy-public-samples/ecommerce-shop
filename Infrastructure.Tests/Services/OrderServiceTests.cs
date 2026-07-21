@@ -133,19 +133,38 @@ namespace Infrastructure.Tests.Services
         }
 
         [Fact]
-        public async Task CreateOrderAsync_WhenBasketValid_CommitsReservationsWithinOrderTransaction()
+        public async Task CreateOrderAsync_WhenBasketValid_InvokesCommitReservationBetweenAddingOrderAndCompleting()
         {
             // Arrange
             var basket = BasketWithBogusClientPrice();
             ArrangeValidCreateOrderDependencies(basket);
 
+            // Record the relative invocation order of the three finalization steps that OrderService
+            // orchestrates, so we can assert the sequencing this unit test is actually able to prove.
+            var callOrder = new List<string>();
+            _orderRepo.Setup(r => r.Add(It.IsAny<Order>()))
+                .Callback(() => callOrder.Add("Add"));
+            _inventoryService.Setup(i => i.CommitReservationAsync("basket-1"))
+                .Callback(() => callOrder.Add("CommitReservationAsync"))
+                .Returns(Task.CompletedTask);
+            _unitOfWork.Setup(u => u.Complete())
+                .Callback(() => callOrder.Add("Complete"))
+                .ReturnsAsync(1);
+
             // Act
             await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
 
-            // Assert — the basket's reservations are committed exactly once, keyed by the basket id.
-            // Commitment is staged inside the same Unit-of-Work transaction that persists the order
-            // (OrderService calls CommitReservationAsync between Add(order) and the single Complete()).
+            // Assert — this is a UNIT-LEVEL orchestration/sequencing guarantee proven with mocks:
+            // OrderService stages the basket's reservation commit exactly once, AFTER Add(order) and
+            // BEFORE the single Complete(), so the commit is staged for the same SaveChanges as the order.
+            //
+            // This test deliberately does NOT — and with mocks CANNOT — prove a real database
+            // transaction, a Products "SELECT ... FOR UPDATE" row lock, rollback on failure, or the
+            // ordering of Redis hold-key cleanup relative to durable commit. Those durability/atomicity
+            // guarantees belong to the PostgreSQL-backed integration tests (API.IntegrationTests), not
+            // to this in-memory unit test.
             _inventoryService.Verify(i => i.CommitReservationAsync("basket-1"), Times.Once);
+            callOrder.Should().Equal(new[] { "Add", "CommitReservationAsync", "Complete" });
         }
 
         [Fact]
