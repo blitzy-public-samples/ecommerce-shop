@@ -239,9 +239,12 @@ namespace Infrastructure.Tests.Services
             var product = await _context.Products.FindAsync(productId);
             product.StockQuantity.Should().Be(7);
 
+            // (F4) Commit STAGES ONLY: the Redis hold key must NOT be deleted here. Deletion is deferred to
+            // FinalizeCommittedHoldsAsync, invoked by OrderService only AFTER a successful flush, so that a
+            // rolled-back order leaves the hold key intact and Redis stays consistent with the reverted reservation.
             _mockDb.Verify(d => d.KeyDeleteAsync(
                 It.Is<RedisKey>(k => k == $"reservation:basket-commit:{productId}"), It.IsAny<CommandFlags>()),
-                Times.Once);
+                Times.Never);
             _mockDb.Verify(d => d.StringDecrementAsync(
                 It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
             _mockDb.Verify(d => d.StringIncrementAsync(
@@ -750,9 +753,10 @@ namespace Infrastructure.Tests.Services
             var reservation = await _context.Reservations
                 .FirstOrDefaultAsync(r => r.BasketId == "basket-missing-prod");
             reservation.Status.Should().Be(ReservationStatus.Committed);
+            // (F4) Commit STAGES ONLY: no Redis hold-key deletion here (deferred to FinalizeCommittedHoldsAsync).
             _mockDb.Verify(d => d.KeyDeleteAsync(
                 It.Is<RedisKey>(k => k == $"reservation:basket-missing-prod:999"), It.IsAny<CommandFlags>()),
-                Times.Once);
+                Times.Never);
         }
 
         // 27. Commit against a flash-sale pool tolerates a MISSING sale row: the reservation is still
@@ -798,6 +802,228 @@ namespace Infrastructure.Tests.Services
                 It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
             _mockSub.Verify(s => s.PublishAsync(
                 It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()), Times.Never);
+        }
+
+
+        // 14. ExtendReservation grows an existing general-pool hold within available capacity.
+        [Fact]
+        public async Task ExtendReservationAsync_WhenGrowingGeneralPoolWithinCapacity_UpdatesQuantityAndDecrementsByDelta()
+        {
+            // Arrange — product stock 10, an existing Active hold of 2 for this basket (general pool).
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 2, status: ReservationStatus.Active,
+                basketId: "basket-grow-gen", flashSaleId: null);
+
+            // Act — grow the desired total to 5 (delta = 3; available = 10 - 2 = 8, so granted).
+            var result = await _sut.ExtendReservationAsync("basket-grow-gen", productId, 5);
+
+            // Assert
+            result.Should().BeTrue();
+            var reservation = await _context.Reservations
+                .FirstOrDefaultAsync(r => r.BasketId == "basket-grow-gen");
+            reservation.Quantity.Should().Be(5);
+            _mockDb.Verify(d => d.StringDecrementAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{productId}"), 3, It.IsAny<CommandFlags>()),
+                Times.Once);
+        }
+
+        // 15. ExtendReservation with no existing hold delegates to CreateReservation and returns its result.
+        [Fact]
+        public async Task ExtendReservationAsync_WhenNoExistingHold_CreatesReservationAndReturnsTrue()
+        {
+            // Arrange
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+
+            // Act
+            var result = await _sut.ExtendReservationAsync("basket-extend-create", productId, 3);
+
+            // Assert — a brand-new Active reservation was created for the requested quantity.
+            result.Should().BeTrue();
+            var reservation = await _context.Reservations
+                .FirstOrDefaultAsync(r => r.BasketId == "basket-extend-create");
+            reservation.Should().NotBeNull();
+            reservation.Quantity.Should().Be(3);
+            reservation.Status.Should().Be(ReservationStatus.Active);
+        }
+
+        // 16. F3 (regression guard): a hold BOUND to a flash sale whose window has ENDED must be
+        //     grown against the BOUND sale pool — never the general product stock. The grow is denied
+        //     because the bound pool is too small, so the quantity is unchanged and the counter is
+        //     never decremented (and therefore can never be driven negative at commit).
+        [Fact]
+        public async Task ExtendReservationAsync_WhenGrowingFlashSaleBoundHoldAfterSaleEnded_UsesBoundPoolAndDenies()
+        {
+            // Arrange — general stock is deliberately LARGE (100) to prove it is ignored. The bound flash
+            // sale pool is small (5). The reservation (qty 2) is bound to that sale. The sale has ended, so
+            // GetActiveFlashSaleForProductAsync returns null (the default) — exactly the F3 trigger.
+            var now = DateTimeOffset.UtcNow;
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 100);
+            var productId = products[0].Id;
+            var sales = await TestStoreContextFactory.SeedFlashSalesAsync(
+                _context, productId, saleStockQuantity: 5,
+                startsAt: now.AddMinutes(-60), endsAt: now.AddMinutes(-30), status: FlashSaleStatus.Ended);
+            var flashSaleId = sales[0].Id;
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 2, status: ReservationStatus.Active,
+                basketId: "basket-fs-grow", flashSaleId: flashSaleId);
+            // No active sale now (window ended) => resolver returns null.
+            _mockFlashSale.Setup(f => f.GetActiveFlashSaleForProductAsync(productId))
+                .ReturnsAsync((FlashSale)null);
+
+            // Act — attempt to grow the bound hold to 10 (bound pool headroom = 5 - 2 = 3 < delta 8 => deny).
+            var result = await _sut.ExtendReservationAsync("basket-fs-grow", productId, 10);
+
+            // Assert — denied; quantity unchanged; counter NEVER decremented (so it can never go negative).
+            result.Should().BeFalse();
+            var reservation = await _context.Reservations
+                .FirstOrDefaultAsync(r => r.BasketId == "basket-fs-grow");
+            reservation.Quantity.Should().Be(2);
+            reservation.FlashSaleId.Should().Be(flashSaleId);
+            _mockDb.Verify(d => d.StringDecrementAsync(
+                It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+        }
+
+        // 17. F3 (control): growing a flash-sale-bound hold WITHIN its bound pool is granted.
+        [Fact]
+        public async Task ExtendReservationAsync_WhenGrowingFlashSaleBoundHoldWithinBoundPool_GrantsAndDecrementsByDelta()
+        {
+            // Arrange — bound sale pool 5, existing bound hold of 2 (headroom 3).
+            var now = DateTimeOffset.UtcNow;
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 100);
+            var productId = products[0].Id;
+            var sales = await TestStoreContextFactory.SeedFlashSalesAsync(
+                _context, productId, saleStockQuantity: 5,
+                startsAt: now.AddMinutes(-5), endsAt: now.AddMinutes(30), status: FlashSaleStatus.Active);
+            var flashSaleId = sales[0].Id;
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 2, status: ReservationStatus.Active,
+                basketId: "basket-fs-grow-ok", flashSaleId: flashSaleId);
+
+            // Act — grow to 4 (delta 2 <= headroom 3) => granted.
+            var result = await _sut.ExtendReservationAsync("basket-fs-grow-ok", productId, 4);
+
+            // Assert
+            result.Should().BeTrue();
+            var reservation = await _context.Reservations
+                .FirstOrDefaultAsync(r => r.BasketId == "basket-fs-grow-ok");
+            reservation.Quantity.Should().Be(4);
+            _mockDb.Verify(d => d.StringDecrementAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{productId}"), 2, It.IsAny<CommandFlags>()),
+                Times.Once);
+        }
+
+        // 18. ExtendReservation denies a general-pool grow beyond available capacity (no counter change).
+        [Fact]
+        public async Task ExtendReservationAsync_WhenGrowingGeneralPoolBeyondCapacity_DeniesAndDoesNotDecrement()
+        {
+            // Arrange — product stock 5, existing hold 2 (available 3).
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 5);
+            var productId = products[0].Id;
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 2, status: ReservationStatus.Active,
+                basketId: "basket-grow-insuff", flashSaleId: null);
+
+            // Act — grow to 10 (delta 8 > available 3) => deny.
+            var result = await _sut.ExtendReservationAsync("basket-grow-insuff", productId, 10);
+
+            // Assert
+            result.Should().BeFalse();
+            var reservation = await _context.Reservations
+                .FirstOrDefaultAsync(r => r.BasketId == "basket-grow-insuff");
+            reservation.Quantity.Should().Be(2);
+            _mockDb.Verify(d => d.StringDecrementAsync(
+                It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+        }
+
+        // 19. F1: ReleaseAllReservationsForBasketAsync cancels every Active hold for the basket and
+        //     restores each product's Redis counter (INCR + hold-key delete + publish).
+        [Fact]
+        public async Task ReleaseAllReservationsForBasketAsync_WhenBasketHasActiveHolds_CancelsAllAndRestoresCounters()
+        {
+            // Arrange — two distinct products each with an Active hold for the same basket.
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 2, stockQuantity: 10);
+            var firstId = products[0].Id;
+            var secondId = products[1].Id;
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, firstId, quantity: 4, status: ReservationStatus.Active,
+                basketId: "basket-clear", flashSaleId: null);
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, secondId, quantity: 3, status: ReservationStatus.Active,
+                basketId: "basket-clear", flashSaleId: null);
+
+            // Act
+            await _sut.ReleaseAllReservationsForBasketAsync("basket-clear");
+
+            // Assert — both holds cancelled.
+            var remainingActive = await _context.Reservations
+                .CountAsync(r => r.BasketId == "basket-clear" && r.Status == ReservationStatus.Active);
+            remainingActive.Should().Be(0);
+
+            // Each product's counter restored by its released quantity, hold key deleted, and stock published.
+            _mockDb.Verify(d => d.StringIncrementAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{firstId}"), 4, It.IsAny<CommandFlags>()),
+                Times.Once);
+            _mockDb.Verify(d => d.StringIncrementAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{secondId}"), 3, It.IsAny<CommandFlags>()),
+                Times.Once);
+            _mockDb.Verify(d => d.KeyDeleteAsync(
+                It.Is<RedisKey>(k => k == $"reservation:basket-clear:{firstId}"), It.IsAny<CommandFlags>()),
+                Times.Once);
+            _mockDb.Verify(d => d.KeyDeleteAsync(
+                It.Is<RedisKey>(k => k == $"reservation:basket-clear:{secondId}"), It.IsAny<CommandFlags>()),
+                Times.Once);
+            _mockSub.Verify(s => s.PublishAsync(
+                It.Is<RedisChannel>(c => c == "stock-updates"), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
+                Times.Exactly(2));
+        }
+
+        // 7b. (F4) FinalizeCommittedHoldsAsync deletes the Redis hold keys for a basket's Committed reservations.
+        //     This is the deferred, post-flush counterpart to the deletion that CommitReservationAsync no longer does.
+        [Fact]
+        public async Task FinalizeCommittedHoldsAsync_WhenReservationCommitted_DeletesHoldKeyWithoutTouchingCounter()
+        {
+            // Arrange — a Committed reservation (as it would exist after a successful order flush).
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 3, status: ReservationStatus.Committed,
+                basketId: "basket-finalize", flashSaleId: null);
+
+            // Act
+            await _sut.FinalizeCommittedHoldsAsync("basket-finalize");
+
+            // Assert — the hold key for the committed reservation is deleted exactly once; the counter is untouched.
+            _mockDb.Verify(d => d.KeyDeleteAsync(
+                It.Is<RedisKey>(k => k == $"reservation:basket-finalize:{productId}"), It.IsAny<CommandFlags>()),
+                Times.Once);
+            _mockDb.Verify(d => d.StringDecrementAsync(
+                It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+            _mockDb.Verify(d => d.StringIncrementAsync(
+                It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+        }
+
+        // 7c. (F4) FinalizeCommittedHoldsAsync ignores still-Active reservations — it only cleans up Committed holds,
+        //     so it never removes a hold key for a reservation that was not durably committed.
+        [Fact]
+        public async Task FinalizeCommittedHoldsAsync_WhenReservationStillActive_DeletesNoHoldKey()
+        {
+            // Arrange — an Active reservation (as it would exist if the flush had rolled back).
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+            await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 3, status: ReservationStatus.Active,
+                basketId: "basket-active", flashSaleId: null);
+
+            // Act
+            await _sut.FinalizeCommittedHoldsAsync("basket-active");
+
+            // Assert — no hold key deleted for a non-committed reservation.
+            _mockDb.Verify(d => d.KeyDeleteAsync(
+                It.Is<RedisKey>(k => k == $"reservation:basket-active:{productId}"), It.IsAny<CommandFlags>()),
+                Times.Never);
         }
 
     }

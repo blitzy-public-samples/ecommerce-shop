@@ -36,8 +36,21 @@ namespace API
             });
             services.AddSingleton<IConnectionMultiplexer>(c =>
             {
+                // The second positional argument to ConfigurationOptions.Parse is `ignoreUnknown`
+                // (NOT abortConnect), so AbortOnConnectFail keeps its default of true unless set
+                // explicitly below.
                 var configuration = ConfigurationOptions.Parse(_config.GetConnectionString("Redis"),
                     true);
+                // Fail-closed resilience: do NOT throw when Redis is unreachable at connect time.
+                // With AbortOnConnectFail=false the multiplexer is constructed successfully and keeps
+                // retrying in the background; individual stock operations then throw
+                // RedisConnectionException/RedisTimeoutException which InventoryService catches and
+                // falls back to the authoritative PostgreSQL SELECT ... FOR UPDATE stock check.
+                // This keeps application startup (identity migrate/seed) and request-time
+                // construction of the Redis-dependent singletons (InventoryService via the
+                // multiplexer, ResponseCacheService) alive during a Redis outage instead of
+                // crashing the host or every request.
+                configuration.AbortOnConnectFail = false;
                 return ConnectionMultiplexer.Connect(configuration);
             });
             services.AddApplicationServices();

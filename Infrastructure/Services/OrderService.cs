@@ -57,11 +57,16 @@ namespace Infrastructure.Services
             // staged on the SAME scoped StoreContext as the order, so the single Complete() below
             // flushes order rows and reservation/stock changes together atomically.
             await _inventoryService.CommitReservationAsync(basketId);
-            // save to db
+            // save to db — single atomic flush of the order rows AND the staged reservation/stock changes
             var result = await _unitOfWork.Complete();
 
             if (result <= 0) return null;
-            
+
+            // Flush succeeded: now (and only now) delete the Redis hold keys for the just-committed reservations.
+            // Deferring this until after a successful Complete() means a rolled-back order (result <= 0 above)
+            // never deletes a hold key whose reservation reverted to Active, keeping PostgreSQL and Redis consistent.
+            await _inventoryService.FinalizeCommittedHoldsAsync(basketId);
+
             // return order
             return order;
         }

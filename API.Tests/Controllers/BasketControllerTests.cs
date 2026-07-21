@@ -1,6 +1,7 @@
 using System.Threading.Tasks;
 using API.Controllers;
 using API.Dtos;
+using API.Errors;
 using AutoMapper;
 using Core.Entities;
 using Core.Interfaces;
@@ -39,10 +40,13 @@ namespace API.Tests.Controllers
     /// </para>
     /// <para>
     /// Reservation note (Real-Time Inventory &amp; Flash-Sale System): <c>UpdateBasket</c>
-    /// now creates/extends a stock reservation for each line of the <b>persisted</b> basket
-    /// via <see cref="IInventoryService.ExtendReservationAsync(string,int,int)"/>. This is a
-    /// side effect layered onto the action; it must not change the HTTP response contract,
-    /// which remains <c>200 OK</c> carrying the persisted basket.
+    /// reserves stock <b>before</b> persisting. It normalizes duplicate product lines (summing
+    /// their quantities), then creates/extends a reservation for each line of the <b>incoming</b>
+    /// basket via <see cref="IInventoryService.ExtendReservationAsync(string,int,int)"/>. If every
+    /// line is granted, the normalized basket is persisted and holds for any removed lines are
+    /// released; the response is <c>200 OK</c> carrying the persisted basket. If any line cannot be
+    /// reserved, the basket is <b>not</b> persisted and the action returns <c>409 Conflict</c> so the
+    /// persisted basket can never claim stock that was not safely held.
     /// </para>
     /// </summary>
     public class BasketControllerTests
@@ -58,6 +62,23 @@ namespace API.Tests.Controllers
             var repo = new Mock<IBasketRepository>();
             var mapper = new Mock<IMapper>();
             var inventory = new Mock<IInventoryService>();
+
+            // Sensible default reservation behavior so happy-path tests read cleanly:
+            //  - ExtendReservationAsync grants by default (returns true). Moq otherwise returns
+            //    Task.FromResult(false) for a Task<bool>, which the controller would treat as
+            //    "insufficient stock" and reject with 409 — so this default must be explicit.
+            //    Tests exercising the reject path override this for a specific product to return false.
+            //  - Release / ReleaseAll return a completed Task so the awaited side effects are no-ops.
+            inventory
+                .Setup(i => i.ExtendReservationAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>()))
+                .ReturnsAsync(true);
+            inventory
+                .Setup(i => i.ReleaseReservationAsync(It.IsAny<string>(), It.IsAny<int>()))
+                .Returns(Task.CompletedTask);
+            inventory
+                .Setup(i => i.ReleaseAllReservationsForBasketAsync(It.IsAny<string>()))
+                .Returns(Task.CompletedTask);
+
             var controller = new BasketController(repo.Object, mapper.Object, inventory.Object);
             return (controller, repo, mapper, inventory);
         }
@@ -147,46 +168,50 @@ namespace API.Tests.Controllers
         }
 
         /// <summary>
-        /// Verification: <c>DeleteBasketAsync</c> returns a plain <see cref="Task"/> (no
-        /// action result), so the observable behavior is the single delegated call to
-        /// the repository. This asserts the repository's delete is invoked exactly once
-        /// with the supplied id.
+        /// F1 (delete releases holds): <c>DeleteBasketAsync</c> releases every Active hold for the
+        /// basket (restoring available stock) BEFORE deleting the basket, then deletes it. Asserts
+        /// both collaborators are invoked exactly once with the supplied id.
         /// </summary>
         [Fact]
-        public async Task DeleteBasketAsync_WhenCalled_InvokesRepositoryDeleteOnce()
+        public async Task DeleteBasketAsync_WhenCalled_ReleasesAllHoldsThenDeletesBasket()
         {
             // Arrange
-            var (controller, repo, _, _) = CreateController();
+            var (controller, repo, _, inventory) = CreateController();
             repo.Setup(r => r.DeleteBasketAsync("basket-1")).ReturnsAsync(true);
 
             // Act
             await controller.DeleteBasketAsync("basket-1");
 
-            // Assert
+            // Assert — holds released for the basket, and the basket deleted, each exactly once.
+            inventory.Verify(i => i.ReleaseAllReservationsForBasketAsync("basket-1"), Times.Once);
             repo.Verify(r => r.DeleteBasketAsync("basket-1"), Times.Once);
         }
 
         // ---------------------------------------------------------------------------------
         // Reservation call site (Real-Time Inventory & Flash-Sale System feature).
-        // UpdateBasket creates/extends a reservation for EACH line of the PERSISTED basket
-        // (the value returned by IBasketRepository.UpdateBasketAsync) via
-        // IInventoryService.ExtendReservationAsync(basketId, productId, quantity), as a pure
-        // side effect that must not alter the HTTP response contract.
+        // UpdateBasket reserves BEFORE persisting: it normalizes duplicate lines, then
+        // creates/extends a reservation for EACH line of the INCOMING (mapped) basket via
+        // IInventoryService.ExtendReservationAsync(basketId, productId, quantity). Only when
+        // every line is granted is the basket persisted (and removed-line holds released);
+        // if any line is denied the basket is NOT persisted and the action returns 409.
         // ---------------------------------------------------------------------------------
 
         /// <summary>
-        /// When the persisted basket has lines, <c>UpdateBasket</c> creates/extends a
-        /// reservation for each line — passing the basket id, the line's product id
-        /// (<see cref="BasketItem.Id"/>), and its quantity — and still returns <c>200 OK</c>
-        /// carrying the persisted basket (response contract unchanged).
+        /// When the incoming basket has lines and all are reservable, <c>UpdateBasket</c>
+        /// creates/extends a reservation for each line — passing the basket id, the line's
+        /// product id (<see cref="BasketItem.Id"/>), and its quantity — persists the basket, and
+        /// returns <c>200 OK</c> carrying the persisted basket.
         /// </summary>
         [Fact]
-        public async Task UpdateBasket_WithItemsInPersistedBasket_ExtendsReservationForEachItem()
+        public async Task UpdateBasket_WithReservableItems_ExtendsReservationForEachItemAndReturnsOk()
         {
-            // Arrange
+            // Arrange — the INCOMING (mapped) basket carries the lines, because reservation happens
+            // BEFORE persistence. The persisted echo returned by the repo is what the client receives.
             var (controller, repo, mapper, inventory) = CreateController();
             var dto = new CustomerBasketDto { Id = "basket-1" };
             var mapped = new CustomerBasket("basket-1");
+            mapped.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 2 });
+            mapped.Items.Add(new BasketItem { Id = 5, ProductName = "Green Angular Boots", Price = 150m, Quantity = 3 });
             var updated = new CustomerBasket("basket-1");
             updated.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 2 });
             updated.Items.Add(new BasketItem { Id = 5, ProductName = "Green Angular Boots", Price = 150m, Quantity = 3 });
@@ -196,7 +221,7 @@ namespace API.Tests.Controllers
             // Act
             var result = await controller.UpdateBasket(dto);
 
-            // Assert — a reservation is created/extended per basket line using the basket id
+            // Assert — a reservation is created/extended per incoming line using the basket id
             // (CustomerBasket.Id), the line's product id (BasketItem.Id), and its quantity.
             inventory.Verify(i => i.ExtendReservationAsync("basket-1", 1, 2), Times.Once);
             inventory.Verify(i => i.ExtendReservationAsync("basket-1", 5, 3), Times.Once);
@@ -204,18 +229,18 @@ namespace API.Tests.Controllers
                 i => i.ExtendReservationAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>()),
                 Times.Exactly(2));
 
-            // Response contract unchanged: still 200 OK carrying the persisted basket instance.
+            // Reserve happened BEFORE persist and the basket was persisted; response is 200 OK.
+            repo.Verify(r => r.UpdateBasketAsync(mapped), Times.Once);
             result.Result.Should().BeOfType<OkObjectResult>();
             ((OkObjectResult)result.Result).Value.Should().BeSameAs(updated);
         }
 
         /// <summary>
-        /// When the persisted basket has no lines, <c>UpdateBasket</c> makes no reservation
-        /// call and still returns <c>200 OK</c> carrying the persisted basket. Guards the
-        /// invariant that the reservation logic is a per-line side effect only.
+        /// When the incoming basket has no lines, <c>UpdateBasket</c> makes no reservation call
+        /// and still returns <c>200 OK</c> carrying the persisted basket.
         /// </summary>
         [Fact]
-        public async Task UpdateBasket_WithNoItemsInPersistedBasket_MakesNoReservationAndReturnsOk()
+        public async Task UpdateBasket_WithNoItems_MakesNoReservationAndReturnsOk()
         {
             // Arrange
             var (controller, repo, mapper, inventory) = CreateController();
@@ -228,12 +253,104 @@ namespace API.Tests.Controllers
             // Act
             var result = await controller.UpdateBasket(dto);
 
-            // Assert — no basket lines => no reservation side effect; response unchanged.
+            // Assert — no basket lines => no reservation call; response is 200 OK carrying the basket.
             inventory.Verify(
                 i => i.ExtendReservationAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>()),
                 Times.Never);
             result.Result.Should().BeOfType<OkObjectResult>();
             ((OkObjectResult)result.Result).Value.Should().BeSameAs(updated);
+        }
+
+        /// <summary>
+        /// F2 (reserve-before-persist): when at least one line cannot be fully reserved,
+        /// <c>UpdateBasket</c> returns <c>409 Conflict</c> and does <b>not</b> persist the basket,
+        /// so the persisted basket can never claim stock that was not safely held.
+        /// </summary>
+        [Fact]
+        public async Task UpdateBasket_WhenALineCannotBeReserved_Returns409AndDoesNotPersist()
+        {
+            // Arrange — product 1 is over-requested (stock short), so its reservation is denied.
+            var (controller, repo, mapper, inventory) = CreateController();
+            var dto = new CustomerBasketDto { Id = "basket-1" };
+            var mapped = new CustomerBasket("basket-1");
+            mapped.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 15 });
+            mapper.Setup(m => m.Map<CustomerBasketDto, CustomerBasket>(dto)).Returns(mapped);
+            inventory
+                .Setup(i => i.ExtendReservationAsync("basket-1", 1, 15))
+                .ReturnsAsync(false); // insufficient stock
+
+            // Act
+            var result = await controller.UpdateBasket(dto);
+
+            // Assert — 409 Conflict carrying an ApiResponse, and the basket was NOT persisted.
+            result.Result.Should().BeOfType<ConflictObjectResult>();
+            var conflict = (ConflictObjectResult)result.Result;
+            conflict.StatusCode.Should().Be(409);
+            conflict.Value.Should().BeOfType<ApiResponse>();
+            ((ApiResponse)conflict.Value).StatusCode.Should().Be(409);
+            repo.Verify(r => r.UpdateBasketAsync(It.IsAny<CustomerBasket>()), Times.Never);
+        }
+
+        /// <summary>
+        /// F2 (duplicate-line normalization): repeated lines for the same product are collapsed
+        /// into a single line whose quantity is the SUM, and the reservation is made for that
+        /// combined total (not the last duplicate's quantity).
+        /// </summary>
+        [Fact]
+        public async Task UpdateBasket_WithDuplicateLines_ReservesTheSummedQuantityOnce()
+        {
+            // Arrange — two lines for product 1 (qty 2 and qty 3) should reserve a total of 5.
+            var (controller, repo, mapper, inventory) = CreateController();
+            var dto = new CustomerBasketDto { Id = "basket-1" };
+            var mapped = new CustomerBasket("basket-1");
+            mapped.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 2 });
+            mapped.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 3 });
+            var updated = new CustomerBasket("basket-1");
+            updated.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 5 });
+            mapper.Setup(m => m.Map<CustomerBasketDto, CustomerBasket>(dto)).Returns(mapped);
+            repo.Setup(r => r.UpdateBasketAsync(It.IsAny<CustomerBasket>())).ReturnsAsync(updated);
+
+            // Act
+            var result = await controller.UpdateBasket(dto);
+
+            // Assert — exactly one reservation for the summed quantity (5), never the raw duplicates.
+            inventory.Verify(i => i.ExtendReservationAsync("basket-1", 1, 5), Times.Once);
+            inventory.Verify(
+                i => i.ExtendReservationAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>()),
+                Times.Once);
+            result.Result.Should().BeOfType<OkObjectResult>();
+        }
+
+        /// <summary>
+        /// F1 (removed-line release): when a product present in the previously-persisted basket is
+        /// absent from the incoming basket, <c>UpdateBasket</c> releases that product's hold (and
+        /// only that product's) after persisting the new basket.
+        /// </summary>
+        [Fact]
+        public async Task UpdateBasket_WhenLineRemoved_ReleasesRemovedProductHoldOnly()
+        {
+            // Arrange — prior basket held products 1 and 5; the incoming basket keeps only product 1,
+            // so product 5's hold must be released.
+            var (controller, repo, mapper, inventory) = CreateController();
+            var dto = new CustomerBasketDto { Id = "basket-1" };
+            var mapped = new CustomerBasket("basket-1");
+            mapped.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 2 });
+            var prior = new CustomerBasket("basket-1");
+            prior.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 2 });
+            prior.Items.Add(new BasketItem { Id = 5, ProductName = "Green Angular Boots", Price = 150m, Quantity = 3 });
+            var updated = new CustomerBasket("basket-1");
+            updated.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 2 });
+            mapper.Setup(m => m.Map<CustomerBasketDto, CustomerBasket>(dto)).Returns(mapped);
+            repo.Setup(r => r.GetBasketAsync("basket-1")).ReturnsAsync(prior);
+            repo.Setup(r => r.UpdateBasketAsync(mapped)).ReturnsAsync(updated);
+
+            // Act
+            var result = await controller.UpdateBasket(dto);
+
+            // Assert — product 5 (removed) is released exactly once; product 1 (kept) is not released.
+            inventory.Verify(i => i.ReleaseReservationAsync("basket-1", 5), Times.Once);
+            inventory.Verify(i => i.ReleaseReservationAsync("basket-1", 1), Times.Never);
+            result.Result.Should().BeOfType<OkObjectResult>();
         }
     }
 }

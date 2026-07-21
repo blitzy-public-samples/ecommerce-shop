@@ -115,6 +115,54 @@ namespace Infrastructure.Tests.Services
             _unitOfWork.Verify(u => u.Complete(), Times.Once);
         }
 
+        // (F4) On a successful flush, the order path must STAGE the reservation commit BEFORE Complete() and
+        // FINALIZE (delete) the Redis holds only AFTER Complete() — never before — so a rollback can never orphan
+        // the hold key. This asserts the exact call order: commit -> complete -> finalize.
+        [Fact]
+        public async Task CreateOrderAsync_WhenCompleteSucceeds_StagesCommitBeforeFlushAndFinalizesHoldsAfterFlush()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket);
+            var calls = new List<string>();
+            _inventoryService.Setup(i => i.CommitReservationAsync("basket-1"))
+                .Callback(() => calls.Add("commit")).Returns(Task.CompletedTask);
+            _unitOfWork.Setup(u => u.Complete())
+                .Callback(() => calls.Add("complete")).ReturnsAsync(1);
+            _inventoryService.Setup(i => i.FinalizeCommittedHoldsAsync("basket-1"))
+                .Callback(() => calls.Add("finalize")).Returns(Task.CompletedTask);
+
+            // Act
+            var result = await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — order created, and the invocation order is exactly commit -> complete -> finalize.
+            result.Should().NotBeNull();
+            _inventoryService.Verify(i => i.CommitReservationAsync("basket-1"), Times.Once);
+            _unitOfWork.Verify(u => u.Complete(), Times.Once);
+            _inventoryService.Verify(i => i.FinalizeCommittedHoldsAsync("basket-1"), Times.Once);
+            calls.Should().Equal("commit", "complete", "finalize");
+        }
+
+        // (F4) When the flush fails (Complete() <= 0 => rollback), the holds must NOT be finalized/deleted, so the
+        // rolled-back (still-Active) reservation stays consistent with its surviving Redis hold key. Commit staging
+        // still occurs (it is purely in-memory on the shared context and reverts with the rollback).
+        [Fact]
+        public async Task CreateOrderAsync_WhenCompleteReturnsZero_StagesCommitButDoesNotFinalizeHolds()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket, completeResult: 0);
+
+            // Act
+            var result = await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — flush failed => null; commit was staged and flush attempted, but hold finalization never ran.
+            result.Should().BeNull();
+            _inventoryService.Verify(i => i.CommitReservationAsync("basket-1"), Times.Once);
+            _unitOfWork.Verify(u => u.Complete(), Times.Once);
+            _inventoryService.Verify(i => i.FinalizeCommittedHoldsAsync(It.IsAny<string>()), Times.Never);
+        }
+
         [Fact]
         public async Task CreateOrderAsync_WhenExistingOrderWithSamePaymentIntent_DeletesItAndUpdatesPaymentIntent()
         {

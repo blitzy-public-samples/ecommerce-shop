@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using API.IntegrationTests.Infrastructure;
 using Core.Interfaces;                          // IPaymentService — resolve the singleton stub (MJ-10)
 using FluentAssertions;
+using Infrastructure.Data;                      // StoreContext — set committed StockQuantity before basketing
+using Microsoft.EntityFrameworkCore;            // FindAsync / SaveChangesAsync on the real StoreContext
 using Microsoft.Extensions.DependencyInjection; // GetRequiredService — resolve the singleton stub (MJ-10)
 using Xunit;
 
@@ -125,6 +127,12 @@ namespace API.IntegrationTests.Contract
             using var productsResponse = await client.GetAsync("api/products");
             productsResponse.StatusCode.Should().Be(HttpStatusCode.OK);
             var product = (await ReadRootAsync(productsResponse)).GetProperty("data")[0];
+            var productId = product.GetProperty("id").GetInt32();
+
+            // Seeded products default to StockQuantity = 0, and UpdateBasket now reserves-before-persist
+            // (rejecting with 409 any line it cannot hold). Give this product ample stock first so the
+            // single-unit line is granted and this test exercises the wire CONTRACT, not stock policy.
+            await SetProductStockAsync(productId, 1000);
 
             var basketId = "contract-order-" + Guid.NewGuid();
             var payload = new
@@ -136,7 +144,7 @@ namespace API.IntegrationTests.Contract
                     {
                         // BasketItemDto: every member is [Required]; id is the product id the server
                         // re-prices authoritatively in CreateOrderAsync (client price is never trusted).
-                        id = product.GetProperty("id").GetInt32(),
+                        id = productId,
                         productName = product.GetProperty("name").GetString(),
                         price = product.GetProperty("price").GetDecimal(),
                         quantity = 1,
@@ -151,6 +159,27 @@ namespace API.IntegrationTests.Contract
             using var basketResponse = await client.PostAsJsonAsync("api/basket", payload);
             basketResponse.StatusCode.Should().Be(HttpStatusCode.OK);
             return basketId;
+        }
+
+        /// <summary>
+        /// Sets the committed PostgreSQL <c>StockQuantity</c> for a product to <paramref name="stock"/> so a
+        /// basket line for it can be reserved. Seeded products default to <c>StockQuantity = 0</c>, and
+        /// <c>UpdateBasket</c> reserves-before-persist (rejecting any line it cannot fully hold), so a test
+        /// that baskets a real product must first give that product stock. Uses a DI scope on the real
+        /// in-process host — the same pattern the concurrency/resilience inventory tests use to seed state.
+        /// </summary>
+        /// <param name="productId">The DB id of the product to stock.</param>
+        /// <param name="stock">The committed stock quantity to set.</param>
+        private async Task SetProductStockAsync(int productId, int stock)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var context = scope.ServiceProvider.GetRequiredService<StoreContext>();
+            var product = await context.Products.FindAsync(productId);
+            if (product != null)
+            {
+                product.StockQuantity = stock;
+                await context.SaveChangesAsync();
+            }
         }
 
         /// <summary>

@@ -12,16 +12,37 @@ namespace Core.Interfaces
         // rely on the PostgreSQL row-locked check and never assume stock on a cache miss).
         Task<bool> CreateReservationAsync(string basketId, int productId, int quantity);
 
-        // Extend / refresh an existing Active hold's ExpiresAt (and Redis hold-key TTL) on repeated basket updates.
-        Task ExtendReservationAsync(string basketId, int productId, int quantity);
+        // Create-or-extend an Active hold for (basketId, productId) so the hold reflects the desired
+        // total quantity for that basket line, refreshing ExpiresAt (and the Redis hold-key TTL).
+        // The grow-capacity check is evaluated against the pool the reservation is BOUND to
+        // (general product stock, or the specific flash sale captured at creation) so a hold can never
+        // grow beyond its bound pool. Returns true when the requested total was granted, false when the
+        // hold could not be grown to the requested total (insufficient stock in the bound pool);
+        // fail-closed on a Redis outage (the PostgreSQL row-locked check remains authoritative).
+        Task<bool> ExtendReservationAsync(string basketId, int productId, int quantity);
 
         // Commit ALL Active reservations for a basket (Active -> Committed): permanently decrement the bound
-        // pool (Products.StockQuantity or FlashSales.SaleStockQuantity) and delete the Redis hold key.
-        // Called by OrderService.CreateOrderAsync INSIDE the same order-persistence transaction.
+        // pool (Products.StockQuantity or FlashSales.SaleStockQuantity). STAGES ONLY — it performs NO Redis
+        // hold-key mutation, so that if the order-persistence flush (OrderService's _unitOfWork.Complete())
+        // rolls back, the still-present Redis hold key stays consistent with the rolled-back (still-Active)
+        // reservation. Called by OrderService.CreateOrderAsync INSIDE the same order-persistence transaction,
+        // BEFORE the flush.
         Task CommitReservationAsync(string basketId);
+
+        // Delete the Redis hold keys for a basket's Committed reservations (best-effort, fail-closed on a Redis
+        // outage). Called by OrderService.CreateOrderAsync ONLY AFTER the order-persistence flush succeeds, so a
+        // rolled-back order never orphans Redis by deleting a hold key whose reservation reverted to Active. This
+        // is the deferred, post-commit counterpart to the hold-key deletion that CommitReservationAsync no longer
+        // performs during staging.
+        Task FinalizeCommittedHoldsAsync(string basketId);
 
         // Release/cancel an Active hold (Active -> Cancelled): INCR the Redis counter back and publish.
         Task ReleaseReservationAsync(string basketId, int productId);
+
+        // Release/cancel EVERY Active hold for a basket (Active -> Cancelled): restore each product's Redis
+        // counter, delete the per-product hold keys, and publish the corrected stock. Called when a basket is
+        // deleted or cleared so no orphaned Active hold survives and available stock is restored immediately.
+        Task ReleaseAllReservationsForBasketAsync(string basketId);
 
         // Available stock = committed pool stock minus the sum of Active reservations for the product.
         Task<int> GetAvailableStockAsync(int productId);

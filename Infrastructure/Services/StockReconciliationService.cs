@@ -93,9 +93,12 @@ namespace Infrastructure.Services
         // because the binder package is absent from Infrastructure's dependency closure and would not
         // compile against the current reference set.
         // Evaluated once per loop iteration so the interval is test-overridable via configuration.
+        // Clamped to a minimum of 1 second: a misconfigured 0 or negative value must never turn the
+        // reconciliation loop into a tight, CPU-spinning loop (Task.Delay(<=0) returns immediately) nor
+        // throw ArgumentOutOfRangeException. A missing/unparseable key falls back to the default (30s).
         private int ReconciliationIntervalSeconds =>
             int.TryParse(_config["Inventory:ReconciliationIntervalSeconds"], out var v)
-                ? v
+                ? Math.Max(1, v)
                 : DefaultReconciliationIntervalSeconds;
 
         // BackgroundService entry point. Runs one reconciliation pass, then waits the configured
