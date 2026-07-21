@@ -4,7 +4,10 @@
 
 export const environment = {
   production: false,
-  apiUrl: `https://localhost:5001/api/`
+  apiUrl: `https://localhost:5001/api/`,
+  // Real-Time Inventory & Flash Sale — SignalR hub URL + client poll interval
+  hubUrl: 'https://localhost:5001/hubs/inventory',
+  pollInterval: 5000
 };
 
 /*
