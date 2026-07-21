@@ -13,5 +13,8 @@ namespace Core.Entities
         public ProductBrand ProductBrand { get; set; }
         public int ProductBrandId { get; set; }
 
+        // Flash-Sale feature: optimistic-concurrency token (row-version style) guarding against
+        // oversell; mapped via ProductConfiguration.IsConcurrencyToken(). Not projected into any DTO.
+        public uint Version { get; set; }
     }
 }
