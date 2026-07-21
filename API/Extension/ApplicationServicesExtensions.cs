@@ -1,5 +1,6 @@
 using System.Linq;
 using API.Errors;
+using API.Hubs;
 using Core.Interfaces;
 using Infrastructure.Data;
 using Infrastructure.Services;
@@ -16,12 +17,16 @@ namespace API.Extension
             services.AddScoped<ITokenService, TokenService>();
             services.AddScoped<IOrderService, OrderService>();
             services.AddScoped<IPaymentService, PaymentService>();
-            services.AddScoped<IFlashSaleService, FlashSaleService>();
-            services.AddScoped<IInventoryService, InventoryService>();
             services.AddScoped<IUnitOfWork, UnitOfWork>();
             services.AddScoped<IProductRepository, ProductRepository>();
             services.AddScoped<IBasketRepository, BasketRepository>();
             services.AddScoped(typeof(IGenericRepository<>), typeof(GenericRepository<>));
+            // Real-Time Inventory & Flash-Sale System registrations
+            services.AddScoped<IInventoryService, InventoryService>();
+            services.AddScoped<IFlashSaleService, FlashSaleService>();
+            services.AddHostedService<StockReconciliationService>();
+            services.AddHostedService<StockBroadcastBackgroundService>();
+            services.AddSignalR();
             services.Configure<ApiBehaviorOptions>(options =>
             {
                 options.InvalidModelStateResponseFactory = actionContext =>
