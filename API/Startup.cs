@@ -1,6 +1,7 @@
 using System.IO;
 using API.Extension;
 using API.Helpers;
+using API.Hubs; // Flash-Sale feature: InventoryHub type for endpoints.MapHub<InventoryHub>() below
 using API.Middleware;
 using Infrastructure.Data;
 using Infrastructure.Identity;
@@ -28,6 +29,7 @@ namespace API
         {
             services.AddAutoMapper(typeof(MappingProfiles));
             services.AddControllers();
+            services.AddSignalR(); // Flash-Sale feature: enable the in-memory SignalR hub (single-instance, no Redis backplane per AAP §0.5.2)
             services.AddDbContext<StoreContext>(x =>
                 x.UseNpgsql(_config.GetConnectionString("DefaultConnection")));
             services.AddDbContext<AppIdentityDbContext>(x =>
@@ -48,7 +50,9 @@ namespace API
                 opt.AddPolicy("CorsPolicy",
                     policy =>
                     {
-                        policy.AllowAnyHeader().AllowAnyMethod().WithOrigins("https://localhost:4200");
+                        // Flash-Sale feature: AllowCredentials required for the browser SignalR (WebSocket) connection.
+                        // Valid here because the policy uses a FIXED origin (WithOrigins), not AllowAnyOrigin. Origin unchanged.
+                        policy.AllowAnyHeader().AllowAnyMethod().WithOrigins("https://localhost:4200").AllowCredentials();
                     });
             });
         }
@@ -85,6 +89,11 @@ namespace API
             app.UseEndpoints(endpoints =>
             {
                 endpoints.MapControllers();
+                // Flash-Sale feature: map the real-time inventory SignalR hub at the configured path.
+                // Path from config SIGNALR_HUB_PATH (falls back to "/hubs/inventory"); MUST match appsettings
+                // and the JwtBearerEvents.OnMessageReceived hub-path check in IdentityServiceExtensions.cs.
+                // Registered BEFORE the SPA catch-all so MapFallbackToController remains the LAST mapping.
+                endpoints.MapHub<InventoryHub>(_config["SIGNALR_HUB_PATH"] ?? "/hubs/inventory");
                 endpoints.MapFallbackToController("Index", "Fallback");
             });
         }

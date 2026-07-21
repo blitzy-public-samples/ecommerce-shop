@@ -1,0 +1,6 @@
+/* Live stock indicator: emphasis is driven by Bootstrap text utility classes
+   (text-danger / text-success) applied in the template. This component-scoped
+   stylesheet is intentionally minimal. */
+:host {
+  display: inline-block;
+}

@@ -21,6 +21,10 @@ namespace Infrastructure.Tests.Services
         private readonly Mock<IGenericRepository<Product>> _productRepo = new Mock<IGenericRepository<Product>>();
         private readonly Mock<IGenericRepository<DeliveryMethod>> _deliveryRepo = new Mock<IGenericRepository<DeliveryMethod>>();
         private readonly Mock<IGenericRepository<Order>> _orderRepo = new Mock<IGenericRepository<Order>>();
+        // Flash-Sale feature: OrderService now takes a 4th dependency (reservation-consume hook). A default
+        // mock is sufficient — Moq returns a completed Task for the void-async ConsumeReservationsAsync, and
+        // the hook is wrapped in a best-effort try/catch inside OrderService, so it never affects these assertions.
+        private readonly Mock<IInventoryReservationService> _inventoryReservationService = new Mock<IInventoryReservationService>();
         private readonly OrderService _sut;
 
         public OrderServiceTests()
@@ -28,7 +32,8 @@ namespace Infrastructure.Tests.Services
             _unitOfWork.Setup(u => u.Repository<Product>()).Returns(_productRepo.Object);
             _unitOfWork.Setup(u => u.Repository<DeliveryMethod>()).Returns(_deliveryRepo.Object);
             _unitOfWork.Setup(u => u.Repository<Order>()).Returns(_orderRepo.Object);
-            _sut = new OrderService(_basketRepo.Object, _unitOfWork.Object, _paymentService.Object);
+            _sut = new OrderService(_basketRepo.Object, _unitOfWork.Object, _paymentService.Object,
+                _inventoryReservationService.Object);
         }
 
         private static Address SampleAddress() =>

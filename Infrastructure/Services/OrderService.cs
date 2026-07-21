@@ -13,12 +13,17 @@ namespace Infrastructure.Services
         private readonly IBasketRepository _basketRepo;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IPaymentService _paymentService;
+        // Flash-Sale feature: reservation service used to consume this session's inventory reservations after a successful order write.
+        private readonly IInventoryReservationService _inventoryReservationService;
 
-        public OrderService(IBasketRepository basketRepo, IUnitOfWork unitOfWork, IPaymentService paymentService)
+        // Flash-Sale feature: 4th parameter (inventoryReservationService) added for the post-commit reservation-consume hook.
+        public OrderService(IBasketRepository basketRepo, IUnitOfWork unitOfWork, IPaymentService paymentService,
+            IInventoryReservationService inventoryReservationService)
         {
             _basketRepo = basketRepo;
             _unitOfWork = unitOfWork;
             _paymentService = paymentService;
+            _inventoryReservationService = inventoryReservationService; // Flash-Sale feature
         }
 
         public async Task<Order> CreateOrderAsync(string buyerEmail, int deliveryMethodId, string basketId, Address shippingAddress)
@@ -55,7 +60,22 @@ namespace Infrastructure.Services
             var result = await _unitOfWork.Complete();
 
             if (result <= 0) return null;
-            
+
+            // Flash-Sale feature: consume this session's inventory reservations after a successful order write.
+            // Defensive - a missing reservation must never break the existing order flow. Totals stay based on products.price.
+            // basketId is the reservation sessionId (client basket UUID from localStorage['basket_id'], reused per AAP R8).
+            try
+            {
+                // Build the ordered lines from the basket (item.Id = productId, item.Quantity). The reservation
+                // service matches this session's ACTIVE holds by (SessionId, ProductId) and marks them Consumed
+                // (never deletes), keeping the sold units subtracted from availability (zero-oversell, AAP R3).
+                var consumeLines = basket.Items
+                    .Select(i => new ReservationConsumeLine(i.Id, i.Quantity))
+                    .ToList();
+                await _inventoryReservationService.ConsumeReservationsAsync(basketId, consumeLines);
+            }
+            catch { /* swallow: reservation consumption is best-effort and must not fail checkout */ }
+
             // return order
             return order;
         }
