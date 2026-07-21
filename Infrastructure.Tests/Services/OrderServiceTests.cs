@@ -8,6 +8,7 @@ using Core.Entities.OrderAggregate;
 using Core.Interfaces;
 using FluentAssertions;
 using Infrastructure.Services;
+using Microsoft.Extensions.Logging; // Flash-Sale feature (review finding C10): ILogger<OrderService> dependency.
 using Moq;
 using Xunit;
 
@@ -25,6 +26,9 @@ namespace Infrastructure.Tests.Services
         // mock is sufficient — Moq returns a completed Task for the void-async ConsumeReservationsAsync, and
         // the hook is wrapped in a best-effort try/catch inside OrderService, so it never affects these assertions.
         private readonly Mock<IInventoryReservationService> _inventoryReservationService = new Mock<IInventoryReservationService>();
+        // Flash-Sale feature (review finding C10): OrderService now takes a 5th dependency (logger for the
+        // structured consume-hook failure log). A default mock suffices; it verifies logging without side effects.
+        private readonly Mock<ILogger<OrderService>> _logger = new Mock<ILogger<OrderService>>();
         private readonly OrderService _sut;
 
         public OrderServiceTests()
@@ -33,7 +37,7 @@ namespace Infrastructure.Tests.Services
             _unitOfWork.Setup(u => u.Repository<DeliveryMethod>()).Returns(_deliveryRepo.Object);
             _unitOfWork.Setup(u => u.Repository<Order>()).Returns(_orderRepo.Object);
             _sut = new OrderService(_basketRepo.Object, _unitOfWork.Object, _paymentService.Object,
-                _inventoryReservationService.Object);
+                _inventoryReservationService.Object, _logger.Object);
         }
 
         private static Address SampleAddress() =>
@@ -162,6 +166,64 @@ namespace Infrastructure.Tests.Services
 
             // Assert
             await act.Should().ThrowAsync<NullReferenceException>();
+        }
+
+        // Flash-Sale feature (review finding C08): after a successful commit the hook consumes the session's
+        // reservations scoped to the EXACT ordered products and quantities (basketId is the sessionId).
+        [Fact]
+        public async Task CreateOrderAsync_WhenCompleteSucceeds_ConsumesReservationsWithOrderedLines()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket);
+
+            // Act
+            await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — consume called once, keyed by the basket UUID (sessionId), with product 1 x qty 2.
+            _inventoryReservationService.Verify(s => s.ConsumeReservationsAsync(
+                "basket-1",
+                It.Is<IEnumerable<ReservationConsumeLine>>(lines =>
+                    lines.Any(l => l.ProductId == 1 && l.Quantity == 2))),
+                Times.Once);
+        }
+
+        // Flash-Sale feature (review finding C10): reservations are consumed ONLY after a successful order write.
+        [Fact]
+        public async Task CreateOrderAsync_WhenCompleteReturnsZero_DoesNotConsumeReservations()
+        {
+            // Arrange — the write fails (result <= 0), so the hook must never run.
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket, completeResult: 0);
+
+            // Act
+            await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert
+            _inventoryReservationService.Verify(s => s.ConsumeReservationsAsync(
+                It.IsAny<string>(), It.IsAny<IEnumerable<ReservationConsumeLine>>()), Times.Never);
+        }
+
+        // Flash-Sale feature (review finding C10): a consume failure must NOT break the committed order, and it
+        // must be recorded via a structured error log rather than silently discarded.
+        [Fact]
+        public async Task CreateOrderAsync_WhenConsumeThrows_StillReturnsOrder_AndLogsError()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket);
+            _inventoryReservationService
+                .Setup(s => s.ConsumeReservationsAsync(It.IsAny<string>(), It.IsAny<IEnumerable<ReservationConsumeLine>>()))
+                .ThrowsAsync(new InvalidOperationException("simulated consume failure"));
+
+            // Act — the defensive hook must swallow the failure and still return the committed order.
+            var result = await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — order still returned; error logged exactly once at Error level.
+            result.Should().NotBeNull();
+            _logger.Verify(l => l.Log(
+                LogLevel.Error, It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(),
+                It.IsAny<Exception>(), It.IsAny<Func<It.IsAnyType, Exception, string>>()), Times.Once);
         }
 
         [Fact]

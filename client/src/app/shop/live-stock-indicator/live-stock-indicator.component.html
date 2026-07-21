@@ -1,3 +1,22 @@
-<span *ngIf="!isOutOfStock" [class.text-danger]="isLowStock" [class.text-success]="!isLowStock">{{ quantityAvailable }} in stock</span>
-<span *ngIf="isLowStock" class="text-danger d-block small">Only {{ quantityAvailable }} left!</span>
-<span *ngIf="isOutOfStock" class="text-danger">Out of stock</span>
+<!--
+  Live stock indicator (Real-Time Inventory & Flash Sale feature).
+
+  M02: ONE persistent live region. The outer <span role="status" aria-live="polite"
+  aria-atomic="true"> is always present; only its inner text/classes change as stock updates arrive
+  over SignalR. This lets assistive technology reliably announce stock changes (swapping among
+  separate sibling elements does not guarantee an announcement).
+
+  M03: the healthy-stock message uses the component-scoped ".stock-in" class (a WCAG-AA >=4.5:1
+  accessible green) instead of Bootstrap ".text-success" (#28a745, ~3.13:1 on white).
+
+  m04: an explicit "unavailable" branch renders when the quantity is missing/invalid, so an
+  undefined/NaN/negative value can never appear as a blank green "in stock".
+-->
+<span class="live-stock" role="status" aria-live="polite" aria-atomic="true">
+  <ng-container [ngSwitch]="true">
+    <span *ngSwitchCase="isUnavailable" class="stock-unavailable">Stock unavailable</span>
+    <span *ngSwitchCase="isOutOfStock" class="text-danger">Out of stock</span>
+    <span *ngSwitchCase="isLowStock" class="text-danger d-inline-block small">Only {{ normalizedQuantity }} left!</span>
+    <span *ngSwitchCase="isInStock" class="stock-in">{{ normalizedQuantity }} in stock</span>
+  </ng-container>
+</span>

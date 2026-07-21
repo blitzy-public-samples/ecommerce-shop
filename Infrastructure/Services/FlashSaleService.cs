@@ -1,169 +1,301 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
 using System.Linq;
 using System.Threading.Tasks;
 using Core.Entities;
 using Core.Interfaces;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 
 namespace Infrastructure.Services
 {
     /// <summary>
     /// Concrete flash-sale service for the Real-Time Inventory &amp; Flash Sale feature.
     /// Two responsibilities:
-    ///   1. <see cref="ScheduleAsync"/> — creates/schedules a time-boxed flash sale and persists it.
+    ///   1. <see cref="ScheduleAsync"/> — validates and schedules a time-boxed flash sale, enforcing per-product
+    ///      non-overlap, and persists it.
     ///   2. <see cref="GetActiveSalesAsync"/> — returns the currently-active sales, each paired with a
-    ///      freshly-computed live <c>QuantityAvailable</c>.
+    ///      freshly-computed, SALE-SCOPED live <c>QuantityAvailable</c>.
     ///
-    /// Design notes (per AAP §0.4.2):
+    /// Hardening applied for the code review:
     /// <list type="bullet">
     ///   <item>
-    ///     Availability is always <b>derived</b>, never stored: it is
-    ///     <c>StockAllocation − SUM(active non-expired reservations for the product)</c>, clamped at zero.
-    ///     There is no stock column on <c>Product</c>, so this projection is the single source of truth.
+    ///     <b>C04 / m09 — sale-scoped availability.</b> Availability is derived per FLASH SALE authority, not
+    ///     per product: <c>StockAllocation − SUM(Quantity WHERE FlashSaleId = &lt;that sale&gt; AND (Consumed OR
+    ///     (Active AND ExpiresAt &gt; now)))</c>, clamped at zero. Durable Consumed (sold) units are included so
+    ///     sold stock is never returned to the pool, and one sale's history can never contaminate another.
     ///   </item>
     ///   <item>
-    ///     Real-time notifications go <b>only</b> through the <see cref="IInventoryBroadcaster"/> abstraction.
-    ///     The service therefore carries <b>no</b> direct SignalR (or <c>API.Hubs</c>) dependency, keeping it
-    ///     fully unit-testable with a mocked broadcaster and an EF in-memory <see cref="StoreContext"/>.
+    ///     <b>C03 / M09 — validation + non-overlap.</b> The service is a trust boundary: it validates product
+    ///     existence, positive allocation/price, discount-below-base-price, and a forward UTC window, and rejects
+    ///     any sale whose window overlaps an existing sale for the same product. On relational providers the
+    ///     check-and-insert runs inside a Serializable transaction so two concurrent schedulers cannot both
+    ///     insert overlapping rows (PostgreSQL SSI detects the conflict; SQLite serialises writers).
     ///   </item>
     ///   <item>
-    ///     The catalog <c>products.price</c> write path is never touched here; the flash-sale price lives on
-    ///     its own column and is applied elsewhere purely as a read-time overlay (AAP §0.5.2).
+    ///     <b>M10 — no N+1.</b> The active-sales read aggregates reservations for ALL active sales in ONE grouped
+    ///     query, then projects in memory.
     ///   </item>
     ///   <item>
-    ///     The <see cref="FlashSale.Version"/> optimistic-concurrency token is <b>not</b> mutated by this
-    ///     service — it is owned by the reservation read-modify-write path that guards against oversell.
+    ///     <b>M11 / M13 — persistence-authoritative, ordered broadcast.</b> A "flash sale started" event is
+    ///     published AFTER commit through the shared <see cref="IInventoryBroadcastCoordinator"/>, which never
+    ///     throws, so a broadcast failure can never turn a durably-scheduled sale into a caller-visible failure.
+    ///   </item>
+    ///   <item>
+    ///     The catalog <c>products.price</c> write path is never touched here; the flash-sale price lives on its
+    ///     own column and is a read-time overlay only (AAP §0.5.2). <see cref="FlashSale.Version"/> is owned by
+    ///     the reservation read-modify-write path and is not mutated by this service.
     ///   </item>
     /// </list>
-    /// Registered as a scoped service by the API layer's <c>ApplicationServicesExtensions</c>; this file
-    /// performs no DI wiring of its own.
     /// </summary>
     public class FlashSaleService : IFlashSaleService
     {
-        // EF Core DbContext for the e-commerce store. Injected (scoped) so every request/operation gets a
-        // fresh unit of work, mirroring the repository conventions of the sibling services.
+        // EF Core DbContext for the e-commerce store (scoped), mirroring the sibling services' conventions.
         private readonly StoreContext _context;
 
-        // Hub-agnostic broadcast seam. Concrete implementation (over IHubContext<InventoryHub>) lives in the
-        // API layer; depending on the interface keeps this service free of any SignalR reference.
-        private readonly IInventoryBroadcaster _broadcaster;
+        // Shared, ordered, persistence-authoritative broadcast coordinator (never throws after commit). Replaces
+        // the previous direct IInventoryBroadcaster dependency so schedule broadcasts obey the same M11/M13
+        // guarantees as reserve/release/consume/sweep.
+        private readonly IInventoryBroadcastCoordinator _coordinator;
 
-        /// <summary>
-        /// Creates a new <see cref="FlashSaleService"/>.
-        /// </summary>
-        /// <param name="context">The store <see cref="StoreContext"/> used to persist and query flash sales.</param>
-        /// <param name="broadcaster">The inventory broadcaster used to emit real-time flash-sale events.</param>
-        public FlashSaleService(StoreContext context, IInventoryBroadcaster broadcaster)
+        private readonly ILogger<FlashSaleService> _logger;
+
+        public FlashSaleService(
+            StoreContext context,
+            IInventoryBroadcastCoordinator coordinator,
+            ILogger<FlashSaleService> logger)
         {
             _context = context;
-            _broadcaster = broadcaster;
+            _coordinator = coordinator;
+            _logger = logger;
         }
 
         /// <summary>
-        /// Creates and persists a flash sale for the given product over the inclusive window
-        /// <c>[startAt, endAt]</c>. If the sale is already active at creation time (i.e.
-        /// <see cref="DateTimeOffset.UtcNow"/> falls inside the window), a <c>FlashSaleStarted</c> event is
-        /// broadcast immediately with the current live availability so connected clients light up without
-        /// waiting for the next poll.
+        /// Validates and schedules a flash sale for <paramref name="productId"/> over the inclusive window
+        /// <c>[startAt, endAt]</c>, enforcing per-product non-overlap. Returns a deterministic
+        /// <see cref="FlashSaleScheduleResult"/> the API maps to an exact HTTP status. On success, if the sale is
+        /// already active, a <c>FlashSaleStarted</c> event is published via the coordinator.
         /// </summary>
-        /// <param name="productId">The product the sale applies to.</param>
-        /// <param name="startAt">Inclusive start of the sale window.</param>
-        /// <param name="endAt">Inclusive end of the sale window.</param>
-        /// <param name="salePrice">The discounted price offered during the window (never overwrites the base product price).</param>
-        /// <param name="stockAllocation">Number of units reserved for the flash sale — the ceiling for availability.</param>
-        /// <returns>The persisted <see cref="FlashSale"/>, with its generated <c>Id</c> (and default <c>Version</c>) populated.</returns>
-        public async Task<FlashSale> ScheduleAsync(int productId, DateTimeOffset startAt, DateTimeOffset endAt,
-            decimal salePrice, int stockAllocation)
+        public async Task<FlashSaleScheduleResult> ScheduleAsync(int productId, DateTimeOffset startAt,
+            DateTimeOffset endAt, decimal salePrice, int stockAllocation)
         {
-            // Build the aggregate from the primitive arguments. Id and Version are assigned by the store on save.
+            // --- M09: service-boundary domain validation (independent of the DTO, so a DIRECT caller cannot
+            // persist an invalid authority row). Normalise the window to UTC first so comparisons and storage are
+            // consistent regardless of the caller's offset.
+            var startAtUtc = startAt.ToUniversalTime();
+            var endAtUtc = endAt.ToUniversalTime();
+
+            if (startAt == default || endAt == default || endAtUtc <= startAtUtc)
+            {
+                return Fail(FlashSaleScheduleOutcome.InvalidWindow);
+            }
+            if (stockAllocation <= 0)
+            {
+                return Fail(FlashSaleScheduleOutcome.InvalidAllocation);
+            }
+            if (salePrice <= 0m)
+            {
+                return Fail(FlashSaleScheduleOutcome.InvalidSalePrice);
+            }
+
+            // Establish product existence rather than trusting a deferred FK failure (M09).
+            var product = await _context.Products.FindAsync(productId);
+            if (product == null)
+            {
+                return Fail(FlashSaleScheduleOutcome.ProductNotFound);
+            }
+
+            // A "discount" must actually discount: the sale price must be strictly below the base price. The base
+            // products.price write path is never modified (AAP §0.5.2) — it is only READ here for this rule.
+            if (salePrice >= product.Price)
+            {
+                return Fail(FlashSaleScheduleOutcome.SalePriceNotBelowBasePrice);
+            }
+
             var sale = new FlashSale
             {
                 ProductId = productId,
-                StartAt = startAt,
-                EndAt = endAt,
+                StartAt = startAtUtc,
+                EndAt = endAtUtc,
                 SalePrice = salePrice,
                 StockAllocation = stockAllocation
+                // Version defaults; owned by the reservation path, never set here.
             };
 
-            // Persist. After SaveChangesAsync the identity Id is materialized and the concurrency Version defaulted.
-            _context.FlashSales.Add(sale);
-            await _context.SaveChangesAsync();
+            // --- C03: transactional, per-product non-overlap enforcement.
+            var persisted = await TryPersistNonOverlappingAsync(sale);
+            if (!persisted)
+            {
+                return Fail(FlashSaleScheduleOutcome.Overlap);
+            }
 
-            // If the sale is live the moment it is created, announce it right away. The window is inclusive of
-            // BOTH bounds, and "now" is evaluated in UTC to match the persisted DateTimeOffset semantics.
+            // --- M11 / M13: announce a live sale AFTER commit via the coordinator (never throws). "now" is UTC to
+            // match the persisted timestamps; the window is inclusive of both bounds.
             var now = DateTimeOffset.UtcNow;
             if (sale.StartAt <= now && sale.EndAt >= now)
             {
-                var available = await ComputeAvailableAsync(sale.ProductId, sale.StockAllocation);
-                await _broadcaster.BroadcastFlashSaleStartedAsync(sale, available);
+                await _coordinator.PublishFlashSaleStartedAsync(
+                    sale, () => ComputeAvailableAsync(sale.Id, sale.StockAllocation));
             }
 
-            return sale;
+            return new FlashSaleScheduleResult
+            {
+                Outcome = FlashSaleScheduleOutcome.Success,
+                FlashSale = sale
+            };
         }
 
         /// <summary>
-        /// Returns every flash sale whose window currently contains <see cref="DateTimeOffset.UtcNow"/>
-        /// (inclusive of both bounds), each paired with a freshly-computed live <c>QuantityAvailable</c>.
-        /// This feeds the deliberately non-cached <c>GET /api/flash-sales/active</c> endpoint, so the numbers
-        /// reflect stock depletion in real time rather than a stale response-cache snapshot.
+        /// Returns every flash sale whose window currently contains <see cref="DateTimeOffset.UtcNow"/> (inclusive
+        /// of both bounds), each paired with a freshly-computed, SALE-SCOPED live <c>QuantityAvailable</c>.
+        /// Aggregates reservations for ALL active sales in ONE grouped query to avoid N+1 round trips (M10).
         /// </summary>
-        /// <returns>An <see cref="IReadOnlyList{T}"/> of <see cref="ActiveFlashSale"/> (empty when no sale is active).</returns>
         public async Task<IReadOnlyList<ActiveFlashSale>> GetActiveSalesAsync()
         {
             var now = DateTimeOffset.UtcNow;
 
-            // Only sales whose window contains "now" (inclusive on both ends) are considered active.
+            // Only sales whose window contains "now" (inclusive on both ends) are active.
             var activeSales = await _context.FlashSales
                 .Where(fs => fs.StartAt <= now && fs.EndAt >= now)
                 .ToListAsync();
 
-            // Compute live availability per active sale. Active sales are few (typically one per product),
-            // so awaiting inside the loop is acceptable; each aggregation runs against the same source of truth.
-            var result = new List<ActiveFlashSale>(activeSales.Count);
-            foreach (var sale in activeSales)
+            if (activeSales.Count == 0)
             {
-                var available = await ComputeAvailableAsync(sale.ProductId, sale.StockAllocation);
-                result.Add(new ActiveFlashSale
-                {
-                    Sale = sale,
-                    QuantityAvailable = available
-                });
+                return new List<ActiveFlashSale>();
             }
 
-            // List<ActiveFlashSale> satisfies the IReadOnlyList<ActiveFlashSale> contract.
-            return result;
+            var saleIds = activeSales.Select(s => s.Id).ToList();
+
+            // M10: ONE grouped aggregation keyed by FlashSaleId (C04: sale-scoped, incl. durable Consumed units),
+            // instead of one SUM per sale. Released/Expired holds do not count.
+            var reservedBySale = await _context.InventoryReservations
+                .Where(r => saleIds.Contains(r.FlashSaleId)
+                    && (r.Status == ReservationStatus.Consumed
+                        || (r.Status == ReservationStatus.Active && r.ExpiresAt > now)))
+                .GroupBy(r => r.FlashSaleId)
+                .Select(g => new { FlashSaleId = g.Key, Reserved = g.Sum(x => x.Quantity) })
+                .ToListAsync();
+
+            var reservedMap = reservedBySale.ToDictionary(x => x.FlashSaleId, x => x.Reserved);
+
+            return activeSales
+                .Select(s =>
+                {
+                    var reserved = reservedMap.TryGetValue(s.Id, out var r) ? r : 0;
+                    var available = s.StockAllocation - reserved;
+                    return new ActiveFlashSale
+                    {
+                        Sale = s,
+                        QuantityAvailable = available < 0 ? 0 : available
+                    };
+                })
+                .ToList();
         }
 
+        // --- C03: persists the sale only if it does not overlap an existing sale for the same product. On a
+        // relational provider the overlap CHECK and the INSERT run in one Serializable transaction so two
+        // concurrent schedulers cannot both commit overlapping rows (PostgreSQL SSI raises a serialization
+        // failure for one; SQLite serialises writers). The application check gives a fast, deterministic answer
+        // for the common case; a serialization/constraint failure is also mapped to "overlap". Non-relational
+        // providers (the InMemory test store) run the check+insert directly. Returns true when persisted.
+        private async Task<bool> TryPersistNonOverlappingAsync(FlashSale sale)
+        {
+            if (!_context.Database.IsRelational())
+            {
+                if (await OverlapsAsync(sale)) return false;
+                _context.FlashSales.Add(sale);
+                await _context.SaveChangesAsync();
+                return true;
+            }
+
+            // Relational: check + insert atomically under Serializable isolation. No retrying execution strategy
+            // is configured on the StoreContext, so a manual transaction is safe here.
+            await using var tx = await _context.Database
+                .BeginTransactionAsync(IsolationLevel.Serializable);
+
+            if (await OverlapsAsync(sale))
+            {
+                await tx.RollbackAsync();
+                return false;
+            }
+
+            _context.FlashSales.Add(sale);
+            try
+            {
+                await _context.SaveChangesAsync();
+                await tx.CommitAsync();
+                return true;
+            }
+            catch (DbUpdateException ex) when (IsConcurrencyOrConstraintConflict(ex.InnerException as DbException))
+            {
+                // A concurrent scheduler inserted an overlapping row first (surfaced as a unique/exclusion
+                // violation). Deterministic conflict response rather than a 500.
+                await SafeRollbackAsync(tx);
+                _context.Entry(sale).State = EntityState.Detached;
+                return false;
+            }
+            catch (DbException ex) when (IsConcurrencyOrConstraintConflict(ex))
+            {
+                // PostgreSQL SSI serialization failure (SQLSTATE 40001) at COMMIT under Serializable isolation:
+                // the competing scheduler's overlapping insert won. Treat as overlap, not an error.
+                await SafeRollbackAsync(tx);
+                _context.Entry(sale).State = EntityState.Detached;
+                return false;
+            }
+        }
+
+        // Two inclusive windows [s1, e1] and [s2, e2] overlap iff s1 <= e2 AND s2 <= e1.
+        private Task<bool> OverlapsAsync(FlashSale sale) =>
+            _context.FlashSales.AnyAsync(fs =>
+                fs.ProductId == sale.ProductId
+                && fs.StartAt <= sale.EndAt
+                && sale.StartAt <= fs.EndAt);
+
+        // 40001 = serialization_failure (SSI); 23505 = unique_violation; 23P01 = exclusion_violation. Compared via
+        // the provider-agnostic DbException.SqlState (available since .NET 5), so no Npgsql-specific dependency.
+        private static bool IsConcurrencyOrConstraintConflict(DbException ex) =>
+            ex != null && (ex.SqlState == "40001" || ex.SqlState == "23505" || ex.SqlState == "23P01");
+
+        private static async Task SafeRollbackAsync(IDisposable tx)
+        {
+            // Rollback defensively; a transaction already aborted by a serialization failure may throw on rollback.
+            try
+            {
+                if (tx is Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction dbTx)
+                {
+                    await dbTx.RollbackAsync();
+                }
+            }
+            catch
+            {
+                // The transaction is being disposed regardless; a rollback error here is not actionable.
+            }
+        }
+
+        private static FlashSaleScheduleResult Fail(FlashSaleScheduleOutcome outcome) =>
+            new FlashSaleScheduleResult { Outcome = outcome };
+
         /// <summary>
-        /// Computes the live available quantity for a product's flash sale as
-        /// <c>stockAllocation − SUM(active non-expired reservations for the product)</c>, clamped so it never
-        /// goes negative. This is the single source of truth for availability shared by scheduling and the
-        /// active-sales query.
+        /// SALE-SCOPED live availability (review findings C04, m09): <c>stockAllocation − SUM(Quantity WHERE
+        /// FlashSaleId = <paramref name="flashSaleId"/> AND (Consumed OR (Active AND ExpiresAt &gt; now)))</c>,
+        /// clamped at zero. Mirrors InventoryReservationService's authoritative formula so scheduling, reserving,
+        /// and sweeping all agree. Used for the single-sale broadcast on schedule; the active-sales list uses the
+        /// grouped query above.
         /// </summary>
-        /// <param name="productId">The product whose reservations reduce availability.</param>
-        /// <param name="stockAllocation">The flash sale's allocated ceiling.</param>
-        /// <returns>The non-negative number of units still available.</returns>
-        private async Task<int> ComputeAvailableAsync(int productId, int stockAllocation)
+        private async Task<int> ComputeAvailableAsync(int flashSaleId, int stockAllocation)
         {
             var now = DateTimeOffset.UtcNow;
 
-            // Reconciled to the hardened Status-based model (Core/Entities/InventoryReservation.cs,
-            // ReservationStatus.cs): a reservation still holds stock when it is Consumed (sold) OR Active and not
-            // yet expired (ExpiresAt > now). Released/Expired holds have returned their stock and must not count.
-            // SumAsync over an int selector returns 0 for an empty set. Aggregation is per-product, assuming a
-            // single active sale per product at any moment (AAP key insight).
             var reserved = await _context.InventoryReservations
-                .Where(r => r.ProductId == productId
+                .Where(r => r.FlashSaleId == flashSaleId
                     && (r.Status == ReservationStatus.Consumed
                         || (r.Status == ReservationStatus.Active && r.ExpiresAt > now)))
                 .SumAsync(r => r.Quantity);
 
             var available = stockAllocation - reserved;
-
-            // Clamp: availability is a display/UX quantity and must never be reported as negative even if,
-            // transiently, reservations were to exceed the allocation.
             return available < 0 ? 0 : available;
         }
     }

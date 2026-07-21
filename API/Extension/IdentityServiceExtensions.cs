@@ -43,15 +43,13 @@ namespace API.Extension
                         {
                             var accessToken = context.Request.Query["access_token"];
                             var path = context.HttpContext.Request.Path;
-                            // Flash-Sale feature (review finding F07): resolve the hub path from configuration, but fall back to
-                            // the single canonical InventoryHub.HubPath when SIGNALR_HUB_PATH is absent/blank. This guarantees the
-                            // query-string token is always lifted for the hub — even if a deployment omits the config key — so the
-                            // WebSocket auth can never silently no-op, and the extraction path always agrees with MapHub<InventoryHub>.
-                            var hubPath = config["SIGNALR_HUB_PATH"];
-                            if (string.IsNullOrWhiteSpace(hubPath))
-                            {
-                                hubPath = InventoryHub.HubPath;
-                            }
+                            // Flash-Sale feature (review finding M04): resolve the hub path through the SINGLE canonical
+                            // InventoryHub.ResolveHubPath so a null/empty/whitespace SIGNALR_HUB_PATH is normalized to
+                            // EXACTLY the same value that Startup.MapHub<InventoryHub> uses. This guarantees the query-string
+                            // token is lifted for precisely the path the hub is mapped at — even if a deployment omits or
+                            // blanks the config key — so WebSocket auth can never silently no-op and the extraction path can
+                            // never diverge from the routing path.
+                            var hubPath = InventoryHub.ResolveHubPath(config["SIGNALR_HUB_PATH"]);
                             if (!string.IsNullOrEmpty(accessToken) &&
                                 path.StartsWithSegments(hubPath))
                             {

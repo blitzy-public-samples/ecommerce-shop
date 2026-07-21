@@ -90,10 +90,12 @@ namespace API
             {
                 endpoints.MapControllers();
                 // Flash-Sale feature: map the real-time inventory SignalR hub at the configured path.
-                // Path from config SIGNALR_HUB_PATH (falls back to "/hubs/inventory"); MUST match appsettings
-                // and the JwtBearerEvents.OnMessageReceived hub-path check in IdentityServiceExtensions.cs.
+                // Flash-Sale feature (review finding M04): resolve the path via the SINGLE canonical
+                // InventoryHub.ResolveHubPath so a null/empty/whitespace SIGNALR_HUB_PATH is normalized to the
+                // SAME value used by the JwtBearerEvents.OnMessageReceived hub-path check in
+                // IdentityServiceExtensions.cs — authentication and routing can no longer target different URLs.
                 // Registered BEFORE the SPA catch-all so MapFallbackToController remains the LAST mapping.
-                endpoints.MapHub<InventoryHub>(_config["SIGNALR_HUB_PATH"] ?? "/hubs/inventory");
+                endpoints.MapHub<InventoryHub>(InventoryHub.ResolveHubPath(_config["SIGNALR_HUB_PATH"]));
                 endpoints.MapFallbackToController("Index", "Fallback");
             });
         }

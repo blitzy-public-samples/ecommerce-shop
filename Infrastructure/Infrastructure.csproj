@@ -7,6 +7,10 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Identity" Version="2.2.0" />
+    <!-- Flash-Sale feature (review finding M22): ReservationExpirySweepService derives from BackgroundService,
+         which lives in Microsoft.Extensions.Hosting.Abstractions. Declare it EXPLICITLY at the net5.0-aligned
+         version (5.0.0) so the type no longer resolves through an accidental transitive 2.2.0 reference. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="5.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="5.0.8" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="5.0.8" />
     <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="6.12.0" />

@@ -20,6 +20,18 @@ namespace API.Hubs
         // absent. Keep this in sync with the SIGNALR_HUB_PATH value in appsettings.json.
         public const string HubPath = "/hubs/inventory";
 
+        // Flash-Sale feature (review finding M04): the SINGLE canonical resolver for the effective hub path.
+        // BOTH the SignalR endpoint mapping (Startup.MapHub<InventoryHub>) AND the JWT query-token extraction
+        // (IdentityServiceExtensions.OnMessageReceived) MUST resolve the path through this method so that a
+        // null, empty, OR whitespace SIGNALR_HUB_PATH is normalized IDENTICALLY on both sides. Previously the
+        // startup mapping used null-coalescing only ("?? default"), which mapped a blank/whitespace value
+        // literally, while the JWT side normalized blank input to the default — so authentication and routing
+        // could target different URLs. Centralizing here removes that divergence: null/empty/whitespace falls
+        // back to HubPath, and any configured value is trimmed so incidental surrounding whitespace cannot
+        // desynchronize the two call sites.
+        public static string ResolveHubPath(string configuredPath)
+            => string.IsNullOrWhiteSpace(configuredPath) ? HubPath : configuredPath.Trim();
+
         // Flash-Sale feature (review finding F08): per-connection key under which we remember the ONE product
         // group a connection is currently subscribed to, so a new join replaces the previous subscription.
         private const string CurrentProductGroupKey = "flashsale:current-product-group";

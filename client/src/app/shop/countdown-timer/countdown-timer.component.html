@@ -1,0 +1,12 @@
+<!--
+  Countdown to a flash sale's end (Real-Time Inventory & Flash Sale feature).
+
+  `remaining` holds the display string for every state:
+    - "HH:MM:SS" while the sale is active (ceiling seconds, m03),
+    - "00:00:00" at the exact expiry transition,
+    - "--:--:--" as the defined fallback when `endAt` is missing/unparsable (m01).
+
+  role="timer" is a live region that, per the ARIA spec, is NOT announced on every tick by default,
+  so a per-second countdown does not spam screen readers.
+-->
+<span class="countdown-timer" role="timer" [class.countdown-timer--invalid]="invalid">{{ remaining }}</span>
