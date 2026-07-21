@@ -1,6 +1,7 @@
 using System.IO;
 using API.Extension;
 using API.Helpers;
+using API.Hubs;
 using API.Middleware;
 using Infrastructure.Data;
 using Infrastructure.Identity;
@@ -61,7 +62,7 @@ namespace API
                 opt.AddPolicy("CorsPolicy",
                     policy =>
                     {
-                        policy.AllowAnyHeader().AllowAnyMethod().WithOrigins("https://localhost:4200");
+                        policy.AllowAnyHeader().AllowAnyMethod().AllowCredentials().WithOrigins("https://localhost:4200");
                     });
             });
         }
@@ -98,6 +99,7 @@ namespace API
             app.UseEndpoints(endpoints =>
             {
                 endpoints.MapControllers();
+                endpoints.MapHub<StockHub>("/hubs/stock");
                 endpoints.MapFallbackToController("Index", "Fallback");
             });
         }
