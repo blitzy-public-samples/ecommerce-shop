@@ -207,11 +207,20 @@ namespace Infrastructure.Services
                 }
 
                 existing.ExpiresAt = expiresAt;
+                // The authoritative DB hold quantity is only updated for a positive new total; a
+                // non-positive quantity is a TTL "refresh only" and leaves the held quantity unchanged.
                 if (quantity > 0) existing.Quantity = quantity;
                 await _context.SaveChangesAsync();
 
-                // adjust counter by -delta (delta>0 => DECR, delta<0 => INCR), refresh hold TTL, publish
-                await TryAdjustReserveRedisAsync(basketId, productId, delta, expiresAt - now, existing.FlashSaleId);
+                // The Redis counter tracks available stock = pool - SUM(Active reservation quantities),
+                // so it MUST move by exactly the amount the authoritative DB hold moved. Because the hold
+                // quantity is unchanged when quantity <= 0, availability is unchanged and the counter must
+                // NOT move either; otherwise an extend-to-0 (or negative) call would spuriously INCR the
+                // counter by the held amount and transiently over-report available stock (and the broadcast
+                // badge) until the next reconciliation reseed. Mirror the DB change in the counter delta.
+                var counterDelta = quantity > 0 ? delta : 0;
+                // adjust counter by counterDelta (>0 => DECR, <0 => INCR, 0 => publish-only), refresh hold TTL
+                await TryAdjustReserveRedisAsync(basketId, productId, counterDelta, expiresAt - now, existing.FlashSaleId);
 
                 if (tx != null) await tx.CommitAsync();
             }

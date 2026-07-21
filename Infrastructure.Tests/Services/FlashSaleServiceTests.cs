@@ -148,5 +148,27 @@ namespace Infrastructure.Tests.Services
             ended.Status.Should().Be(FlashSaleStatus.Ended);
             stayed.Status.Should().Be(FlashSaleStatus.Scheduled);
         }
+
+        [Fact]
+        public async Task AdvanceFlashSaleStatusesAsync_WhenActiveSaleStillWithinWindow_RemainsActive()
+        {
+            // Arrange — an already-Active sale whose window has NOT yet ended must stay Active.
+            // This exercises the status-advance guard where sale.Status == Scheduled is FALSE (a
+            // non-Scheduled, non-Ended sale reaching the else-if short-circuit), which the combined
+            // transition test above does not cover on its own.
+            var now = DateTimeOffset.UtcNow;
+            var seeded = await TestStoreContextFactory.SeedFlashSalesAsync(
+                _context, productId: 4, saleStockQuantity: 10,
+                startsAt: now.AddMinutes(-5), endsAt: now.AddMinutes(30),
+                status: FlashSaleStatus.Active);
+
+            // Act
+            await _sut.AdvanceFlashSaleStatusesAsync();
+
+            // Assert — the in-window Active sale is unchanged.
+            var unchanged = await _context.FlashSales.FindAsync(seeded[0].Id);
+            unchanged.Status.Should().Be(FlashSaleStatus.Active);
+        }
+
     }
 }
