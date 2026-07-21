@@ -64,12 +64,36 @@ export class CheckoutComponent implements OnInit, OnDestroy {
   }
 
   private trackBasketStock(): void {
-    const basketSub = this.basketService.basket$.subscribe(basket => {
-      if (basket && basket.items) {
-        basket.items.forEach(item => this.trackProductStock(item.id));
+    const basketSub = this.basketService.basket$.subscribe(basket => this.syncBasketStock(basket));
+    this.subscriptions.push(basketSub);
+  }
+
+  /**
+   * Reconciles live-stock tracking with the CURRENT basket on every basket$ emit.
+   *
+   * Fix for the mid-session submit-gate latch (QA H1): the gate was recomputed
+   * only inside the per-product stock callback, so a removed/emptied product's
+   * stale `0` kept it stuck true and blocked the AAP recovery flow ("return to
+   * your basket and remove it"). Here we prune products that have left the basket
+   * — releasing their hub subscription (R1) — and recompute the gate from the
+   * current basket on every emit.
+   */
+  private syncBasketStock(basket: IBasket): void {
+    const currentIds = new Set<number>((basket && basket.items ? basket.items : []).map(item => item.id));
+
+    Array.from(this.trackedProductIds).forEach(id => {
+      if (!currentIds.has(id)) {
+        this.trackedProductIds.delete(id);
+        this.stockMap.delete(id);
+        this.stockService.unsubscribeFromProduct(id);
       }
     });
-    this.subscriptions.push(basketSub);
+
+    if (basket && basket.items) {
+      basket.items.forEach(item => this.trackProductStock(item.id));
+    }
+
+    this.recomputeGate();
   }
 
   private trackProductStock(productId: number): void {
@@ -79,10 +103,20 @@ export class CheckoutComponent implements OnInit, OnDestroy {
     this.trackedProductIds.add(productId);
     this.stockService.subscribeToProduct(productId);
     const stockSub = this.stockService.getStock$(productId).subscribe(stock => {
+      // Ignore a late emission for a product that has since left the basket.
+      if (!this.trackedProductIds.has(productId)) { return; }
       this.stockMap.set(productId, stock);
-      this.hasOutOfStockItem = Array.from(this.stockMap.values()).some(value => value === 0);
+      this.recomputeGate();
     });
     this.subscriptions.push(stockSub);
+  }
+
+  /**
+   * The gate reflects only products STILL in the basket: true when any
+   * currently-tracked product's latest known stock is exactly zero.
+   */
+  private recomputeGate(): void {
+    this.hasOutOfStockItem = Array.from(this.trackedProductIds).some(id => this.stockMap.get(id) === 0);
   }
 
   ngOnDestroy(): void {

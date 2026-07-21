@@ -122,4 +122,24 @@ describe('AppComponent', () => {
     // Assert: existing bootstrap behavior is preserved alongside the new hub start.
     expect(accountServiceStub.loadCurrentUser).toHaveBeenCalled();
   });
+
+  it('rehydrates the basket from a persisted basket_id on init (QA A1 coverage)', () => {
+    // Arrange: a basket_id persisted from a prior session drives loadBasket() down
+    // its rehydration branch (the beforeEach clears localStorage, so the other
+    // specs only exercise the no-op branch — this closes that coverage gap).
+    localStorage.setItem('basket_id', 'persisted-basket-1');
+
+    try {
+      // Act
+      component.ngOnInit();
+
+      // Assert: the persisted basket is rehydrated with its exact id, and the new
+      // hub-startup behavior remains a single call alongside it.
+      expect(basketServiceStub.getBasket).toHaveBeenCalledWith('persisted-basket-1');
+      expect(stockServiceStub.startConnection).toHaveBeenCalledTimes(1);
+    } finally {
+      // Do not leak persisted state into later specs / spec files.
+      localStorage.removeItem('basket_id');
+    }
+  });
 });

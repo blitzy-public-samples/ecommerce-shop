@@ -44,7 +44,7 @@ describe('BasketComponent (template gating)', () => {
   let component: BasketComponent;
   let fixture: ComponentFixture<BasketComponent>;
   let basketServiceStub: { basket$: any; basketTotal$: any };
-  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy };
+  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy; unsubscribeFromProduct: jasmine.Spy };
 
   // A basket item's id IS the product id, so stock is tracked on item.id. Two items
   // (ids 1 and 2) make the per-item subscribe assertions and the "ANY item at zero"
@@ -73,7 +73,10 @@ describe('BasketComponent (template gating)', () => {
     // the out-of-stock gating.
     stockServiceStub = {
       subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
-      getStock$: jasmine.createSpy('getStock$').and.returnValue(of(5))
+      getStock$: jasmine.createSpy('getStock$').and.returnValue(of(5)),
+      // Mirror the real StockService surface: the component releases a product's
+      // hub subscription when it leaves the basket (QA R1 / prune-on-removal).
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct')
     };
 
     await TestBed.configureTestingModule({
@@ -125,6 +128,8 @@ describe('BasketComponent (template gating)', () => {
     // The proceed-to-checkout anchor is gated with the Bootstrap disabled class.
     const proceed = fixture.nativeElement.querySelector('a.btn-outline-primary');
     expect(proceed.classList.contains('disabled')).toBe(true);
+    // ...and exposes the accessible disabled state for assistive technology.
+    expect(proceed.getAttribute('aria-disabled')).toBe('true');
   });
 
   it('does not gate checkout and hides the alert when all items are in stock', () => {
@@ -170,6 +175,7 @@ describe('BasketComponent (stock tracking logic)', () => {
   let stockServiceMock: {
     subscribeToProduct: jasmine.Spy;
     getStock$: jasmine.Spy;
+    unsubscribeFromProduct: jasmine.Spy;
   };
 
   // Arrange helper: build a basket item matching the IBasketItem contract. A
@@ -215,7 +221,10 @@ describe('BasketComponent (stock tracking logic)', () => {
       subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
       getStock$: jasmine
         .createSpy('getStock$')
-        .and.callFake((id: number) => stockStream(id).asObservable())
+        .and.callFake((id: number) => stockStream(id).asObservable()),
+      // The component calls this when a product leaves the basket so the service
+      // can release its per-product hub tracking (QA R1 / prune-on-removal).
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct')
     };
 
     await TestBed.configureTestingModule({
@@ -281,6 +290,50 @@ describe('BasketComponent (stock tracking logic)', () => {
     expect(component.hasOutOfStockItem).toBe(true);
 
     stockStream(1).next(4);
+    expect(component.hasOutOfStockItem).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA H1 (MAJOR) — the checkout gate must CLEAR when the offending product is
+  // removed from the basket or the basket is emptied. Before the fix the gate was
+  // a one-way latch: a departed item's stale `0` stayed in the component's stock
+  // map and kept `.some(v => v === 0)` true forever. These specs lock the
+  // AAP-documented recovery flow ("remove the zero-stock item and continue").
+  // ---------------------------------------------------------------------------
+
+  it('H1a: removing the out-of-stock item clears the checkout gate', () => {
+    // Two items; item 2 goes to zero -> gate ON.
+    basketSubject.next(makeBasket([makeItem(1), makeItem(2)]));
+    stockStream(1).next(5);
+    stockStream(2).next(0);
+    expect(component.hasOutOfStockItem).toBe(true);
+
+    // The shopper removes item 2, so basket$ re-emits with only item 1. The gate
+    // must recompute from the CURRENT basket and clear.
+    basketSubject.next(makeBasket([makeItem(1)]));
+    expect(component.hasOutOfStockItem).toBe(false);
+
+    // The departed product's per-product hub tracking is released (R1).
+    expect(stockServiceMock.unsubscribeFromProduct).toHaveBeenCalledWith(2);
+  });
+
+  it('H1b: emptying the basket (null) clears the checkout gate', () => {
+    basketSubject.next(makeBasket([makeItem(1), makeItem(2)]));
+    stockStream(2).next(0);
+    expect(component.hasOutOfStockItem).toBe(true);
+
+    // A null basket (fully emptied) must clear the gate, not leave it latched.
+    basketSubject.next(null);
+    expect(component.hasOutOfStockItem).toBe(false);
+  });
+
+  it('H1c: emptying the basket (items: []) clears the checkout gate', () => {
+    basketSubject.next(makeBasket([makeItem(1), makeItem(2)]));
+    stockStream(2).next(0);
+    expect(component.hasOutOfStockItem).toBe(true);
+
+    // An empty items array must clear the gate too.
+    basketSubject.next(makeBasket([]));
     expect(component.hasOutOfStockItem).toBe(false);
   });
 

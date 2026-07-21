@@ -17,6 +17,8 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   quantity = 1;
   stock: number;
   private stockSub: Subscription;
+  private routeSub: Subscription;
+  private subscribedProductId: number;
 
   constructor(private shopService: ShopService, private activateRoute: ActivatedRoute,
               private bcService: BreadcrumbService, private basketService: BasketService,
@@ -25,32 +27,65 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    this.loadProduct();
+    // Resolve the id from the paramMap OBSERVABLE (not a one-shot snapshot) so a
+    // same-component route reuse — navigating between products without leaving the
+    // details view — rebinds live-stock tracking to the new product (QA R2).
+    this.routeSub = this.activateRoute.paramMap.subscribe(params => {
+      this.loadProduct(+params.get('id'));
+    });
   }
   addItemToBasket() {
-    this.basketService.addItemToBasket(this.product, this.quantity);
+    // Defense-in-depth guard (QA H2): refuse a programmatic add at zero stock and
+    // never enqueue more than the currently-known available stock. The template
+    // already disables the button at zero; authoritative oversell prevention still
+    // lives on the server (reservation + row lock).
+    if (this.stock === 0) { return; }
+    const quantityToAdd = this.stock !== undefined ? Math.min(this.quantity, this.stock) : this.quantity;
+    this.basketService.addItemToBasket(this.product, quantityToAdd);
   }
   incrementQuantity() {
-    this.quantity++;
+    // Do not let the requested quantity exceed the known available stock (QA H2).
+    // While stock is unknown (undefined) the control is unbounded as before.
+    if (this.stock === undefined || this.quantity < this.stock) {
+      this.quantity++;
+    }
   }
   decrementQuantity() {
     if (this.quantity > 1){
       this.quantity--;
     }
   }
-  loadProduct() {
-    this.shopService.getProduct(+this.activateRoute.snapshot.paramMap.get('id')).subscribe(product => {
+  loadProduct(id: number) {
+    // Release any previously-bound product's live-stock subscription before
+    // rebinding, so route reuse cannot leak subscriptions or show a stale badge.
+    this.releaseStockSubscription();
+    this.stock = undefined;
+    this.quantity = 1;
+    this.shopService.getProduct(id).subscribe(product => {
       this.product = product;
       this.bcService.set('@productDetails', product.name);
-      this.stockService.subscribeToProduct(this.product.id);
-      this.stockSub = this.stockService.getStock$(this.product.id).subscribe(s => this.stock = s);
+      this.subscribedProductId = product.id;
+      this.stockService.subscribeToProduct(product.id);
+      this.stockSub = this.stockService.getStock$(product.id).subscribe(s => this.stock = s);
     }, error => {
       console.log(error);
     });
   }
-  ngOnDestroy(): void {
+  private releaseStockSubscription(): void {
     if (this.stockSub) {
       this.stockSub.unsubscribe();
+      this.stockSub = undefined;
     }
+    if (this.subscribedProductId !== undefined) {
+      // Release the per-product hub tracking for the product we are leaving (R1/R2).
+      this.stockService.unsubscribeFromProduct(this.subscribedProductId);
+      this.subscribedProductId = undefined;
+    }
+  }
+  ngOnDestroy(): void {
+    if (this.routeSub) {
+      this.routeSub.unsubscribe();
+    }
+    this.releaseStockSubscription();
   }
 }

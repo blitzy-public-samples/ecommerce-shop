@@ -28,6 +28,11 @@ export class ProductItemComponent implements OnInit, OnDestroy {
   }
 
   addItemToBasket() {
+    // Defense-in-depth guard (QA H2): the template already disables the button at
+    // zero stock, but the method must also refuse a programmatic add so no code
+    // path can enqueue an out-of-stock product. Authoritative oversell prevention
+    // still lives on the server (reservation + row lock).
+    if (this.stock === 0) { return; }
     this.basketService.addItemToBasket(this.product);
   }
 }

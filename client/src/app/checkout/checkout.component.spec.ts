@@ -184,6 +184,9 @@ describe('CheckoutComponent (stock tracking logic)', () => {
    */
   class MockStockService {
     subscribeToProduct = jasmine.createSpy('subscribeToProduct');
+    // Mirror the real StockService surface: the component releases a product's hub
+    // tracking when it leaves the basket (QA R1 / prune-on-removal).
+    unsubscribeFromProduct = jasmine.createSpy('unsubscribeFromProduct');
     private subjects = new Map<number, Subject<number>>();
 
     getStock$(productId: number): Observable<number> {
@@ -290,6 +293,40 @@ describe('CheckoutComponent (stock tracking logic)', () => {
     expect(component.hasOutOfStockItem).toBeTrue();
 
     stockService.push(2, 4); // restock -> no product at zero anymore
+    expect(component.hasOutOfStockItem).toBeFalse();
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA H1 (MAJOR) — the checkout submit gate must CLEAR when the offending
+  // product is removed from the basket or the basket is emptied. Before the fix
+  // the gate latched permanently on a departed item's stale zero, blocking the
+  // AAP-documented recovery ("return to your basket and remove it").
+  // ---------------------------------------------------------------------------
+
+  it('H1a: removing the out-of-stock item clears the checkout submit gate', () => {
+    fixture.detectChanges();
+
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1 }, { id: 2 }] });
+    stockService.push(1, 5);
+    stockService.push(2, 0);
+    expect(component.hasOutOfStockItem).toBeTrue();
+
+    // The shopper removes item 2; the checkout re-computes from the current basket.
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1 }] });
+    expect(component.hasOutOfStockItem).toBeFalse();
+
+    // The departed product's per-product hub tracking is released (R1).
+    expect(stockService.unsubscribeFromProduct).toHaveBeenCalledWith(2);
+  });
+
+  it('H1b: emptying the basket (null) clears the checkout submit gate', () => {
+    fixture.detectChanges();
+
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1 }, { id: 2 }] });
+    stockService.push(2, 0);
+    expect(component.hasOutOfStockItem).toBeTrue();
+
+    basketService.basket$.next(null);
     expect(component.hasOutOfStockItem).toBeFalse();
   });
 
