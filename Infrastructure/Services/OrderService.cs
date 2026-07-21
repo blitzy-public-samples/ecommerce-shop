@@ -13,12 +13,14 @@ namespace Infrastructure.Services
         private readonly IBasketRepository _basketRepo;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IPaymentService _paymentService;
+        private readonly IInventoryService _inventoryService;
 
-        public OrderService(IBasketRepository basketRepo, IUnitOfWork unitOfWork, IPaymentService paymentService)
+        public OrderService(IBasketRepository basketRepo, IUnitOfWork unitOfWork, IPaymentService paymentService, IInventoryService inventoryService)
         {
             _basketRepo = basketRepo;
             _unitOfWork = unitOfWork;
             _paymentService = paymentService;
+            _inventoryService = inventoryService;
         }
 
         public async Task<Order> CreateOrderAsync(string buyerEmail, int deliveryMethodId, string basketId, Address shippingAddress)
@@ -51,6 +53,10 @@ namespace Infrastructure.Services
             // create order
             var order = new Order(items, buyerEmail, shippingAddress, deliveryMethod, subtotal, basket.PaymentIntentId);
             _unitOfWork.Repository<Order>().Add(order);
+            // commit the basket's stock reservations (Active -> Committed + permanent pool decrement)
+            // staged on the SAME scoped StoreContext as the order, so the single Complete() below
+            // flushes order rows and reservation/stock changes together atomically.
+            await _inventoryService.CommitReservationAsync(basketId);
             // save to db
             var result = await _unitOfWork.Complete();
 

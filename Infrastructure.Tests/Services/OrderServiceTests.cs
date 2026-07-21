@@ -18,6 +18,7 @@ namespace Infrastructure.Tests.Services
         private readonly Mock<IBasketRepository> _basketRepo = new Mock<IBasketRepository>();
         private readonly Mock<IUnitOfWork> _unitOfWork = new Mock<IUnitOfWork>();
         private readonly Mock<IPaymentService> _paymentService = new Mock<IPaymentService>();
+        private readonly Mock<IInventoryService> _inventoryService = new Mock<IInventoryService>();
         private readonly Mock<IGenericRepository<Product>> _productRepo = new Mock<IGenericRepository<Product>>();
         private readonly Mock<IGenericRepository<DeliveryMethod>> _deliveryRepo = new Mock<IGenericRepository<DeliveryMethod>>();
         private readonly Mock<IGenericRepository<Order>> _orderRepo = new Mock<IGenericRepository<Order>>();
@@ -28,7 +29,7 @@ namespace Infrastructure.Tests.Services
             _unitOfWork.Setup(u => u.Repository<Product>()).Returns(_productRepo.Object);
             _unitOfWork.Setup(u => u.Repository<DeliveryMethod>()).Returns(_deliveryRepo.Object);
             _unitOfWork.Setup(u => u.Repository<Order>()).Returns(_orderRepo.Object);
-            _sut = new OrderService(_basketRepo.Object, _unitOfWork.Object, _paymentService.Object);
+            _sut = new OrderService(_basketRepo.Object, _unitOfWork.Object, _paymentService.Object, _inventoryService.Object);
         }
 
         private static Address SampleAddress() =>
