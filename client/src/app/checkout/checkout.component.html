@@ -1,4 +1,7 @@
 <div class="container mt-4">
+  <div *ngIf="hasOutOfStockItem" class="alert alert-danger" role="alert">
+    A product in your order is out of stock. Please return to your basket and remove it before completing checkout.
+  </div>
   <div class="row">
     <div class="col-8">
       <app-stepper [linearModeSelected]="true" #appStepper>stepper works

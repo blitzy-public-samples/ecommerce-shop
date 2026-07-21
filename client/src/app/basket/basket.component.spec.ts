@@ -1,13 +1,144 @@
-import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { TestBed, ComponentFixture } from '@angular/core/testing';
+import { Component, EventEmitter, Input, Output, NO_ERRORS_SCHEMA } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterTestingModule } from '@angular/router/testing';
-import { NO_ERRORS_SCHEMA } from '@angular/core';
-import { BehaviorSubject, Observable, ReplaySubject } from 'rxjs';
+import { of, BehaviorSubject, Observable, ReplaySubject } from 'rxjs';
 
 import { BasketComponent } from './basket.component';
 import { BasketService } from './basket.service';
 import { StockService } from '../core/services/stock.service';
 import { IBasket, IBasketItem } from '../shared/models/basket';
+
+/**
+ * Lightweight stub for the <app-basket-summary> child. Declares the EXACT surface
+ * the basket template binds ([items] input plus the decrement/increment/remove
+ * outputs) so the real template compiles WITHOUT NO_ERRORS_SCHEMA. Stubbing keeps
+ * the suite lighter than importing the full SharedModule.
+ */
+@Component({ selector: 'app-basket-summary', template: '' })
+class BasketSummaryStubComponent {
+  @Input() items: IBasketItem[];
+  @Output() decrement = new EventEmitter<IBasketItem>();
+  @Output() increment = new EventEmitter<IBasketItem>();
+  @Output() remove = new EventEmitter<IBasketItem>();
+}
+
+/**
+ * Lightweight stub for the <app-order-totals> child. Declares the three price
+ * inputs the basket template binds so the real template compiles WITHOUT
+ * NO_ERRORS_SCHEMA.
+ */
+@Component({ selector: 'app-order-totals', template: '' })
+class OrderTotalsStubComponent {
+  @Input() shippingPrice: number;
+  @Input() subtotal: number;
+  @Input() total: number;
+}
+
+/**
+ * Template-level checkout gating: compiles the real basket template (with child
+ * stubs, no NO_ERRORS_SCHEMA) so the out-of-stock alert and the disabled
+ * proceed-to-checkout anchor are asserted against the rendered DOM.
+ */
+describe('BasketComponent (template gating)', () => {
+  let component: BasketComponent;
+  let fixture: ComponentFixture<BasketComponent>;
+  let basketServiceStub: { basket$: any; basketTotal$: any };
+  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy };
+
+  // A basket item's id IS the product id, so stock is tracked on item.id. Two items
+  // (ids 1 and 2) make the per-item subscribe assertions and the "ANY item at zero"
+  // gating semantics meaningful.
+  const mockBasket = {
+    id: 'basket-1',
+    items: [
+      { id: 1, productName: 'Prod 1', price: 10, quantity: 1, pictureUrl: '', brand: 'b', type: 't' },
+      { id: 2, productName: 'Prod 2', price: 20, quantity: 2, pictureUrl: '', brand: 'b', type: 't' }
+    ]
+  };
+
+  beforeEach(async () => {
+    // Stub BasketService via useValue so its real HttpClient is never constructed.
+    // basket$ replays the two-item basket synchronously; basketTotal$ feeds the
+    // <app-order-totals> stub's *ngIf and price inputs.
+    basketServiceStub = {
+      basket$: of(mockBasket),
+      basketTotal$: of({ shipping: 0, subtotal: 50, total: 50 })
+    };
+
+    // Stub StockService via useValue so its real constructor (which builds a live
+    // real-time hub connection) never runs and no socket is opened. subscribeToProduct is a spy
+    // asserted per item id; getStock$ returns an in-stock (5) stream by default.
+    // Individual tests override the getStock$ return BEFORE detectChanges to drive
+    // the out-of-stock gating.
+    stockServiceStub = {
+      subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
+      getStock$: jasmine.createSpy('getStock$').and.returnValue(of(5))
+    };
+
+    await TestBed.configureTestingModule({
+      declarations: [
+        BasketComponent,
+        BasketSummaryStubComponent,
+        OrderTotalsStubComponent
+      ],
+      imports: [
+        // Real template compilation (no NO_ERRORS_SCHEMA masking): CommonModule
+        // supplies the async pipe and *ngIf; RouterTestingModule supplies the
+        // routerLink="/checkout" on the proceed anchor.
+        CommonModule,
+        RouterTestingModule
+      ],
+      providers: [
+        { provide: BasketService, useValue: basketServiceStub },
+        { provide: StockService, useValue: stockServiceStub }
+      ]
+    }).compileComponents();
+
+    fixture = TestBed.createComponent(BasketComponent);
+    component = fixture.componentInstance;
+  });
+
+  it('should create', () => {
+    expect(component).toBeTruthy();
+  });
+
+  it('subscribes to live stock for each basket item id on init', () => {
+    // detectChanges() runs ngOnInit, which subscribes to basket$ and tracks each item.
+    fixture.detectChanges();
+
+    expect(stockServiceStub.subscribeToProduct).toHaveBeenCalledWith(1);
+    expect(stockServiceStub.subscribeToProduct).toHaveBeenCalledWith(2);
+  });
+
+  it('gates checkout and renders the alert when any tracked item is out of stock', () => {
+    // Drive item 1 to zero stock (item 2 stays in stock) BEFORE detectChanges so the
+    // synchronous of(...) emissions in ngOnInit set hasOutOfStockItem before the view
+    // bindings are evaluated in the same change-detection pass.
+    stockServiceStub.getStock$.and.callFake((id: number) => of(id === 1 ? 0 : 5));
+
+    fixture.detectChanges();
+
+    expect(component.hasOutOfStockItem).toBe(true);
+    // The out-of-stock alert is rendered by the real template's *ngIf.
+    expect(fixture.nativeElement.querySelector('.alert.alert-danger')).toBeTruthy();
+    // The proceed-to-checkout anchor is gated with the Bootstrap disabled class.
+    const proceed = fixture.nativeElement.querySelector('a.btn-outline-primary');
+    expect(proceed.classList.contains('disabled')).toBe(true);
+  });
+
+  it('does not gate checkout and hides the alert when all items are in stock', () => {
+    // All tracked products report positive stock, so nothing is gated.
+    stockServiceStub.getStock$.and.returnValue(of(5));
+
+    fixture.detectChanges();
+
+    expect(component.hasOutOfStockItem).toBe(false);
+    expect(fixture.nativeElement.querySelector('.alert.alert-danger')).toBeNull();
+    const proceed = fixture.nativeElement.querySelector('a.btn-outline-primary');
+    expect(proceed.classList.contains('disabled')).toBe(false);
+  });
+});
 
 /**
  * Unit tests for BasketComponent's mid-session zero-stock checkout gating.
@@ -22,7 +153,7 @@ import { IBasket, IBasketItem } from '../shared/models/basket';
  * controller logic only, so those elements are ignored via NO_ERRORS_SCHEMA -
  * the same pattern the other component specs in this workspace use.
  */
-describe('BasketComponent', () => {
+describe('BasketComponent (stock tracking logic)', () => {
   let component: BasketComponent;
   let fixture: ComponentFixture<BasketComponent>;
 

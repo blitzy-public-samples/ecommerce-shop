@@ -27,7 +27,13 @@
               [total]="(basketTotals$ | async).total">
 
             </app-order-totals>
-            <a routerLink="/checkout" class="btn btn-outline-primary py-2 btn-block">
+            <div *ngIf="hasOutOfStockItem" class="alert alert-danger" role="alert">
+              One or more products in your basket are out of stock. Please remove them before checking out.
+            </div>
+            <a routerLink="/checkout" class="btn btn-outline-primary py-2 btn-block"
+               [class.disabled]="hasOutOfStockItem"
+               [attr.aria-disabled]="hasOutOfStockItem"
+               (click)="hasOutOfStockItem && $event.preventDefault()">
               Proceed to checkout
             </a>
           </div>
