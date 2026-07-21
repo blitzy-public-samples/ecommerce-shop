@@ -129,9 +129,11 @@ namespace API.IntegrationTests.Contract
             var product = (await ReadRootAsync(productsResponse)).GetProperty("data")[0];
             var productId = product.GetProperty("id").GetInt32();
 
-            // Seeded products default to StockQuantity = 0, and UpdateBasket now reserves-before-persist
-            // (rejecting with 409 any line it cannot hold). Give this product ample stock first so the
-            // single-unit line is granted and this test exercises the wire CONTRACT, not stock policy.
+            // Seeded products carry StockQuantity = 100 (the feature's source seed), and UpdateBasket now
+            // reserves-before-persist (rejecting with 409 any line it cannot hold). Reset this product to an
+            // ample, isolated stock (1000) first so the single-unit line is granted deterministically —
+            // independent of any stock already consumed by other reservations in this class's shared
+            // container — and this test exercises the wire CONTRACT, not stock policy.
             await SetProductStockAsync(productId, 1000);
 
             var basketId = "contract-order-" + Guid.NewGuid();
@@ -163,10 +165,12 @@ namespace API.IntegrationTests.Contract
 
         /// <summary>
         /// Sets the committed PostgreSQL <c>StockQuantity</c> for a product to <paramref name="stock"/> so a
-        /// basket line for it can be reserved. Seeded products default to <c>StockQuantity = 0</c>, and
-        /// <c>UpdateBasket</c> reserves-before-persist (rejecting any line it cannot fully hold), so a test
-        /// that baskets a real product must first give that product stock. Uses a DI scope on the real
-        /// in-process host — the same pattern the concurrency/resilience inventory tests use to seed state.
+        /// basket line for it can be reserved deterministically. Seeded products carry <c>StockQuantity = 100</c>
+        /// (the feature's source seed), and <c>UpdateBasket</c> reserves-before-persist (rejecting any line it
+        /// cannot fully hold); because this class's container is shared across its tests, a contract test resets
+        /// the product to a known, ample stock first so its single-unit line is granted regardless of stock
+        /// already consumed by sibling tests. Uses a DI scope on the real in-process host — the same pattern the
+        /// concurrency/resilience inventory tests use to seed state.
         /// </summary>
         /// <param name="productId">The DB id of the product to stock.</param>
         /// <param name="stock">The committed stock quantity to set.</param>

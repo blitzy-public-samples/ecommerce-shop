@@ -10,12 +10,17 @@ import { BasketService } from '../../basket/basket.service';
 describe('ProductItemComponent', () => {
   let component: ProductItemComponent;
   let fixture: ComponentFixture<ProductItemComponent>;
-  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy };
+  let stockServiceStub: {
+    subscribeToProduct: jasmine.Spy;
+    unsubscribeFromProduct: jasmine.Spy;
+    getStock$: jasmine.Spy;
+  };
   let basketServiceStub: { addItemToBasket: jasmine.Spy };
 
   beforeEach(async () => {
     stockServiceStub = {
       subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct'),
       getStock$: jasmine.createSpy('getStock$').and.returnValue(of(3))
     };
     basketServiceStub = {
@@ -143,5 +148,36 @@ describe('ProductItemComponent', () => {
     fixture.detectChanges();
     component.addItemToBasket();
     expect(basketServiceStub.addItemToBasket).toHaveBeenCalledWith(component.product);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Component lifecycle (P4-12 / P4-24): the card must release its per-product hub
+  // tracking on destroy, and rebind when the bound @Input product changes identity
+  // on a reused instance.
+  // ---------------------------------------------------------------------------
+
+  it('releases the per-product hub subscription on destroy (P4-12)', () => {
+    fixture.detectChanges(); // ngOnInit -> subscribe to product 1
+    expect(stockServiceStub.subscribeToProduct).toHaveBeenCalledWith(1);
+
+    component.ngOnDestroy();
+
+    // The hub tracking for the destroyed card's product is released (leaves the server group).
+    expect(stockServiceStub.unsubscribeFromProduct).toHaveBeenCalledWith(1);
+  });
+
+  it('rebinds live-stock tracking when the @Input product changes identity (P4-24)', () => {
+    fixture.detectChanges(); // bound to product 1
+    expect(stockServiceStub.subscribeToProduct).toHaveBeenCalledWith(1);
+
+    // The catalog swaps the product bound to this reused component instance.
+    component.product = { id: 2, name: 'y', description: '', price: 2, pictureUrl: '', productType: '', productBrand: '' };
+    component.ngOnChanges({
+      product: { previousValue: undefined, currentValue: component.product, firstChange: false, isFirstChange: () => false }
+    } as any);
+
+    // The previous product's hub tracking is released and the new product is subscribed.
+    expect(stockServiceStub.unsubscribeFromProduct).toHaveBeenCalledWith(1);
+    expect(stockServiceStub.subscribeToProduct).toHaveBeenCalledWith(2);
   });
 });

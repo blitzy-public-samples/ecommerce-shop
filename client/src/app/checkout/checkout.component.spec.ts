@@ -1,5 +1,6 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { Component, Input } from '@angular/core';
+import { By } from '@angular/platform-browser';
 import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
@@ -52,6 +53,10 @@ class StubCheckoutReviewComponent {
 @Component({ selector: 'app-checkout-payment', template: '' })
 class StubCheckoutPaymentComponent {
   @Input() checkoutForm: any;
+  // The checkout shell binds [stockBlocked]="hasOutOfStockItem" on <app-checkout-payment> so the payment
+  // step disables its Submit button when a basket line goes to zero. The stub must declare the input or the
+  // real template would fail to compile (no error-suppressing schema is used by this suite).
+  @Input() stockBlocked: boolean;
 }
 
 @Component({ selector: 'app-order-totals', template: '' })
@@ -71,7 +76,11 @@ describe('CheckoutComponent (template gating)', () => {
   let fixture: ComponentFixture<CheckoutComponent>;
   let accountServiceStub: { getUserAddress: jasmine.Spy };
   let basketServiceStub: any;
-  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy };
+  let stockServiceStub: {
+    subscribeToProduct: jasmine.Spy;
+    getStock$: jasmine.Spy;
+    unsubscribeFromProduct: jasmine.Spy;
+  };
 
   beforeEach(async () => {
     // Stub collaborators via useValue so no real HttpClient / Router / SignalR
@@ -96,7 +105,10 @@ describe('CheckoutComponent (template gating)', () => {
     };
     stockServiceStub = {
       subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
-      getStock$: jasmine.createSpy('getStock$').and.returnValue(of(5))
+      getStock$: jasmine.createSpy('getStock$').and.returnValue(of(5)),
+      // ngOnDestroy releases tracked hub ids on teardown (P4-12); the auto-destroy
+      // between specs invokes it, so the stub must expose it.
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct')
     };
 
     await TestBed.configureTestingModule({
@@ -156,6 +168,28 @@ describe('CheckoutComponent (template gating)', () => {
     // flag (mirroring the sibling basket.component.spec.ts), which stays correct
     // whether or not the shell template renders the alert.
     expect(component.hasOutOfStockItem).toBeTrue();
+  });
+
+  it('should propagate the gate to the payment step via [stockBlocked] (P4-07)', () => {
+    // With positive stock the payment step must NOT be blocked.
+    stockServiceStub.getStock$.and.returnValue(of(5));
+    fixture.detectChanges();
+    const payment = fixture.debugElement
+      .query(By.directive(StubCheckoutPaymentComponent)).componentInstance as StubCheckoutPaymentComponent;
+    expect(component.hasOutOfStockItem).toBeFalse();
+    expect(payment.stockBlocked).toBeFalse();
+  });
+
+  it('should block the payment step submit when a tracked product is at zero (P4-07)', () => {
+    // A zero-stock line must flow through to the payment child so it can disable its Submit button —
+    // this is the wiring that was missing (the parent only rendered an alert). Asserting the bound child
+    // input proves the gate reaches the component that owns submitOrder() and the Submit button.
+    stockServiceStub.getStock$.and.returnValue(of(0));
+    fixture.detectChanges();
+    const payment = fixture.debugElement
+      .query(By.directive(StubCheckoutPaymentComponent)).componentInstance as StubCheckoutPaymentComponent;
+    expect(component.hasOutOfStockItem).toBeTrue();
+    expect(payment.stockBlocked).toBeTrue();
   });
 });
 
@@ -358,5 +392,22 @@ describe('CheckoutComponent (stock tracking logic)', () => {
     const callsBefore = stockService.subscribeToProduct.calls.count();
     basketService.basket$.next({ id: 'basket-1', items: [{ id: 99 }] });
     expect(stockService.subscribeToProduct.calls.count()).toBe(callsBefore);
+  });
+
+  it('releases every still-tracked product hub id on destroy (P4-12 teardown)', () => {
+    fixture.detectChanges();
+
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1 }, { id: 2 }] });
+    stockService.push(1, 5);
+    stockService.push(2, 3);
+    expect(stockService.subscribeToProduct).toHaveBeenCalledWith(1);
+    expect(stockService.subscribeToProduct).toHaveBeenCalledWith(2);
+
+    component.ngOnDestroy();
+
+    // Leaving checkout with items still in the basket must release BOTH products'
+    // per-product hub tracking so the server groups are left (P4-12).
+    expect(stockService.unsubscribeFromProduct).toHaveBeenCalledWith(1);
+    expect(stockService.unsubscribeFromProduct).toHaveBeenCalledWith(2);
   });
 });

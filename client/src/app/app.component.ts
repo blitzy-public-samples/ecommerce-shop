@@ -1,7 +1,7 @@
 import {Component, OnInit} from '@angular/core';
 import {BasketService} from "./basket/basket.service";
 import {AccountService} from "./account/account.service";
-import {StockService} from "./core/services/stock.service";
+import {StockService} from './core/services/stock.service';
 
 @Component({
   selector: 'app-root',

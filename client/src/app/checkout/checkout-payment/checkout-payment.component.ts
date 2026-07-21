@@ -16,6 +16,10 @@ declare var Stripe;
 })
 export class CheckoutPaymentComponent implements AfterViewInit, OnDestroy {
   @Input() checkoutForm: FormGroup;
+  // When true, at least one product in the basket reached zero stock mid-session (computed by the parent
+  // CheckoutComponent from the live stock hub). The Submit Order button is disabled and submitOrder()
+  // early-returns, so a shopper can never finalize an order that contains an out-of-stock line.
+  @Input() stockBlocked = false;
   @ViewChild('cardNumber', { static: true }) cardNumberElement: ElementRef;
   @ViewChild('cardExpiry', { static: true }) cardExpiryElement: ElementRef;
   @ViewChild('cardCvc', { static: true }) cardCvcElement: ElementRef;
@@ -76,6 +80,12 @@ export class CheckoutPaymentComponent implements AfterViewInit, OnDestroy {
   }
 
   async submitOrder() {
+    // Defense-in-depth: the Submit button is disabled while stockBlocked is true, but also guard the
+    // handler itself so a programmatic or stale invocation can never submit an order containing an
+    // out-of-stock line. The parent CheckoutComponent renders the explanatory alert; here we simply refuse.
+    if (this.stockBlocked) {
+      return;
+    }
     this.loading = true;
     const basket = this.basketService.getCurrentBasketValue();
     try {

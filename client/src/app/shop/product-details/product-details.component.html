@@ -7,8 +7,8 @@
       <h3>{{product.name}}</h3>
       <p style="font-size: 1.7em">{{product.price | currency}}</p>
       <div class="mb-2">
-        <span *ngIf="stock > 0 && stock <= 5" class="badge badge-warning">Only {{stock}} left!</span>
-        <span *ngIf="stock === 0" class="badge badge-danger">Out of stock</span>
+        <span *ngIf="stock > 0 && stock <= 5" class="badge badge-warning" role="status" aria-live="polite">Only {{stock}} left!</span>
+        <span *ngIf="stock === 0" class="badge badge-danger" role="status" aria-live="polite">Out of stock</span>
       </div>
       <div class="d-flex justify-content-start align-items-center">
         <i (click)="decrementQuantity()" class="fa fa-minus-circle text-warning mr-2"  style="cursor: pointer; font-size: 2em"></i>

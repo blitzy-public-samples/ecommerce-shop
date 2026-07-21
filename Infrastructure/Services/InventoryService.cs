@@ -36,7 +36,6 @@ namespace Infrastructure.Services
         private const string StockUpdatesChannel = "stock-updates";
 
         private readonly StoreContext _context;
-        private readonly IConnectionMultiplexer _redis;
         private readonly IDatabase _database;
         private readonly ISubscriber _subscriber;
         private readonly IFlashSaleService _flashSaleService;
@@ -53,7 +52,6 @@ namespace Infrastructure.Services
             ILogger<InventoryService> logger = null)
         {
             _context = context;
-            _redis = redis;
             _database = redis.GetDatabase();
             _subscriber = redis.GetSubscriber();
             _flashSaleService = flashSaleService;
@@ -209,10 +207,71 @@ namespace Infrastructure.Services
 
                 if (existing == null)
                 {
-                    // nothing to extend -> release lock, delegate to create (which opens its own tx).
-                    // Propagate create's grant/deny result so the caller can reject on insufficient stock.
-                    if (tx != null) await tx.RollbackAsync();
-                    return await CreateReservationAsync(basketId, productId, quantity > 0 ? quantity : 1);
+                    // No Active hold yet for this basket line: CREATE one at the requested desired TOTAL,
+                    // INSIDE the "SELECT ... FOR UPDATE" row lock already held above. This is the P8-01 fix:
+                    // the previous implementation rolled the lock BACK and delegated to CreateReservationAsync
+                    // (which opened its own transaction and ADDS to any existing hold — existing.Quantity +=
+                    // quantity). Under a same-basket race that additive semantics treated concurrent desired
+                    // totals as cumulative, inflating the hold past available stock and rejecting valid writes
+                    // (multiple 409s). Doing the create-or-set here, without releasing the lock, serializes
+                    // concurrent requests on the product row: each sees the previous request's committed hold
+                    // and takes the delta path below, so the outcome is a coherent last-write-wins to the
+                    // desired total (all-200 while stock is sufficient) rather than an additive over-reservation.
+                    if (quantity <= 0)
+                    {
+                        // A non-positive desired total has nothing to hold. Reject WITHOUT creating a row
+                        // (P4-26): the old delegation floored the quantity to 1 (`quantity > 0 ? quantity : 1`),
+                        // which manufactured a phantom 1-unit hold and a spurious counter decrement.
+                        if (tx != null) await tx.RollbackAsync();
+                        return false;
+                    }
+
+                    var product = await _context.Set<Product>().FindAsync(productId);
+                    if (product == null)
+                    {
+                        // Unknown product cannot be reserved: fail-closed (never assume availability).
+                        if (tx != null) await tx.RollbackAsync();
+                        return false;
+                    }
+
+                    // Resolve the pool active at creation (a specific flash sale, else the general product
+                    // stock) and bind the new hold to it, exactly as CreateReservationAsync does.
+                    var sale = await _flashSaleService.GetActiveFlashSaleForProductAsync(productId);
+                    int? newFlashSaleId = sale?.Id;
+                    var newCapacity = sale?.SaleStockQuantity ?? product.StockQuantity;
+
+                    var newReserved = await _context.Set<Reservation>()
+                        .Where(r => r.Status == ReservationStatus.Active
+                                    && r.ProductId == productId
+                                    && r.FlashSaleId == newFlashSaleId)
+                        .SumAsync(r => (int?)r.Quantity) ?? 0;
+
+                    if (newCapacity - newReserved < quantity)
+                    {
+                        // Insufficient stock in the bound pool: deny so the caller (BasketController) can
+                        // reject the basket line. Nothing is persisted and the counter is untouched.
+                        if (tx != null) await tx.RollbackAsync();
+                        return false;
+                    }
+
+                    _context.Set<Reservation>().Add(new Reservation
+                    {
+                        ProductId = productId,
+                        BasketId = basketId,
+                        Quantity = quantity,
+                        CreatedAt = now,
+                        ExpiresAt = expiresAt,
+                        Status = ReservationStatus.Active,
+                        FlashSaleId = newFlashSaleId
+                    });
+                    await _context.SaveChangesAsync();
+
+                    // Redis best-effort (fail-closed): set the hold key with TTL, DECR the counter by the
+                    // newly-held quantity, and publish — identical to the create path's counter movement.
+                    await TryReserveRedisAsync(basketId, productId, quantity, expiresAt - now, newFlashSaleId);
+
+                    if (tx != null) await tx.CommitAsync();
+                    return true;
                 }
 
                 var delta = quantity - existing.Quantity; // interpret quantity as new desired total for the basket line
@@ -291,8 +350,14 @@ namespace Infrastructure.Services
         // ---------- commit (STAGES ONLY — OrderService owns the flush) ----------
         public async Task CommitReservationAsync(string basketId)
         {
+            // Order the basket's reservations by ProductId so the per-product "SELECT ... FOR UPDATE" row
+            // locks taken in the loop below are always acquired in a DETERMINISTIC order (P4-21). Two orders
+            // that share more than one product would otherwise be able to lock those product rows in opposite
+            // orders and deadlock; a stable global lock ordering (ascending ProductId) makes such a cycle
+            // impossible while leaving the committed quantities and single-product behavior unchanged.
             var reservations = await _context.Set<Reservation>()
                 .Where(r => r.Status == ReservationStatus.Active && r.BasketId == basketId)
+                .OrderBy(r => r.ProductId)
                 .ToListAsync();
 
             foreach (var r in reservations)

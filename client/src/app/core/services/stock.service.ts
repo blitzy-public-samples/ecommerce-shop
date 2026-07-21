@@ -109,7 +109,15 @@ export class StockService {
     // Surface transient connection state so consuming UI can fail closed while the
     // socket is down or re-establishing.
     this.hubConnection.onreconnecting(() => this.connectionStateSubject.next(HubConnectionState.Reconnecting));
-    this.hubConnection.onclose(() => this.connectionStateSubject.next(HubConnectionState.Disconnected));
+    this.hubConnection.onclose(() => {
+      this.connectionStateSubject.next(HubConnectionState.Disconnected);
+      // Terminal close (SignalR's own automatic-reconnect schedule is exhausted): clear the
+      // start guard so a later startConnection() — e.g. a fresh subscribeToProduct or an app
+      // re-init — begins a brand-new bounded retry cycle instead of returning the stale,
+      // already-resolved start promise, which would otherwise prevent any reconnection (P4-11).
+      this.startPromise = null;
+      this.startAttempt = 0;
+    });
 
     // On reconnect, re-invoke SubscribeToProduct for EVERY tracked product: a full
     // refetch of the current state (SignalR does not replay frames missed while down).
@@ -166,8 +174,8 @@ export class StockService {
    * - Reference-counts consumers so `unsubscribeFromProduct` can evict precisely.
    * - Enforces `maxTrackedProducts` so a session cannot track unbounded products.
    * - Idempotent: only the FIRST consumer of a product triggers the server-side
-   *   group join / initial fetch; the reconnect handler refetches every tracked id
-   *   regardless, so a duplicate subscription never re-invokes the hub.
+   *   group join / initial fetch; the connect and reconnect handlers refetch every
+   *   tracked id regardless, so a duplicate subscription never re-invokes the hub.
    * - Fail-closed: the `SubscribeToProduct` invoke is only sent once the socket is
    *   confirmed `Connected` (see invokeSubscribe), never against a dead connection.
    */
@@ -194,7 +202,17 @@ export class StockService {
       return;
     }
 
-    this.startConnection().then(() => this.invokeSubscribe(productId));
+    // If the socket is already live, fetch just this product now. Otherwise start the
+    // connection: its success handler performs a FULL refetch of every tracked id (see
+    // connectWithRetry), so this product — and any previously-tracked-but-unfetched ids
+    // left over from an earlier failed start cycle — are all (re)fetched exactly once on
+    // connect. This avoids a duplicate invoke per product while ensuring none are omitted
+    // after a fresh connection (P4-11).
+    if (this.hubConnection.state === HubConnectionState.Connected) {
+      this.invokeSubscribe(productId);
+    } else {
+      this.startConnection();
+    }
   }
 
   /**
@@ -278,6 +296,11 @@ export class StockService {
       .then(() => {
         this.startAttempt = 0;
         this.connectionStateSubject.next(HubConnectionState.Connected);
+        // Refetch EVERY tracked product after this fresh connection (not only newly-added
+        // ids): an earlier failed start cycle may have tracked products whose one-shot invoke
+        // was skipped while disconnected, so a full refetch on connect guarantees none are
+        // omitted from live-stock tracking (P4-11).
+        return this.refetchAllTrackedStock();
       })
       .catch(err => {
         console.error('Error starting SignalR connection', err);

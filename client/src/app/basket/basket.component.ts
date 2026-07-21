@@ -1,8 +1,8 @@
 import {Component, OnDestroy, OnInit} from '@angular/core';
-import {Observable, Subscription} from "rxjs";
+import {Observable, Subscription} from 'rxjs';
 import {IBasket, IBasketItem, IBasketTotals} from "../shared/models/basket";
 import {BasketService} from "./basket.service";
-import {StockService} from "../core/services/stock.service";
+import {StockService} from '../core/services/stock.service';
 
 @Component({
   selector: 'app-basket',
@@ -87,6 +87,12 @@ export class BasketComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.subscriptions.forEach(s => s.unsubscribe());
+    // Release the hub tracking for every product still tracked at teardown so the
+    // component leaves the per-product server groups and cannot leak subscriptions
+    // when the shopper navigates away with items still in the basket (P4-12).
+    this.trackedProductIds.forEach(id => this.stockService.unsubscribeFromProduct(id));
+    this.trackedProductIds.clear();
+    this.stockMap.clear();
   }
 
   removeBasketItem(item: IBasketItem) {

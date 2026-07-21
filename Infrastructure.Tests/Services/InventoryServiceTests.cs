@@ -408,32 +408,54 @@ namespace Infrastructure.Tests.Services
             result.Should().Be(7);
         }
 
-        // 14. Extend with NO existing Active hold delegates to CreateReservationAsync.
-        //     quantity>0 creates that quantity; a non-positive quantity delegates with a floor of 1
-        //     (covers the `quantity > 0 ? quantity : 1` branch at the delegation site).
-        [Theory]
-        [InlineData(3, 3)]
-        [InlineData(0, 1)]
-        [InlineData(-2, 1)]
-        public async Task ExtendReservationAsync_WhenNoExistingHold_DelegatesToCreate(
-            int requested, int expectedQuantity)
+        // 14. Extend with NO existing Active hold CREATES the hold at the requested desired TOTAL, INSIDE
+        //     the row lock (create-or-set; it no longer rolls back and delegates to an ADDITIVE create).
+        //     A positive desired total is held in full and the counter is DECR'd by exactly that amount.
+        [Fact]
+        public async Task ExtendReservationAsync_WhenNoExistingHold_CreatesHoldAtDesiredTotal()
         {
             // Arrange
             var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
             var productId = products[0].Id;
 
             // Act
-            await _sut.ExtendReservationAsync("basket-extend-new", productId, requested);
+            var result = await _sut.ExtendReservationAsync("basket-extend-new", productId, 3);
 
-            // Assert — a fresh Active hold was created at the delegated quantity.
+            // Assert — a fresh Active hold was created at the requested desired total.
+            result.Should().BeTrue();
             var reservation = await _context.Reservations
                 .FirstOrDefaultAsync(r => r.BasketId == "basket-extend-new");
             reservation.Should().NotBeNull();
             reservation.Status.Should().Be(ReservationStatus.Active);
-            reservation.Quantity.Should().Be(expectedQuantity);
+            reservation.Quantity.Should().Be(3);
             _mockDb.Verify(d => d.StringDecrementAsync(
-                It.Is<RedisKey>(k => k == $"stock:product:{productId}"), expectedQuantity, It.IsAny<CommandFlags>()),
+                It.Is<RedisKey>(k => k == $"stock:product:{productId}"), 3, It.IsAny<CommandFlags>()),
                 Times.Once);
+        }
+
+        // 14b. Extend with NO existing hold and a NON-POSITIVE desired total is REJECTED (returns false):
+        //      no reservation row is created and the counter is never moved. This is the P4-26 fix — the
+        //      previous delegation floored the quantity to 1 (`quantity > 0 ? quantity : 1`), manufacturing
+        //      a phantom 1-unit hold and a spurious decrement for a request that reserves nothing.
+        [Theory]
+        [InlineData(0)]
+        [InlineData(-2)]
+        public async Task ExtendReservationAsync_WhenNoExistingHoldAndQuantityNotPositive_RejectsAndCreatesNoHold(
+            int requested)
+        {
+            // Arrange
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+
+            // Act
+            var result = await _sut.ExtendReservationAsync("basket-extend-new-nonpos", productId, requested);
+
+            // Assert — denied, nothing persisted, counter untouched.
+            result.Should().BeFalse();
+            (await _context.Reservations.AnyAsync(r => r.BasketId == "basket-extend-new-nonpos"))
+                .Should().BeFalse();
+            _mockDb.Verify(d => d.StringDecrementAsync(
+                It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
         }
 
         // 15. Extend GROWS an existing hold within capacity: DECR the counter by the positive delta.
@@ -829,7 +851,8 @@ namespace Infrastructure.Tests.Services
                 Times.Once);
         }
 
-        // 15. ExtendReservation with no existing hold delegates to CreateReservation and returns its result.
+        // 15. ExtendReservation with no existing hold creates the hold at the requested desired total
+        //     (create-or-set within the row lock) and returns true.
         [Fact]
         public async Task ExtendReservationAsync_WhenNoExistingHold_CreatesReservationAndReturnsTrue()
         {

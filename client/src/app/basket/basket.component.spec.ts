@@ -373,4 +373,19 @@ describe('BasketComponent (stock tracking logic)', () => {
     expect(basketServiceMock.incrementItemQuantity).toHaveBeenCalledWith(item);
     expect(basketServiceMock.decrementItemQuantity).toHaveBeenCalledWith(item);
   });
+
+  it('releases every still-tracked product hub id on destroy (P4-12 teardown)', () => {
+    basketSubject.next(makeBasket([makeItem(1), makeItem(2)]));
+    stockStream(1).next(5);
+    stockStream(2).next(3);
+    expect(stockServiceMock.subscribeToProduct).toHaveBeenCalledWith(1);
+    expect(stockServiceMock.subscribeToProduct).toHaveBeenCalledWith(2);
+
+    fixture.destroy(); // triggers ngOnDestroy
+
+    // Navigating away with items still in the basket must release BOTH products'
+    // per-product hub tracking so the server groups are left (P4-12).
+    expect(stockServiceMock.unsubscribeFromProduct).toHaveBeenCalledWith(1);
+    expect(stockServiceMock.unsubscribeFromProduct).toHaveBeenCalledWith(2);
+  });
 });

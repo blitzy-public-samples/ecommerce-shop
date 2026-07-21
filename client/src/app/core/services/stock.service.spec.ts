@@ -28,6 +28,7 @@ describe('StockService', () => {
   let withReconnectSpy: jasmine.Spy;
   let stockChangedCb: (productId: number, currentStock: number) => void;
   let reconnectedCb: () => Promise<void>;
+  let closeCb: () => void;
 
   beforeEach(() => {
     // A fake HubConnection exposing every member StockService uses. `state` starts
@@ -49,6 +50,9 @@ describe('StockService', () => {
     });
     hubSpy.onreconnected.and.callFake((cb: () => Promise<void>) => {
       reconnectedCb = cb;
+    });
+    hubSpy.onclose.and.callFake((cb: () => void) => {
+      closeCb = cb;
     });
 
     // Let withUrl / withAutomaticReconnect run through so their args are recorded for
@@ -273,6 +277,50 @@ describe('StockService', () => {
     stockChangedCb(1, 8);
     expect(emitted).toBe(8);
   });
+
+  it('resets the start guard on a terminal close so a later startConnection reconnects (P4-11)', async () => {
+    // First connection succeeds and arms the idempotency guard.
+    await service.startConnection();
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+    expect((service as any).startPromise).not.toBeNull();
+
+    // Terminal close (SignalR's own automatic-reconnect schedule is exhausted): the guard
+    // and attempt counter must be cleared so a fresh start cycle can begin.
+    hubSpy.state = HubConnectionState.Disconnected;
+    closeCb();
+    expect((service as any).startPromise).toBeNull();
+    expect((service as any).startAttempt).toBe(0);
+
+    // A later start therefore opens a NEW connection instead of returning the stale,
+    // already-resolved promise (which previously prevented any reconnection).
+    await service.startConnection();
+    expect(hubSpy.start).toHaveBeenCalledTimes(2);
+    expect(hubSpy.state).toBe(HubConnectionState.Connected);
+  });
+
+  it('refetches a product tracked during a failed start cycle once a later start succeeds (P4-11)', fakeAsync(() => {
+    (service as any).reconnectDelaysMs = [0, 0, 0];
+
+    // Product 1 is subscribed while the hub is DOWN: every start attempt fails, so its
+    // one-shot invoke is skipped (fail-closed) and the guard resets fail-soft.
+    hubSpy.start.and.callFake(() => Promise.reject(new Error('down')));
+    service.subscribeToProduct(1);
+    flush();
+    expect(hubSpy.invoke).not.toHaveBeenCalled();
+    expect((service as any).trackedProductIds.has(1)).toBe(true);
+
+    // The hub returns and a fresh start (e.g. another subscribe or app re-init) succeeds.
+    // The connect-success FULL refetch must re-invoke the previously-tracked product 1
+    // rather than omit it.
+    hubSpy.start.and.callFake(() => {
+      hubSpy.state = HubConnectionState.Connected;
+      return Promise.resolve();
+    });
+    service.startConnection();
+    flush();
+
+    expect(hubSpy.invoke).toHaveBeenCalledWith('SubscribeToProduct', 1);
+  }));
 
   it('exposes connection state transitions via connectionState$', async () => {
     const states: HubConnectionState[] = [];
