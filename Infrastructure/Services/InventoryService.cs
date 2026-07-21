@@ -299,15 +299,41 @@ namespace Infrastructure.Services
             {
                 r.Status = ReservationStatus.Committed;
 
+                // Take the SAME PostgreSQL "SELECT ... FOR UPDATE" row lock used at reservation creation,
+                // on the Products row, BEFORE reading the pool to decrement. OrderService wraps this whole
+                // commit in an explicit transaction over the shared scoped StoreContext, so this lock enlists
+                // in that transaction and is held until the order commits. That serializes concurrent order
+                // finalizations for the same product and closes the oversell / lost-update defect where two
+                // finalizations both read the pre-decrement stock and one silently overwrote the other.
+                await AcquireProductRowLockAsync(r.ProductId);
+
                 if (r.FlashSaleId == null)
                 {
                     var product = await _context.Set<Product>().FindAsync(r.ProductId);
-                    if (product != null) product.StockQuantity -= r.Quantity;
+                    if (product != null)
+                    {
+                        // The Product is very likely ALREADY tracked in this scoped context (OrderService
+                        // reads it through the repository while building the order items), and EF Core does
+                        // NOT refresh a tracked entity from the FOR UPDATE query above — it keeps the stale
+                        // in-memory snapshot. Reload it under the lock so the decrement is applied to the
+                        // freshly-locked committed value. Guarded by SupportsRowLocking() so the
+                        // non-relational InMemory provider (unit tests) skips the reload and is unchanged.
+                        if (SupportsRowLocking()) await _context.Entry(product).ReloadAsync();
+                        product.StockQuantity -= r.Quantity;
+                    }
                 }
                 else
                 {
                     var sale = await _context.Set<FlashSale>().FindAsync(r.FlashSaleId.Value);
-                    if (sale != null) sale.SaleStockQuantity -= r.Quantity;
+                    if (sale != null)
+                    {
+                        // Same rationale as the general pool: reload the bound flash-sale row under the
+                        // Products row lock so the sale-pool decrement is applied to the fresh committed
+                        // value rather than a stale tracked snapshot. Concurrent commits for the product
+                        // serialize on its row lock. No-op on the InMemory provider.
+                        if (SupportsRowLocking()) await _context.Entry(sale).ReloadAsync();
+                        sale.SaleStockQuantity -= r.Quantity;
+                    }
                 }
 
                 // NOTE (F4): the Redis hold key is intentionally NOT deleted here. Deletion is deferred to
@@ -412,19 +438,72 @@ namespace Infrastructure.Services
         }
 
         // ---------- seeding / reconcile reseed ----------
+        // Set-based reseed of the Redis stock counters for EVERY product using a FIXED number of queries
+        // (three), replacing the previous 3N+1 pattern (a per-product FindAsync + active-sale lookup +
+        // reservation SUM => 3*18+1 = 55 round-trips for the seed catalog, 3001 for 1000 products). This
+        // method runs at startup AND after every reconciliation pass, so its cost grew linearly with the
+        // catalog; batching bounds it to three queries regardless of catalog size. The available-stock
+        // formula is IDENTICAL to ComputeAvailableFromDbAsync (the single-product path), preserving exact
+        // parity: capacity is the active flash-sale pool when one is open for the product, otherwise the
+        // product's own StockQuantity; reserved is the sum of Active holds bound to that same pool; and
+        // available is the clamped-non-negative remainder. Grouping/joining is done in memory (no
+        // server-side GROUP BY) so the logic is provider-agnostic across PostgreSQL, SQLite and the EF Core
+        // InMemory provider used by unit tests. The per-product Redis write + publish and the fail-closed
+        // Redis exception handling are unchanged, so counter values and the stock-updates payload shape are
+        // byte-for-byte identical to the previous implementation.
         public async Task SeedStockCountersAsync()
         {
-            var productIds = await _context.Set<Product>().Select(p => p.Id).ToListAsync();
-            foreach (var productId in productIds)
+            var now = DateTimeOffset.UtcNow;
+
+            // (1) Every product's id and general-pool stock.
+            var products = await _context.Set<Product>()
+                .Select(p => new { p.Id, p.StockQuantity })
+                .ToListAsync();
+
+            // (2) All currently-active flash sales — same window predicate as
+            // FlashSaleService.GetActiveFlashSaleForProductAsync — reduced to at most one sale per product
+            // (the lowest Id, deterministic). The domain permits at most one active sale per product at a
+            // time, so this matches the single-product resolver's FirstOrDefault result.
+            var activeSales = await _context.Set<FlashSale>()
+                .Where(f => f.Status == FlashSaleStatus.Active && f.StartsAt <= now && now < f.EndsAt)
+                .Select(f => new { f.Id, f.ProductId, f.SaleStockQuantity })
+                .ToListAsync();
+            var saleByProduct = activeSales
+                .GroupBy(s => s.ProductId)
+                .ToDictionary(g => g.Key, g => g.OrderBy(s => s.Id).First());
+
+            // (3) All Active reservations, summed in memory per (product, bound pool). The bound pool is the
+            // reservation's FlashSaleId (null == general pool), exactly the key ComputeAvailableFromDbAsync
+            // filters on.
+            var activeReservations = await _context.Set<Reservation>()
+                .Where(r => r.Status == ReservationStatus.Active)
+                .Select(r => new { r.ProductId, r.FlashSaleId, r.Quantity })
+                .ToListAsync();
+            var reservedByPool = activeReservations
+                .GroupBy(r => new { r.ProductId, r.FlashSaleId })
+                .ToDictionary(g => g.Key, g => g.Sum(r => r.Quantity));
+
+            foreach (var product in products)
             {
-                var (available, flashSaleId) = await ComputeAvailableFromDbAsync(productId);
+                int? flashSaleId = null;
+                var capacity = product.StockQuantity;
+                if (saleByProduct.TryGetValue(product.Id, out var sale))
+                {
+                    flashSaleId = sale.Id;
+                    capacity = sale.SaleStockQuantity;
+                }
+
+                reservedByPool.TryGetValue(new { ProductId = product.Id, FlashSaleId = flashSaleId }, out var reserved);
+                var available = capacity - reserved;
+                if (available < 0) available = 0;
+
                 try
                 {
-                    await _database.StringSetAsync(StockKey(productId), available);
-                    await PublishStockAsync(productId, available, flashSaleId);
+                    await _database.StringSetAsync(StockKey(product.Id), available);
+                    await PublishStockAsync(product.Id, available, flashSaleId);
                 }
-                catch (RedisConnectionException ex) { LogRedisDegraded(ex, "SeedStockCounters", productId); }
-                catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "SeedStockCounters", productId); }
+                catch (RedisConnectionException ex) { LogRedisDegraded(ex, "SeedStockCounters", product.Id); }
+                catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "SeedStockCounters", product.Id); }
             }
         }
 

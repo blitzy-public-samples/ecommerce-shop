@@ -236,6 +236,8 @@ namespace Infrastructure.Data.Migrations
 
                     b.HasIndex("ProductId");
 
+                    b.HasIndex("Status", "ExpiresAt");
+
                     b.ToTable("Reservations");
                 });
 

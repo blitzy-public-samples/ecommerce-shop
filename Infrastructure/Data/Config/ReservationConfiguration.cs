@@ -23,6 +23,13 @@ namespace Infrastructure.Data.Config
                 .WithMany()
                 .HasForeignKey(r => r.FlashSaleId)
                 .OnDelete(DeleteBehavior.Restrict);
+
+            // Composite index accelerating the reconciliation expired-reservation scan
+            // (WHERE "Status" = 'Active' AND "ExpiresAt" < now). Without it PostgreSQL performs
+            // a sequential scan of the Reservations table on every reconciliation pass (F4).
+            // Provider-agnostic: SQLite EnsureCreated builds it from this configuration,
+            // PostgreSQL builds it via the migration Up(), and the in-memory provider ignores it.
+            builder.HasIndex(r => new { r.Status, r.ExpiresAt });
         }
     }
 }

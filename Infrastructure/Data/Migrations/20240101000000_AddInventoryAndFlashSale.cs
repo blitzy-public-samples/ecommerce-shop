@@ -83,6 +83,11 @@ namespace Infrastructure.Data.Migrations
                 name: "IX_Reservations_ProductId",
                 table: "Reservations",
                 column: "ProductId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Reservations_Status_ExpiresAt",
+                table: "Reservations",
+                columns: new[] { "Status", "ExpiresAt" });
         }
 
         protected override void Down(MigrationBuilder migrationBuilder)

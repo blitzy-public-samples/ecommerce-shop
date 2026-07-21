@@ -52,19 +52,49 @@ namespace Infrastructure.Services
             }
             // create order
             var order = new Order(items, buyerEmail, shippingAddress, deliveryMethod, subtotal, basket.PaymentIntentId);
-            _unitOfWork.Repository<Order>().Add(order);
-            // commit the basket's stock reservations (Active -> Committed + permanent pool decrement)
-            // staged on the SAME scoped StoreContext as the order, so the single Complete() below
-            // flushes order rows and reservation/stock changes together atomically.
-            await _inventoryService.CommitReservationAsync(basketId);
-            // save to db — single atomic flush of the order rows AND the staged reservation/stock changes
-            var result = await _unitOfWork.Complete();
 
-            if (result <= 0) return null;
+            // Open an explicit transaction on the shared scoped StoreContext so order finalization is
+            // atomic AND serialized against concurrent finalizations. CommitReservationAsync below takes
+            // a PostgreSQL "SELECT ... FOR UPDATE" row lock on each reserved Product over this SAME
+            // context; because the lock lives inside this transaction it is held until CommitTransactionAsync,
+            // so two shoppers finalizing orders for the same product cannot both read the pre-decrement
+            // stock and silently overwrite each other (the oversell / lost-update defect). On the EF Core
+            // InMemory provider this is a no-op and behavior is unchanged.
+            await _unitOfWork.BeginTransactionAsync();
+            try
+            {
+                _unitOfWork.Repository<Order>().Add(order);
+                // commit the basket's stock reservations (Active -> Committed + permanent pool decrement)
+                // staged on the SAME scoped StoreContext as the order, so the single Complete() below
+                // flushes order rows and reservation/stock changes together atomically under the row lock.
+                await _inventoryService.CommitReservationAsync(basketId);
+                // save to db — single atomic flush of the order rows AND the staged reservation/stock changes
+                var result = await _unitOfWork.Complete();
 
-            // Flush succeeded: now (and only now) delete the Redis hold keys for the just-committed reservations.
-            // Deferring this until after a successful Complete() means a rolled-back order (result <= 0 above)
-            // never deletes a hold key whose reservation reverted to Active, keeping PostgreSQL and Redis consistent.
+                if (result <= 0)
+                {
+                    // Nothing was written: roll back (releasing the row lock) and abort. The staged
+                    // reservation transition to Committed is discarded with the rollback, so the holds
+                    // remain Active and consistent with the un-decremented stock.
+                    await _unitOfWork.RollbackTransactionAsync();
+                    return null;
+                }
+
+                // Commit the row lock + all staged changes together, making the stock decrement durable.
+                await _unitOfWork.CommitTransactionAsync();
+            }
+            catch
+            {
+                // Any failure (DB error, FK violation, etc.) rolls back the whole unit — order rows and
+                // the staged reservation/stock changes revert together — then the error propagates.
+                await _unitOfWork.RollbackTransactionAsync();
+                throw;
+            }
+
+            // Flush succeeded and the transaction committed: now (and only now) delete the Redis hold keys
+            // for the just-committed reservations. Deferring this until after a successful, committed flush
+            // means a rolled-back order never deletes a hold key whose reservation reverted to Active,
+            // keeping PostgreSQL and Redis consistent.
             await _inventoryService.FinalizeCommittedHoldsAsync(basketId);
 
             // return order

@@ -393,9 +393,39 @@ namespace API.IntegrationTests.Concurrency
         /// <param name="dto">The basket to persist.</param>
         private async Task SeedBasketAsync(CustomerBasketDto dto)
         {
+            // F5: POST api/basket now RESERVES stock (reserve-before-persist), returning 409 Conflict when a
+            // basket line cannot be held because the product has no available stock. The catalog seed now
+            // provisions positive StockQuantity, but these order tests run sequentially on ONE shared
+            // per-class database and each committed order permanently decrements the product's stock, so
+            // guarantee ample available stock for every product this basket references BEFORE the reserve
+            // runs. This keeps the arrange deterministic regardless of what earlier tests in this class
+            // consumed, mirroring the explicit stock-setup ReservationConcurrencyTests performs.
+            await EnsureAmpleStockForBasketAsync(dto);
+
             using var client = _fixture.CreateClient();
             using var resp = await client.PostAsJsonAsync("api/basket", dto);
             resp.StatusCode.Should().Be(HttpStatusCode.OK);
+        }
+
+        /// <summary>
+        /// Ensures every product referenced by <paramref name="dto"/> has ample general-pool
+        /// <c>StockQuantity</c> so the reserve-on-basket path (<c>POST api/basket</c>) grants the hold and
+        /// returns 200 rather than 409. Writes through a fresh scope's real <see cref="StoreContext"/> and
+        /// SETS (never increments) a high value, so the setup is deterministic on this class's shared
+        /// database even after prior tests committed orders that decremented the same product.
+        /// </summary>
+        private async Task EnsureAmpleStockForBasketAsync(CustomerBasketDto dto)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
+
+            var productIds = dto.Items.Select(i => i.Id).Distinct().ToList();
+            var products = await ctx.Products.Where(p => productIds.Contains(p.Id)).ToListAsync();
+            foreach (var product in products)
+            {
+                product.StockQuantity = 1000;
+            }
+            await ctx.SaveChangesAsync();
         }
 
         /// <summary>
