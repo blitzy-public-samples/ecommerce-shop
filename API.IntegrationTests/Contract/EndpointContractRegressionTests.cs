@@ -321,6 +321,74 @@ namespace API.IntegrationTests.Contract
             ShouldExposeCamelCaseProperties(root[0], "id", "name");
         }
 
+        /// <summary>
+        /// <b>Inventory-feature contract lock</b> (AAP §0.1.2 invariant "StockQuantity is not added to the DTO";
+        /// §0.4.1 non-touchpoints; §0.6.2). After the Real-Time Inventory &amp; Flash-Sale System is added,
+        /// <c>Products.StockQuantity</c> exists on the <c>Product</c> ENTITY and in the database, but it is
+        /// deliberately NOT added to <c>ProductToReturnDto</c> or <c>MappingProfiles</c>: live stock reaches the
+        /// client only over the SignalR hub, never through the <c>[Cached(600)]</c> catalog. This test proves the
+        /// cached list DTO shape is unchanged — the first <c>data</c> item still exposes EXACTLY the seven mapped
+        /// camelCase properties and leaks NO stock field (neither <c>stockQuantity</c> nor <c>stock</c>).
+        /// </summary>
+        [Fact]
+        public async Task GetProducts_AfterInventoryFeature_ProductDtoHasNoStockField()
+        {
+            // Arrange
+            using var client = _fixture.CreateClient();
+
+            // Act
+            using var response = await client.GetAsync("api/products");
+
+            // Assert — status + first item keeps the 7 mapped DTO props and leaks no stock field.
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            var item = root.GetProperty("data")[0];
+
+            // (1) the existing 7 camelCase props are still present (presence-only helper).
+            ShouldExposeCamelCaseProperties(
+                item, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
+
+            // (2) NO stock leakage — the helper cannot express absence, so assert it explicitly (camelCase).
+            item.TryGetProperty("stockQuantity", out _).Should()
+                .BeFalse("StockQuantity must never be exposed through the cached catalog DTO");
+            item.TryGetProperty("stock", out _).Should()
+                .BeFalse("no stock field may leak into the cached ProductToReturnDto");
+        }
+
+        /// <summary>
+        /// Single-product companion to
+        /// <see cref="GetProducts_AfterInventoryFeature_ProductDtoHasNoStockField"/>:
+        /// <c>GET api/products/{id}</c> for a real seeded id returns the <c>ProductToReturnDto</c> with EXACTLY the
+        /// seven mapped camelCase properties, echoes the requested id, and leaks NO stock field
+        /// (<c>stockQuantity</c>/<c>stock</c>). The id is discovered dynamically from the list response because
+        /// product ids are database-assigned.
+        /// </summary>
+        [Fact]
+        public async Task GetProduct_ExistingId_AfterInventoryFeature_ProductDtoHasNoStockField()
+        {
+            // Arrange — discover a real, seeded product id dynamically (ids are DB-assigned, never hardcoded).
+            using var client = _fixture.CreateClient();
+            using var listResponse = await client.GetAsync("api/products");
+            var listRoot = await ReadRootAsync(listResponse);
+            var existingId = listRoot.GetProperty("data")[0].GetProperty("id").GetInt32();
+
+            // Act
+            using var response = await client.GetAsync($"api/products/{existingId}");
+
+            // Assert — status + single-product DTO shape + id echo + NO stock leakage.
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            ShouldExposeCamelCaseProperties(
+                root, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
+            root.GetProperty("id").GetInt32().Should().Be(existingId);
+
+            // The helper cannot assert absence — assert the missing stock fields explicitly (camelCase).
+            root.TryGetProperty("stockQuantity", out _).Should()
+                .BeFalse("StockQuantity must never be exposed through the cached catalog DTO");
+            root.TryGetProperty("stock", out _).Should()
+                .BeFalse("no stock field may leak into the cached ProductToReturnDto");
+        }
+
         // ---------------------------------------------------------------------------------------------
         // PHASE 2 — Basket endpoints (anonymous client)
         // ---------------------------------------------------------------------------------------------

@@ -53,7 +53,8 @@ namespace API.Tests.Controllers
         {
             var repo = new Mock<IBasketRepository>();
             var mapper = new Mock<IMapper>();
-            var controller = new BasketController(repo.Object, mapper.Object);
+            var inventoryService = new Mock<IInventoryService>();
+            var controller = new BasketController(repo.Object, mapper.Object, inventoryService.Object);
             return (controller, repo, mapper);
         }
 

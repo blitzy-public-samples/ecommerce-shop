@@ -11,11 +11,13 @@ namespace API.Controllers
     {
         private readonly IBasketRepository _basketRepository;
         private readonly IMapper _mapper;
+        private readonly IInventoryService _inventoryService;
 
-        public BasketController(IBasketRepository basketRepository, IMapper mapper)
+        public BasketController(IBasketRepository basketRepository, IMapper mapper, IInventoryService inventoryService)
         {
             _basketRepository = basketRepository;
             _mapper = mapper;
+            _inventoryService = inventoryService;
         }
 
         [HttpGet]
@@ -30,6 +32,15 @@ namespace API.Controllers
         {
             var customerBasket = _mapper.Map<CustomerBasketDto, CustomerBasket>(basket);
             var updatedBasket = await _basketRepository.UpdateBasketAsync(customerBasket);
+
+            if (updatedBasket?.Items != null)
+            {
+                foreach (var item in updatedBasket.Items)
+                {
+                    await _inventoryService.ExtendReservationAsync(updatedBasket.Id, item.Id, item.Quantity);
+                }
+            }
+
             return Ok(updatedBasket);
         }
 
