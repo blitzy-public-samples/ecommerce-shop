@@ -1,6 +1,8 @@
 using System.Text;
 // Flash-Sale feature: System.Threading.Tasks for Task.CompletedTask; Microsoft.AspNetCore.Http for PathString.StartsWithSegments (query-string hub token).
 using System.Threading.Tasks;
+// Flash-Sale feature (review finding F07): API.Hubs for the single canonical InventoryHub.HubPath fallback.
+using API.Hubs;
 using Core.Entities.Identity;
 using Infrastructure.Identity;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -41,9 +43,16 @@ namespace API.Extension
                         {
                             var accessToken = context.Request.Query["access_token"];
                             var path = context.HttpContext.Request.Path;
+                            // Flash-Sale feature (review finding F07): resolve the hub path from configuration, but fall back to
+                            // the single canonical InventoryHub.HubPath when SIGNALR_HUB_PATH is absent/blank. This guarantees the
+                            // query-string token is always lifted for the hub — even if a deployment omits the config key — so the
+                            // WebSocket auth can never silently no-op, and the extraction path always agrees with MapHub<InventoryHub>.
                             var hubPath = config["SIGNALR_HUB_PATH"];
+                            if (string.IsNullOrWhiteSpace(hubPath))
+                            {
+                                hubPath = InventoryHub.HubPath;
+                            }
                             if (!string.IsNullOrEmpty(accessToken) &&
-                                !string.IsNullOrEmpty(hubPath) &&
                                 path.StartsWithSegments(hubPath))
                             {
                                 context.Token = accessToken;

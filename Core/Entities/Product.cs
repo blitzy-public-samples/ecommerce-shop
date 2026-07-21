@@ -13,8 +13,12 @@ namespace Core.Entities
         public ProductBrand ProductBrand { get; set; }
         public int ProductBrandId { get; set; }
 
-        // Flash-Sale feature: optimistic-concurrency token (row-version style) guarding against
-        // oversell; mapped via ProductConfiguration.IsConcurrencyToken(). Not projected into any DTO.
+        // Flash-Sale feature (review finding F04): GENERAL product-row optimistic-concurrency token,
+        // mapped via ProductConfiguration.IsConcurrencyToken(). It guards concurrent mutations of the
+        // Product row itself and is NOT the flash-sale allocation/oversell authority — that single
+        // authority is FlashSale.Version (which owns StockAllocation). The reservation/sweep flows
+        // never read or increment Product.Version, so the two tokens have clearly separated roles and
+        // there is exactly one allocation authority. Not projected into any DTO.
         public uint Version { get; set; }
     }
 }

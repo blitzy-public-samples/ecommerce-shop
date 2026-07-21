@@ -3,7 +3,12 @@
     font-size: 1.25rem;
   }
 
+  // Flash-Sale feature (review finding F13): the struck-through base price must remain legible.
+  // The previous `opacity: 0.75` dropped the effective contrast of the del text below the WCAG 2.1 AA
+  // 4.5:1 threshold for normal text. Render it at the alert's NORMAL foreground colour at full opacity
+  // (inherit, opacity: 1) instead of a dimmed/muted tone — do NOT use `.text-muted` on this element.
   del {
-    opacity: 0.75;
+    color: inherit;
+    opacity: 1;
   }
 }
