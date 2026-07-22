@@ -18,6 +18,18 @@ export class LoadingInterceptor implements HttpInterceptor {
     if (req.url.includes('emailexists')) {
       return next.handle(req);
     }
+    // QA finding F3 (MINOR, Visual/Performance): the product-details M14 fallback poll issues
+    // GET /api/flash-sales/active every environment.pollInterval (5000ms) to reconcile live
+    // sale/stock state. Without this exclusion the LoadingInterceptor raises the global
+    // full-viewport busy spinner (ngx-spinner, z-index:99999) on every silent background poll -
+    // imperceptible on a fast link but a visibly flashing scrim on throttled networks (Fast/Slow 3G).
+    // Excluding the active-sale poll keeps background price/stock refreshes silent while every
+    // user-initiated request continues to show the spinner. Scoped to 'flash-sales/active' only, so
+    // the deliberate POST /api/flash-sales scheduling action (URL '.../flash-sales', no '/active')
+    // still shows the spinner as before.
+    if (req.url.includes('flash-sales/active')) {
+      return next.handle(req);
+    }
     this.busyService.busy();
     return next.handle(req).pipe(
       finalize(() => {

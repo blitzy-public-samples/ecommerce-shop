@@ -99,6 +99,18 @@ export class BasketService {
   private createBasket(): IBasket {
     const basket = new Basket();
     localStorage.setItem('basket_id', basket.id);
+    // QA finding F2 (CRITICAL) fix: seed the BehaviorSubject with the just-created basket so that
+    // getCurrentBasketValue() immediately returns it. Previously createBasket() only persisted the
+    // UUID to localStorage without seeding basketSource, so a first-time shopper who reserved a
+    // flash-sale item via getOrCreateBasketId() (which mints UUID_A) would then hit
+    // addItemToBasket()'s `getCurrentBasketValue() ?? createBasket()`; because the subject was still
+    // null this minted a SECOND basket (UUID_B) and overwrote localStorage['basket_id'], diverging
+    // the order's basket UUID from the reservation's session_id. Checkout then consumed no
+    // reservation and the orphaned hold lapsed at TTL, re-releasing already-sold stock (oversell).
+    // Seeding here keeps reservation session_id == basket UUID == order basket UUID end-to-end,
+    // preserving the zero-oversell invariant (AAP R3) and the basket-UUID-as-session-id rule
+    // (AAP R8/R5). No new identity concept is introduced.
+    this.basketSource.next(basket);
     return basket;
   }
 

@@ -5,12 +5,23 @@ import { environment } from '../../../environments/environment';
 import { IFlashSale, IFlashSaleEnded } from '../../shared/models/flash-sale';
 import { IInventoryUpdate } from '../../shared/models/inventory';
 
-// M13: Initial-connect retry policy. withAutomaticReconnect() only retries AFTER a first
-// successful connection drops - it does NOT retry the very first start(). We therefore retry the
-// initial connect a bounded number of times with a fixed backoff, then surface the final failure to
-// the caller (no longer swallowed into a fulfilled promise).
+// M13: Initial-connect retry policy. We self-manage all (re)connection (QA finding F4 removed
+// withAutomaticReconnect() - see the builder), so startWithRetry() below owns BOTH the very first
+// connect and every reconnect attempt. The initial connect is retried a bounded number of times with a
+// fixed backoff, then the final failure is surfaced to the caller (no longer swallowed into a
+// fulfilled promise).
 const INITIAL_START_MAX_ATTEMPTS = 3;
 const INITIAL_START_RETRY_DELAY_MS = 2000;
+
+// QA finding F4: bounded self-managed reconnect budget. When an already-established connection drops we
+// retry the connect OURSELVES (see onclose -> reconnect) at INITIAL_START_RETRY_DELAY_MS spacing. This
+// budget bounds ONLY connect attempts made while the browser reports ONLINE (an OFFLINE period parks on
+// the 'online' event and consumes NO attempts - so a long outage never exhausts the budget and self-
+// heals the instant connectivity returns). The budget therefore caps the rarer "online but server
+// briefly unreachable" case; if it is exhausted we stop retrying (mirroring the previous
+// withAutomaticReconnect give-up), the product-details M14 REST poll keeps the UI fresh, and a later
+// manual acquire() can always reopen the socket.
+const RECONNECT_MAX_ATTEMPTS = 10;
 
 // Real-Time Inventory & Flash Sale - SignalR client wrapper.
 // Surfaces the three server-to-client hub events as RxJS observables consumed by the
@@ -34,7 +45,16 @@ export class InventoryHubService {
       // warnings/errors but removes the per-connection console noise, supporting console cleanliness.
       .configureLogging(signalR.LogLevel.Warning)
       .withUrl(environment.hubUrl, { accessTokenFactory: () => localStorage.getItem('token') || '' })
-      .withAutomaticReconnect()
+      // QA finding F4 (LOW, resilience/console-hygiene): intentionally NOT calling
+      // .withAutomaticReconnect(). Its internal reconnect loop (HubConnection._reconnect ->
+      // _startInternal -> transport start) settles a FLOATING promise whose rejection our code cannot
+      // attach a .catch to. Under Angular's zone.js that surfaces as an "Unhandled Promise rejection"
+      // console.error during a sustained outage - and zone.js logs it BEFORE dispatching the native
+      // 'unhandledrejection' event to listeners, so a window-level preventDefault() cannot suppress it.
+      // Instead we drive reconnection ourselves from the onclose handler via startWithRetry() (see
+      // below), so EVERY connect attempt is awaited inside our own try/catch and no promise is ever
+      // left floating. The graceful-recovery contract is preserved: on a successful reconnect we rejoin
+      // the retained product groups and emit reconnected$ so consumers reconcile missed updates.
       .build();
 
   private inventoryUpdatedSource = new Subject<IInventoryUpdate>();
@@ -47,15 +67,15 @@ export class InventoryHubService {
   private flashSaleEndedSource = new Subject<IFlashSaleEnded>();
   flashSaleEnded$ = this.flashSaleEndedSource.asObservable();
 
-  // M13: Emits AFTER the connection is automatically re-established and retained groups have been
-  // rejoined. Consumers subscribe to refresh any state that may have drifted while disconnected
-  // (e.g. re-fetch the active sale + live stock via REST). The refresh lives in the consumer so this
-  // service stays HTTP-free.
+  // M13: Emits AFTER the connection is re-established (by the self-managed onclose-driven reconnect(),
+  // QA finding F4) and retained groups have been rejoined. Consumers subscribe to refresh any state
+  // that may have drifted while disconnected (e.g. re-fetch the active sale + live stock via REST). The
+  // refresh lives in the consumer so this service stays HTTP-free.
   private reconnectedSource = new Subject<void>();
   reconnected$ = this.reconnectedSource.asObservable();
 
-  // M13: Retained registry of product groups this (shared) connection has joined. Kept so the
-  // onreconnected handler can transparently rejoin them after an automatic reconnect, and so groups
+  // M13: Retained registry of product groups this (shared) connection has joined. Kept so reconnect()
+  // (QA finding F4) can transparently rejoin them after a self-managed reconnect, and so groups
   // requested before the socket is up are joined once it connects.
   private joinedGroups = new Set<number>();
 
@@ -68,6 +88,18 @@ export class InventoryHubService {
   // instead of racing two start() calls (which SignalR rejects unless state === Disconnected).
   private startPromise: Promise<void> | null = null;
 
+  // QA finding F4 (LOW, resilience): distinguishes a DELIBERATE teardown from an unexpected network
+  // drop for the onclose-driven reconnect (see constructor + reconnect()). stop()/release() set this
+  // true so onclose does NOT try to resurrect a connection the app intentionally closed; acquire()
+  // clears it because a fresh consumer wants the connection kept alive across drops.
+  private userStopped = false;
+
+  // QA finding F4 (LOW, console-hygiene): while the browser is offline reconnect() parks on the window
+  // 'online' event instead of calling hubConnection.start() (a failed start() makes @microsoft/signalr
+  // float internal negotiate-rejections that zone.js logs as "Unhandled Promise rejection"). This holds
+  // the cleanup for the currently-parked wait so a deliberate stop() can release it immediately.
+  private onlineWaitAbort: (() => void) | null = null;
+
   constructor() {
     // Register the server-to-client handlers once. The event names MUST match the backend
     // InventoryHub method names exactly (InventoryUpdated / FlashSaleStarted / FlashSaleEnded).
@@ -76,11 +108,21 @@ export class InventoryHubService {
     // M9-fe: forward the { productId, saleId } payload typed as IFlashSaleEnded.
     this.hubConnection.on('FlashSaleEnded', (payload: IFlashSaleEnded) => this.flashSaleEndedSource.next(payload));
 
-    // M13: On an automatic reconnect, transparently rejoin the retained groups and THEN signal
-    // consumers to reconcile via REST (server-to-client group membership does not survive a reconnect
-    // and events may have been missed while offline). Registering the handler does not open a socket.
-    this.hubConnection.onreconnected(() => {
-      this.rejoinGroups().then(() => this.reconnectedSource.next());
+    // QA finding F4 (LOW, resilience/console-hygiene): recover from an UNEXPECTED connection drop
+    // ourselves. Because we do NOT use withAutomaticReconnect() (see builder above), the connection has
+    // no internal reconnect policy and instead fires onclose the moment the socket drops. We respond by
+    // self-managing reconnection so that no library-internal promise can float unhandled through
+    // zone.js. onclose fires for BOTH a deliberate stop() and a network drop, so reconnect() itself
+    // gates on userStopped/refCount to only resurrect a connection consumers still want. This single
+    // handler replaces the previous onreconnected/onreconnecting hooks (which only fire when
+    // withAutomaticReconnect owns the connection); the rejoin-groups + reconnected$ recovery they
+    // provided now lives in reconnect().
+    this.hubConnection.onclose(() => {
+      // Drop the shared start promise so reconnect()/a future acquire() can reopen from Disconnected.
+      this.startPromise = null;
+      // Fire-and-forget: reconnect() is fully self-contained (every path is caught), so it can never
+      // surface as an unhandled rejection; `void` marks the intentional non-await.
+      void this.reconnect();
     });
   }
 
@@ -89,6 +131,9 @@ export class InventoryHubService {
   // can await a live connection (and observe a start failure).
   acquire(): Promise<void> {
     this.refCount++;
+    // QA finding F4: a consumer wants the connection, so clear any prior deliberate-stop flag - a drop
+    // from here on should trigger the onclose-driven reconnect() rather than stand down.
+    this.userStopped = false;
     return this.start();
   }
 
@@ -117,8 +162,10 @@ export class InventoryHubService {
     if (this.startPromise) {
       return this.startPromise;
     }
-    // While the automatic-reconnect machinery owns the connection we must not issue a manual start
-    // (SignalR throws unless state === Disconnected); the reconnect + onreconnected path handles it.
+    // Only a Disconnected connection may be started (SignalR throws otherwise). If we are mid-transition
+    // (Connecting/Disconnecting, e.g. a self-managed reconnect via startWithRetry() is already in
+    // flight, or a stop() is completing) there is nothing safe to do here - the in-flight attempt or the
+    // onclose-driven reconnect() path will settle the state.
     if (this.hubConnection.state !== signalR.HubConnectionState.Disconnected) {
       return Promise.resolve();
     }
@@ -140,6 +187,16 @@ export class InventoryHubService {
   // Stop the connection, guarded by state; errors swallowed/logged. Prefer release() from components
   // so reference counting is honoured - a direct stop() bypasses shared ownership.
   stop(): Promise<void> {
+    // QA finding F4: mark this as a DELIBERATE teardown BEFORE stopping. onclose fires for both a manual
+    // stop and a network drop; this flag lets the onclose-driven reconnect() stand down here instead of
+    // trying to reopen a connection the app intentionally closed.
+    this.userStopped = true;
+    // QA finding F4: release any reconnect loop currently parked waiting for the browser to come back
+    // online, so a deliberate teardown does not leave it hanging on the 'online' event. The loop wakes,
+    // re-checks userStopped (now true) and stands down.
+    if (this.onlineWaitAbort) {
+      this.onlineWaitAbort();
+    }
     if (this.hubConnection.state === signalR.HubConnectionState.Disconnected) {
       return Promise.resolve();
     }
@@ -154,7 +211,7 @@ export class InventoryHubService {
   joinProductGroup(productId: number): Promise<void> {
     this.joinedGroups.add(productId);
     if (this.hubConnection.state !== signalR.HubConnectionState.Connected) {
-      // Not connected yet; membership is retained and joined by start()/onreconnected.
+      // Not connected yet; membership is retained and joined by start()/reconnect() once connected.
       return Promise.resolve();
     }
     return this.hubConnection.invoke('JoinProductGroup', productId)
@@ -195,6 +252,107 @@ export class InventoryHubService {
       console.error('InventoryHub initial start failed after all retries', err);
       throw err;
     }
+  }
+
+  // QA finding F4 (LOW, resilience/console-hygiene): self-managed reconnect, invoked from onclose after
+  // an UNEXPECTED drop. It replaces withAutomaticReconnect()'s internal (floating) reconnect loop with a
+  // loop we fully own. The crux of the fix: EVERY hubConnection.start() attempt is awaited inside this
+  // method's own try/catch, so a failed attempt rejects into OUR handler instead of settling a floating
+  // promise - which is exactly what keeps zone.js from ever observing an uncaught rejection and printing
+  // "Unhandled Promise rejection" console.error noise during an outage.
+  //
+  // Logging is deliberately minimal (the finding's theme is console hygiene): individual failed attempts
+  // are silent, and only a single informative warning is emitted if we ultimately give up. On a
+  // successful reconnect it restores the exact pre-drop contract the previous onreconnected hook
+  // provided: rejoin the retained product groups, then signal consumers via reconnected$ so they
+  // reconcile any updates missed while offline (the REST refresh lives in the consumer; this service
+  // stays HTTP-free). A deliberate stop() (userStopped) or a fully-released connection (refCount === 0)
+  // short-circuits - checked at entry AND on every iteration - so we never resurrect a connection nobody
+  // wants. If the outage outlasts the bounded budget we stop (matching the previous withAutomaticReconnect
+  // give-up behaviour); the product-details M14 REST poll keeps the UI fresh and a later acquire()/start()
+  // reopens the socket. Declared async and returning Promise<void> purely for testability; onclose calls
+  // it fire-and-forget and every path is caught, so the returned promise never rejects (nothing floats).
+  private async reconnect(): Promise<void> {
+    if (this.userStopped || this.refCount <= 0) {
+      return;
+    }
+    for (let attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt++) {
+      // A deliberate stop() or a full release() may have happened between attempts - stand down.
+      if (this.userStopped || this.refCount <= 0) {
+        return;
+      }
+      // CORE OF THE F4 FIX: never call hubConnection.start() while the browser is offline. A start()
+      // that fails at negotiation makes @microsoft/signalr settle internal promises that our await
+      // cannot attach to, and zone.js reports them as "Unhandled Promise rejection" console.error noise.
+      // By parking on the 'online' event until connectivity returns we simply never invoke the failing
+      // start(), so no such promise is ever created. This also means an offline period consumes NO
+      // attempts from the budget and the socket self-heals the instant the network comes back.
+      await this.waitUntilOnline();
+      if (this.userStopped || this.refCount <= 0) {
+        return;
+      }
+      try {
+        // Only a Disconnected connection may be (re)started (SignalR throws otherwise).
+        if (this.hubConnection.state === signalR.HubConnectionState.Disconnected) {
+          await this.hubConnection.start();
+        }
+      } catch {
+        // Online but the connect failed (e.g. the server was briefly unreachable). The rejection is
+        // fully handled HERE - it never floats. Back off and retry (kept silent for console hygiene).
+        await this.delay(INITIAL_START_RETRY_DELAY_MS);
+        continue;
+      }
+      if (this.hubConnection.state === signalR.HubConnectionState.Connected) {
+        // Reconnected. If everyone released (or a deliberate stop happened) while we were reconnecting,
+        // stand the connection back down; otherwise restore the pre-drop contract.
+        if (this.userStopped || this.refCount <= 0) {
+          return this.stop();
+        }
+        await this.rejoinGroups();
+        this.reconnectedSource.next();
+        return;
+      }
+      // Still transitioning (not yet Connected) - wait out the backoff and re-check.
+      await this.delay(INITIAL_START_RETRY_DELAY_MS);
+    }
+    // Online-retry budget exhausted (a sustained server-unreachable-while-online outage; an offline
+    // outage never reaches here because it parks on 'online' above). Surface ONE handled warning (not an
+    // unhandled rejection) so the give-up stays diagnosable; live push resumes on the next connection and
+    // the product-details M14 REST poll keeps reconciling stock/price in the meantime.
+    console.warn('InventoryHub reconnect gave up after a sustained outage; live updates will resume on '
+      + 'the next connection (REST polling continues to refresh stock/price).');
+  }
+
+  // QA finding F4: is the browser currently online? navigator may be undefined in non-browser/test
+  // contexts, in which case we treat the environment as online so the reconnect logic proceeds normally.
+  private isOnline(): boolean {
+    return typeof navigator === 'undefined' || navigator.onLine !== false;
+  }
+
+  // QA finding F4: resolve as soon as the browser has connectivity. If already online this resolves
+  // synchronously; otherwise it parks on a one-shot window 'online' listener (never a timer/poll) so we
+  // avoid calling start() - and thus creating a floating negotiate-rejection - during the outage. The
+  // pending wait is exposed via onlineWaitAbort so stop() can release it immediately on teardown; the
+  // reconnect loop re-checks userStopped/refCount right after this resolves and stands down if needed.
+  private waitUntilOnline(): Promise<void> {
+    if (this.isOnline()) {
+      return Promise.resolve();
+    }
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return Promise.resolve();
+    }
+    return new Promise<void>(resolve => {
+      const done = () => {
+        window.removeEventListener('online', done);
+        if (this.onlineWaitAbort === done) {
+          this.onlineWaitAbort = null;
+        }
+        resolve();
+      };
+      // Allow a deliberate stop() to release the parked wait immediately (the loop then stands down).
+      this.onlineWaitAbort = done;
+      window.addEventListener('online', done);
+    });
   }
 
   // Small awaitable delay used between initial-connect retries. Isolated as a method so tests can
