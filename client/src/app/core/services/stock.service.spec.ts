@@ -70,6 +70,13 @@ describe('StockService', () => {
     service = TestBed.inject(StockService);
   });
 
+  afterEach(() => {
+    // Remove the window 'online' listener this test's service registered (P5-4/P6-7), so
+    // listeners do not accumulate on the global window across the suite and a later test's
+    // dispatched 'online' event cannot fan out to a prior test's service instance.
+    service.ngOnDestroy();
+  });
+
   it('should be created', () => {
     expect(service).toBeTruthy();
   });
@@ -300,6 +307,105 @@ describe('StockService', () => {
     await service.startConnection();
     expect(hubSpy.start).toHaveBeenCalledTimes(2);
     expect(hubSpy.state).toBe(HubConnectionState.Connected);
+  });
+
+  it('proactively restarts a fresh connection on terminal close when products are tracked (P5-4/P6-7)', async () => {
+    // A product is tracked and the socket connects (start #1); the connect-success full
+    // refetch invokes SubscribeToProduct for it.
+    service.subscribeToProduct(1);
+    await service.startConnection();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+    hubSpy.invoke.calls.reset();
+
+    // Terminal close (SignalR's own auto-reconnect schedule exhausted) while product 1 is
+    // STILL tracked. Previously the badge froze because nothing re-initiated the connection;
+    // now onclose must PROACTIVELY begin a fresh start cycle (start #2) with no external
+    // subscribeToProduct and no navigation.
+    hubSpy.state = HubConnectionState.Disconnected;
+    closeCb();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(hubSpy.start).toHaveBeenCalledTimes(2);
+    expect(hubSpy.state).toBe(HubConnectionState.Connected);
+    // The fresh connection performs a FULL refetch, re-invoking SubscribeToProduct for the
+    // tracked id so its badge re-converges to current stock.
+    expect(hubSpy.invoke).toHaveBeenCalledWith('SubscribeToProduct', 1);
+  });
+
+  it('does NOT auto-restart on terminal close when no products are tracked (P5-4/P6-7)', async () => {
+    // Connect with nothing tracked (start #1).
+    await service.startConnection();
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+
+    // Terminal close with an empty tracking set: there is no badge to keep live, so onclose
+    // resets the guard but must NOT open a needless connection (a later subscribeToProduct
+    // starts it on demand). This keeps the guard-reset-only contract for the untracked case.
+    hubSpy.state = HubConnectionState.Disconnected;
+    closeCb();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+    expect((service as any).startPromise).toBeNull();
+    expect((service as any).startAttempt).toBe(0);
+  });
+
+  it('reconnects on the browser "online" event when the socket is not connected (P5-4/P6-7)', async () => {
+    // A product is tracked and the socket connects (start #1).
+    service.subscribeToProduct(1);
+    await service.startConnection();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+
+    // Simulate an outage that exhausted every reconnect attempt: the socket is Disconnected
+    // and the start guard is cleared (isolating the 'online' recovery path from onclose).
+    hubSpy.state = HubConnectionState.Disconnected;
+    (service as any).startPromise = null;
+    (service as any).startAttempt = 0;
+    hubSpy.invoke.calls.reset();
+
+    // The browser regains connectivity: the 'online' listener must re-initiate the connection
+    // (start #2) and full-refetch every tracked product — with no navigation or user action.
+    window.dispatchEvent(new Event('online'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(hubSpy.start).toHaveBeenCalledTimes(2);
+    expect(hubSpy.state).toBe(HubConnectionState.Connected);
+    expect(hubSpy.invoke).toHaveBeenCalledWith('SubscribeToProduct', 1);
+  });
+
+  it('ignores the browser "online" event while already connected (no duplicate start) (P5-4/P6-7)', async () => {
+    await service.startConnection();
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+    expect(hubSpy.state).toBe(HubConnectionState.Connected);
+
+    // Already Connected: the online handler is a no-op (startConnection short-circuits on a
+    // Connected socket), so no second start() is issued.
+    window.dispatchEvent(new Event('online'));
+    await Promise.resolve();
+
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes the "online" listener on ngOnDestroy so it cannot reconnect after teardown (P5-4/P6-7)', async () => {
+    await service.startConnection();
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
+
+    // Tear the singleton down: the window 'online' listener must be removed.
+    service.ngOnDestroy();
+
+    // A subsequent connectivity restore must NOT reconnect a destroyed service.
+    hubSpy.state = HubConnectionState.Disconnected;
+    (service as any).startPromise = null;
+    window.dispatchEvent(new Event('online'));
+    await Promise.resolve();
+
+    expect(hubSpy.start).toHaveBeenCalledTimes(1);
   });
 
   it('refetches a product tracked during a failed start cycle once a later start succeeds (P4-11)', fakeAsync(() => {

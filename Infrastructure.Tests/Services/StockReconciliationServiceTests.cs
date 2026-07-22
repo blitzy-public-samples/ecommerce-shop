@@ -13,24 +13,24 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
-using StackExchange.Redis;
 using Xunit;
 
 namespace Infrastructure.Tests.Services
 {
     /// <summary>
     /// Unit tests for <see cref="StockReconciliationService"/> — a single reconciliation pass driven
-    /// through the IHostedService lifecycle. Uses a mocked IServiceScopeFactory chain, mocked Redis,
-    /// mocked IInventoryService/IFlashSaleService, and a real EF InMemory StoreContext for reservation
-    /// state. A TaskCompletionSource gates on the pass's last step so tests are deterministic and fast.
+    /// through the IHostedService lifecycle. After P7-1 this service ORCHESTRATES: it performs NO direct
+    /// Redis I/O and no direct reservation writes, delegating the reclaim and the counter reseed to the
+    /// sole stock writer (IInventoryService). These tests therefore verify the ORCHESTRATION contract
+    /// (reclaim + advance flash sales + reseed are each invoked per pass) via a mocked IServiceScopeFactory
+    /// chain and mocked IInventoryService/IFlashSaleService; the reclaim's internal effects (Active ->
+    /// Expired, INCR, publish, hold-key cleanup) are unit-tested in InventoryServiceTests. A
+    /// TaskCompletionSource gates on the pass's last step so tests are deterministic and fast.
     /// </summary>
     public class StockReconciliationServiceTests
     {
         private readonly Mock<IInventoryService> _mockInventory;
         private readonly Mock<IFlashSaleService> _mockFlashSale;
-        private readonly Mock<IConnectionMultiplexer> _mockMux;
-        private readonly Mock<IDatabase> _mockDb;
-        private readonly Mock<ISubscriber> _mockSub;
         private readonly Mock<IConfiguration> _mockConfig;
 
         public StockReconciliationServiceTests()
@@ -39,15 +39,11 @@ namespace Infrastructure.Tests.Services
             _mockFlashSale = new Mock<IFlashSaleService>();
             _mockFlashSale.Setup(f => f.AdvanceFlashSaleStatusesAsync()).Returns(Task.CompletedTask);
 
-            _mockDb = new Mock<IDatabase>();
-            _mockSub = new Mock<ISubscriber>();
-            _mockMux = new Mock<IConnectionMultiplexer>();
-            _mockMux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(_mockDb.Object);
-            _mockMux.Setup(m => m.GetSubscriber(It.IsAny<object>())).Returns(_mockSub.Object);
-            _mockDb.Setup(d => d.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
-                .ReturnsAsync(0L);
-            _mockSub.Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
-                .ReturnsAsync(0L);
+            // After P7-1 the reclaim (Active -> Expired + INCR + publish + hold-key cleanup) lives behind the
+            // sole stock writer; this service merely ORCHESTRATES it. Stub the delegated reclaim so the pass
+            // completes; its internal Redis/DB effects are covered by InventoryServiceTests. No Redis mock is
+            // wired here because the service no longer injects or touches an IConnectionMultiplexer.
+            _mockInventory.Setup(i => i.ReclaimExpiredReservationsAsync()).Returns(Task.CompletedTask);
 
             _mockConfig = new Mock<IConfiguration>();
             // Large interval => exactly one pass runs before the loop blocks on Task.Delay.
@@ -58,7 +54,6 @@ namespace Infrastructure.Tests.Services
         private (StockReconciliationService Sut, TaskCompletionSource<bool> PassDone) CreateService(StoreContext context)
         {
             var provider = new Mock<IServiceProvider>();
-            provider.Setup(p => p.GetService(typeof(StoreContext))).Returns(context);
             provider.Setup(p => p.GetService(typeof(IInventoryService))).Returns(_mockInventory.Object);
             provider.Setup(p => p.GetService(typeof(IFlashSaleService))).Returns(_mockFlashSale.Object);
 
@@ -73,7 +68,7 @@ namespace Infrastructure.Tests.Services
                 .Returns(Task.CompletedTask)
                 .Callback(() => passDone.TrySetResult(true));
 
-            var sut = new StockReconciliationService(scopeFactory.Object, _mockConfig.Object, _mockMux.Object, null);
+            var sut = new StockReconciliationService(scopeFactory.Object, _mockConfig.Object, null);
             return (sut, passDone);
         }
 
@@ -84,51 +79,25 @@ namespace Infrastructure.Tests.Services
             await sut.StopAsync(CancellationToken.None);
         }
 
-        // 1. Reclaims expired reservations and frees their stock.
+        // 1. Each pass DELEGATES expired-reservation reclaim to the sole stock writer (P7-1). The reclaim
+        // itself — Active -> Expired, returning held stock to the counters, publishing the corrected value,
+        // and residual hold-key cleanup — now lives in InventoryService.ReclaimExpiredReservationsAsync and
+        // is unit-tested there (see InventoryServiceTests, which covers both the expired-reclaim and the
+        // non-expired-left-Active behaviors that this class previously asserted). This service must merely
+        // INVOKE it each pass; it no longer writes the Reservations table or the Redis stock keys directly
+        // (the sole-writer invariant). Verifying the delegated call is the orchestration counterpart.
         [Fact]
-        public async Task ExecuteAsync_WhenReservationExpired_MarksExpiredAndIncrementsCounter()
+        public async Task ExecuteAsync_WhenPassRuns_DelegatesExpiredReclaimToInventoryService()
         {
             // Arrange
             var context = TestStoreContextFactory.CreateInMemoryContext(Guid.NewGuid().ToString());
-            var products = await TestStoreContextFactory.SeedProductsAsync(context, count: 1, stockQuantity: 10);
-            var productId = products[0].Id;
-            var reservations = await TestStoreContextFactory.SeedReservationsAsync(
-                context, productId, quantity: 3, status: ReservationStatus.Active,
-                expiresAt: DateTimeOffset.UtcNow.AddMinutes(-1));
             var (sut, passDone) = CreateService(context);
 
             // Act
             await RunOnePassAsync(sut, passDone);
 
-            // Assert
-            var reclaimed = await context.Reservations.FindAsync(reservations[0].Id);
-            reclaimed.Status.Should().Be(ReservationStatus.Expired);
-            _mockDb.Verify(d => d.StringIncrementAsync(
-                It.Is<RedisKey>(k => k == $"stock:product:{productId}"), 3, It.IsAny<CommandFlags>()),
-                Times.AtLeastOnce);
-            _mockSub.Verify(s => s.PublishAsync(
-                It.Is<RedisChannel>(c => c == "stock-updates"), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
-                Times.AtLeastOnce);
-        }
-
-        // 2. Leaves non-expired reservations untouched.
-        [Fact]
-        public async Task ExecuteAsync_WhenReservationNotExpired_LeavesReservationActive()
-        {
-            // Arrange
-            var context = TestStoreContextFactory.CreateInMemoryContext(Guid.NewGuid().ToString());
-            var products = await TestStoreContextFactory.SeedProductsAsync(context, count: 1, stockQuantity: 10);
-            var reservations = await TestStoreContextFactory.SeedReservationsAsync(
-                context, products[0].Id, quantity: 3, status: ReservationStatus.Active,
-                expiresAt: DateTimeOffset.UtcNow.AddMinutes(10));
-            var (sut, passDone) = CreateService(context);
-
-            // Act
-            await RunOnePassAsync(sut, passDone);
-
-            // Assert
-            var untouched = await context.Reservations.FindAsync(reservations[0].Id);
-            untouched.Status.Should().Be(ReservationStatus.Active);
+            // Assert: the reclaim was delegated to the sole writer, not performed directly by this service.
+            _mockInventory.Verify(i => i.ReclaimExpiredReservationsAsync(), Times.AtLeastOnce);
         }
 
         // 3. Advances flash-sale statuses each pass.
@@ -206,7 +175,7 @@ namespace Infrastructure.Tests.Services
 
             var scopeFactory = new Mock<IServiceScopeFactory>();
             var sut = new StockReconciliationService(
-                scopeFactory.Object, config.Object, _mockMux.Object, null);
+                scopeFactory.Object, config.Object, null);
 
             // Act: read the private effective-interval property.
             var prop = typeof(StockReconciliationService).GetProperty(
@@ -255,7 +224,6 @@ namespace Infrastructure.Tests.Services
             var mockLogger = new Mock<ILogger<StockReconciliationService>>();
 
             var provider = new Mock<IServiceProvider>();
-            provider.Setup(p => p.GetService(typeof(StoreContext))).Returns(context);
             provider.Setup(p => p.GetService(typeof(IInventoryService))).Returns(_mockInventory.Object);
             provider.Setup(p => p.GetService(typeof(IFlashSaleService))).Returns(_mockFlashSale.Object);
             var scope = new Mock<IServiceScope>();
@@ -269,7 +237,7 @@ namespace Infrastructure.Tests.Services
                 .Callback(() => passDone.TrySetResult(true));
 
             var sut = new StockReconciliationService(
-                scopeFactory.Object, _mockConfig.Object, _mockMux.Object, mockLogger.Object);
+                scopeFactory.Object, _mockConfig.Object, mockLogger.Object);
 
             // Act
             await sut.StartAsync(CancellationToken.None);

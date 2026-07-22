@@ -1,4 +1,4 @@
-import { Injectable } from '@angular/core';
+import { Injectable, OnDestroy } from '@angular/core';
 import { HubConnection, HubConnectionBuilder, HubConnectionState } from '@microsoft/signalr';
 import { environment } from '../../../environments/environment';
 import { BehaviorSubject, Observable, ReplaySubject } from 'rxjs';
@@ -39,7 +39,7 @@ import { BehaviorSubject, Observable, ReplaySubject } from 'rxjs';
 @Injectable({
   providedIn: 'root'
 })
-export class StockService {
+export class StockService implements OnDestroy {
   /** The single SignalR hub connection shared for the whole application session. */
   private hubConnection: HubConnection;
 
@@ -153,6 +153,23 @@ export class StockService {
       // already-resolved start promise, which would otherwise prevent any reconnection (P4-11).
       this.startPromise = null;
       this.startAttempt = 0;
+
+      // P5-4/P6-7 (terminal-reconnect recovery): SignalR's built-in withAutomaticReconnect
+      // schedule is now exhausted and the socket is terminally closed. Previously we only reset
+      // the guard and then WAITED for some external caller (a fresh subscribeToProduct or an app
+      // re-init) to call startConnection() again — but a UI that already subscribed to its
+      // products never re-subscribes, so its low-stock badges froze permanently and never
+      // recovered even once connectivity returned. Proactively begin a FRESH bounded retry cycle
+      // so the connection self-heals with no navigation or user action required. On success
+      // connectWithRetry() performs a full refetch of every tracked product (re-converging state,
+      // not replaying missed frames); if the server is still unreachable it resolves fail-soft and
+      // resets the guard again. This cannot tight-loop: onclose only fires for a socket that WAS
+      // connected, and connectWithRetry()'s own start() failures never raise onclose. Only bother
+      // when something is actually tracked — with nothing subscribed there is no badge to keep live
+      // (a later subscribeToProduct will start the connection on demand).
+      if (this.trackedProductIds.size > 0) {
+        this.startConnection();
+      }
     });
 
     // On reconnect, re-invoke SubscribeToProduct for EVERY tracked product: a full
@@ -163,6 +180,40 @@ export class StockService {
       this.connectionStateSubject.next(HubConnectionState.Connected);
       return this.refetchAllTrackedStock();
     });
+
+    // P5-4/P6-7 (terminal-reconnect recovery): also self-heal when the browser regains network
+    // connectivity. If an outage lasted long enough to exhaust BOTH SignalR's automatic-reconnect
+    // schedule and the onclose-triggered retry cycle above, the socket is left disconnected until
+    // something restarts it. The browser 'online' event is exactly that signal, so re-initiate the
+    // connection when it fires. Guarded with typeof checks so it is a safe no-op under server-side
+    // rendering and the Node/Karma test host where `window` may be absent.
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('online', this.handleOnline);
+    }
+  }
+
+  /**
+   * Browser `online` handler (P5-4/P6-7). Bound as an arrow property so the SAME reference is
+   * used to add and later remove the listener. Re-initiates the hub connection when connectivity
+   * returns, but only if the socket is not already live — `startConnection()` is idempotent and
+   * its success path performs a full refetch of every tracked product, so a spurious `online`
+   * event while already connected is a harmless no-op.
+   */
+  private handleOnline = (): void => {
+    if (this.hubConnection.state !== HubConnectionState.Connected) {
+      this.startConnection();
+    }
+  };
+
+  /**
+   * Removes the `online` listener when the root singleton is torn down (application shutdown /
+   * test teardown), so the bound handler cannot outlive the service. Guarded with the same
+   * typeof checks used at registration so it is a safe no-op where `window` is absent.
+   */
+  ngOnDestroy(): void {
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('online', this.handleOnline);
+    }
   }
 
   /** Convenience flag mirroring the underlying hub connection's live state. */

@@ -122,7 +122,11 @@ namespace API.IntegrationTests.Inventory
                 })
                 .Build();
             var scopeFactory = _fixture.Factory.Services.GetRequiredService<IServiceScopeFactory>();
-            var svc = new StockReconciliationService(scopeFactory, config, redis, logger: null);
+            // P7-1: the reconciliation service no longer injects an IConnectionMultiplexer — it delegates all
+            // reclaim/reseed Redis I/O to the sole stock writer (the real InventoryService resolved per-pass
+            // from this scope factory). The `redis` handle above is still used only for the test's own setup
+            // (mirroring the hold via DECR) and to assert convergence below.
+            var svc = new StockReconciliationService(scopeFactory, config, logger: null);
 
             var stopped = false;
             using var cts = new CancellationTokenSource();

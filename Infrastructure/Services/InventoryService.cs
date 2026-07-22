@@ -391,8 +391,6 @@ namespace Infrastructure.Services
 
             foreach (var r in reservations)
             {
-                r.Status = ReservationStatus.Committed;
-
                 // Take the SAME PostgreSQL "SELECT ... FOR UPDATE" row lock used at reservation creation,
                 // on the Products row, BEFORE reading the pool to decrement. OrderService wraps this whole
                 // commit in an explicit transaction over the shared scoped StoreContext, so this lock enlists
@@ -400,6 +398,25 @@ namespace Infrastructure.Services
                 // finalizations for the same product and closes the oversell / lost-update defect where two
                 // finalizations both read the pre-decrement stock and one silently overwrote the other.
                 await AcquireProductRowLockAsync(r.ProductId);
+
+                // P6-1 idempotency guard (CRITICAL): the Active -> Committed transition and the pool decrement
+                // MUST both happen AFTER the row lock is held, never before it. Two concurrent finalizations of
+                // the SAME basket (e.g. a double-submitted checkout) each load this reservation while it is
+                // still Active, then serialize on the product row lock acquired above. Previously the status was
+                // flipped to Committed BEFORE the lock and the reservation was never re-read under it, so the
+                // second finalization decremented the pool a SECOND time for a hold the first had already
+                // committed — driving stock to -1. Re-load the reservation under the lock and skip it when it is
+                // no longer Active: the first finalization already committed it and decremented the pool, so
+                // this pass must be a no-op for that line. Guarded by SupportsRowLocking() so the non-relational
+                // EF InMemory provider (single-threaded unit tests) skips the reload and keeps the original
+                // straight-line "set Committed then decrement" behavior unchanged.
+                if (SupportsRowLocking())
+                {
+                    await _context.Entry(r).ReloadAsync();
+                    if (r.Status != ReservationStatus.Active) continue;
+                }
+
+                r.Status = ReservationStatus.Committed;
 
                 if (r.FlashSaleId == null)
                 {
@@ -477,7 +494,10 @@ namespace Infrastructure.Services
                 await _database.KeyDeleteAsync(HoldKey(basketId, productId));
                 await PublishStockAsync(productId, currentStock, flashSaleId);
             }
-            catch (RedisConnectionException ex) { LogRedisDegraded(ex, "ReleaseReservation", productId, basketId); }
+            // P6-6: RedisException base covers connection + server faults (e.g. a malformed counter); the
+            // separate RedisTimeoutException catch is required because it derives from System.TimeoutException,
+            // NOT RedisException. Both degrade fail-closed — PostgreSQL/reconciliation remain authoritative.
+            catch (RedisException ex) { LogRedisDegraded(ex, "ReleaseReservation", productId, basketId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "ReleaseReservation", productId, basketId); }
         }
 
@@ -509,8 +529,90 @@ namespace Infrastructure.Services
                     await _database.KeyDeleteAsync(HoldKey(basketId, productId));
                     await PublishStockAsync(productId, currentStock, group.Key.FlashSaleId);
                 }
-                catch (RedisConnectionException ex) { LogRedisDegraded(ex, "ReleaseAllReservations", productId, basketId); }
+                // P6-6: RedisException base covers connection + server faults; RedisTimeoutException is caught
+                // separately because it derives from System.TimeoutException, NOT RedisException. Both degrade
+                // fail-closed — PostgreSQL/reconciliation remain authoritative.
+                catch (RedisException ex) { LogRedisDegraded(ex, "ReleaseAllReservations", productId, basketId); }
                 catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "ReleaseAllReservations", productId, basketId); }
+            }
+        }
+
+        // ---------- reclaim (SOLE-WRITER expiry seam — orchestrated by StockReconciliationService) ----------
+        // Reclaim every Active reservation whose hold window has elapsed (ExpiresAt < now): transition it
+        // Active -> Expired, return its held quantity to the Redis counter (INCR), delete its now-defunct hold
+        // key, and publish the corrected stock; then persist the transitions. Because PostgreSQL has no native
+        // row TTL, this method is the SOLE enforcer of reservation expiry — the reconciliation background loop
+        // merely invokes it (it no longer writes the Reservations table or the Redis stock keys directly), so
+        // InventoryService remains the only writer of the Reservations table and the stock:* / reservation:*
+        // keys (the AAP sole-writer invariant, §0.1.2 / §0.7).
+        //
+        // The DB reclaim (the authority) is committed first and always proceeds; every Redis touch is
+        // best-effort / fail-closed so a Redis outage during a pass never aborts the reclaim — the
+        // authoritative counter reseed in SeedStockCountersAsync (invoked by the same reconciliation pass)
+        // converges Redis regardless.
+        public async Task ReclaimExpiredReservationsAsync()
+        {
+            var now = DateTimeOffset.UtcNow;
+
+            // (a) Authoritatively reclaim Active-but-expired holds. Semantics match
+            // ExpiredReservationsSpecification(now); expressed as direct LINQ so no API.Specifications
+            // dependency leaks into the Infrastructure layer.
+            var expired = await _context.Set<Reservation>()
+                .Where(r => r.Status == ReservationStatus.Active && r.ExpiresAt < now)
+                .ToListAsync();
+
+            if (expired.Count > 0)
+            {
+                // Persist the Expired transitions FIRST: this is the durable record of expiry and must succeed
+                // independently of Redis availability.
+                foreach (var r in expired) r.Status = ReservationStatus.Expired;
+                await _context.SaveChangesAsync();
+
+                // Return the held quantity to each product's counter and publish the corrected value so
+                // subscribed clients see stock come back promptly. Grouped per (product, bound pool) to match
+                // the per-product Redis key layout (stock:product:{id}); best-effort / fail-closed on Redis.
+                foreach (var group in expired.GroupBy(r => new { r.ProductId, r.FlashSaleId }))
+                {
+                    var productId = group.Key.ProductId;
+                    var released = group.Sum(r => r.Quantity);
+                    try
+                    {
+                        var currentStock = await _database.StringIncrementAsync(StockKey(productId), released);
+                        currentStock = await RepairCounterIfNegativeAsync(productId, currentStock);
+                        await PublishStockAsync(productId, currentStock, group.Key.FlashSaleId);
+                    }
+                    // RedisException base covers connection + server faults; RedisTimeoutException derives from
+                    // System.TimeoutException (NOT RedisException) so it needs its own sibling catch. Both are
+                    // fail-closed — the DB status transition above is already committed.
+                    catch (RedisException ex) { LogRedisDegraded(ex, "ReclaimExpired", productId); }
+                    catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "ReclaimExpired", productId); }
+
+                    // The reservation no longer holds stock, so its Redis hold key is defunct. Its native TTL
+                    // has almost certainly already elapsed (the TTL matched ExpiresAt, now in the past), but
+                    // delete it explicitly for determinism — idempotent and best-effort.
+                    foreach (var r in group)
+                    {
+                        await TryDeleteHoldKeyAsync(r.BasketId, productId);
+                    }
+                }
+            }
+
+            // (b) P6-5: converge Redis by removing STALE hold keys left behind for reservations that are no
+            // longer Active but whose original hold window has NOT yet elapsed (ExpiresAt > now) — so their
+            // Redis TTL would otherwise keep the defunct `reservation:{basketId}:{productId}` key alive until it
+            // self-expires. A hold key is normally deleted the moment its reservation leaves Active (commit ->
+            // FinalizeCommittedHoldsAsync; release -> ReleaseReservationAsync), but a Redis outage at that
+            // instant skips the best-effort delete and orphans the key. Reconciliation reaps those residual
+            // holds here. Bounded to the live-TTL window (ExpiresAt > now); older keys have already self-expired.
+            var staleHoldOwners = await _context.Set<Reservation>()
+                .Where(r => r.Status != ReservationStatus.Active && r.ExpiresAt > now)
+                .Select(r => new { r.BasketId, r.ProductId })
+                .Distinct()
+                .ToListAsync();
+
+            foreach (var owner in staleHoldOwners)
+            {
+                await TryDeleteHoldKeyAsync(owner.BasketId, owner.ProductId);
             }
         }
 
@@ -523,7 +625,12 @@ namespace Infrastructure.Services
                 if (val.HasValue && int.TryParse(val, out var cached))
                     return cached < 0 ? 0 : cached;
             }
-            catch (RedisConnectionException ex) { LogRedisDegraded(ex, "GetAvailableStock", productId); }
+            // P6-6: catch the RedisException base (covers RedisConnectionException AND RedisServerException —
+            // e.g. a malformed/non-integer counter) so a server-side fault degrades fail-closed to the
+            // authoritative PostgreSQL read below instead of surfacing as an unhandled 500. RedisTimeoutException
+            // is caught SEPARATELY because it derives from System.TimeoutException, NOT RedisException, so the
+            // base catch alone would let a timeout escape.
+            catch (RedisException ex) { LogRedisDegraded(ex, "GetAvailableStock", productId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "GetAvailableStock", productId); }
 
             // fail-closed fallback: authoritative committed PostgreSQL state
@@ -596,7 +703,10 @@ namespace Infrastructure.Services
                     await _database.StringSetAsync(StockKey(product.Id), available);
                     await PublishStockAsync(product.Id, available, flashSaleId);
                 }
-                catch (RedisConnectionException ex) { LogRedisDegraded(ex, "SeedStockCounters", product.Id); }
+                // P6-6: RedisException base covers connection + server faults; RedisTimeoutException is caught
+                // separately (it derives from System.TimeoutException, NOT RedisException). Both fail-closed —
+                // a counter that cannot be seeded now is re-converged on the next reconciliation pass.
+                catch (RedisException ex) { LogRedisDegraded(ex, "SeedStockCounters", product.Id); }
                 catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "SeedStockCounters", product.Id); }
             }
         }
@@ -648,6 +758,36 @@ namespace Infrastructure.Services
             return available;
         }
 
+        /// <summary>
+        /// P6-6 server-fault self-heal for the hot-path stock counter. Distinct from
+        /// <see cref="RepairCounterIfNegativeAsync"/> (which repairs a NEGATIVE value observed AFTER a
+        /// successful mutation): this repairs a counter that is CORRUPT — e.g. it holds a non-integer value, so
+        /// the atomic DECR/INCR itself raises <see cref="RedisServerException"/> and never returns a value to
+        /// inspect. Overwrite the key with the authoritative committed value computed from PostgreSQL (pool
+        /// capacity minus the sum of Active reservations, already inclusive of the reservation just persisted in
+        /// the surrounding row-locked transaction) via an idempotent SET, healing the malformed counter in
+        /// place, and publish the corrected value so subscribed clients converge immediately.
+        ///
+        /// Invoked ONLY from the RedisException branch of the counter-mutating Redis helpers, where Redis is
+        /// reachable (the fault was server-side, not a connectivity outage), so the SET is expected to succeed.
+        /// It is nonetheless wrapped fail-closed: a further Redis fault during the repair is swallowed under the
+        /// same contract as the mutation it follows — PostgreSQL and its SELECT ... FOR UPDATE row lock remain
+        /// the SOLE authority on whether stock is available, so a still-broken mirror never widens oversell.
+        /// </summary>
+        private async Task TryReseedCounterFromDbAsync(int productId, int? flashSaleId)
+        {
+            try
+            {
+                var (available, _) = await ComputeAvailableFromDbAsync(productId);
+                await _database.StringSetAsync(StockKey(productId), available);
+                await PublishStockAsync(productId, available, flashSaleId);
+            }
+            catch (RedisException) { /* still faulting — PostgreSQL + the row lock remain authoritative */ }
+            // RedisTimeoutException derives from System.TimeoutException (not RedisException); swallow it too so
+            // a timeout during the self-heal never escapes the enclosing catch handler that invoked this method.
+            catch (RedisTimeoutException) { /* still faulting — PostgreSQL + the row lock remain authoritative */ }
+        }
+
         private async Task TryReserveRedisAsync(string basketId, int productId, int quantity, TimeSpan ttl, int? flashSaleId)
         {
             try
@@ -657,8 +797,23 @@ namespace Infrastructure.Services
                 currentStock = await RepairCounterIfNegativeAsync(productId, currentStock);
                 await PublishStockAsync(productId, currentStock, flashSaleId);
             }
+            // A pure connectivity/timeout outage: log only. Reseeding is futile because the very next Redis
+            // write would fault again; the reconciliation reseed converges the counter once Redis recovers.
             catch (RedisConnectionException ex) { LogRedisDegraded(ex, "ReserveRedis", productId, basketId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "ReserveRedis", productId, basketId); }
+            // P6-6 (primary root cause): a SERVER-side Redis fault — most importantly a non-integer
+            // `stock:product:{id}` counter, which makes StringDecrementAsync raise RedisServerException —
+            // previously escaped the two catches above and surfaced as an HTTP 500 AFTER the reservation was
+            // already durably committed to PostgreSQL (CreateReservationAsync commits the DB transaction before
+            // this best-effort Redis mirror step). Catch the RedisException base so any server-side fault is
+            // fail-closed, then self-heal the malformed counter by reseeding it from the authoritative
+            // committed PostgreSQL value (Redis is reachable in this branch, so the SET succeeds and the
+            // counter stops reporting garbage). The reservation stands regardless — the row lock is authority.
+            catch (RedisException ex)
+            {
+                LogRedisDegraded(ex, "ReserveRedis", productId, basketId);
+                await TryReseedCounterFromDbAsync(productId, flashSaleId);
+            }
         }
 
         private async Task TryAdjustReserveRedisAsync(string basketId, int productId, int heldQuantity, int delta, TimeSpan ttl, int? flashSaleId)
@@ -679,21 +834,36 @@ namespace Infrastructure.Services
                 currentStock = await RepairCounterIfNegativeAsync(productId, currentStock);
                 await PublishStockAsync(productId, currentStock, flashSaleId);
             }
+            // Pure connectivity/timeout outage: log only (reseeding would fault again).
             catch (RedisConnectionException ex) { LogRedisDegraded(ex, "AdjustReserveRedis", productId, basketId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "AdjustReserveRedis", productId, basketId); }
+            // P6-6: a server-side Redis fault (e.g. a non-integer counter making DECR/INCR raise
+            // RedisServerException) is fail-closed here and self-heals the malformed counter from committed
+            // PostgreSQL truth, exactly as on the create path.
+            catch (RedisException ex)
+            {
+                LogRedisDegraded(ex, "AdjustReserveRedis", productId, basketId);
+                await TryReseedCounterFromDbAsync(productId, flashSaleId);
+            }
         }
 
         private async Task TrySetHoldTtlAsync(string basketId, int productId, TimeSpan ttl)
         {
             try { if (ttl > TimeSpan.Zero) await _database.KeyExpireAsync(HoldKey(basketId, productId), ttl); }
-            catch (RedisConnectionException ex) { LogRedisDegraded(ex, "SetHoldTtl", productId, basketId); }
+            // P6-6: RedisException base covers connection + server faults; RedisTimeoutException is caught
+            // separately (it derives from System.TimeoutException, NOT RedisException). Both fail-closed — the
+            // hold key's absence only forgoes an optimization; reconciliation remains the expiry authority.
+            catch (RedisException ex) { LogRedisDegraded(ex, "SetHoldTtl", productId, basketId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "SetHoldTtl", productId, basketId); }
         }
 
         private async Task TryDeleteHoldKeyAsync(string basketId, int productId)
         {
             try { await _database.KeyDeleteAsync(HoldKey(basketId, productId)); }
-            catch (RedisConnectionException ex) { LogRedisDegraded(ex, "DeleteHoldKey", productId, basketId); }
+            // P6-6: RedisException base covers connection + server faults; RedisTimeoutException is caught
+            // separately (it derives from System.TimeoutException, NOT RedisException). Both fail-closed — a
+            // stale hold key is harmless and is swept on the next reconciliation pass.
+            catch (RedisException ex) { LogRedisDegraded(ex, "DeleteHoldKey", productId, basketId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "DeleteHoldKey", productId, basketId); }
         }
 
@@ -706,7 +876,10 @@ namespace Infrastructure.Services
                     new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
                 await _subscriber.PublishAsync(StockUpdatesChannel, payload);
             }
-            catch (RedisConnectionException ex) { LogRedisDegraded(ex, "PublishStock", productId); }
+            // P6-6: RedisException base covers connection + server faults; RedisTimeoutException is caught
+            // separately (it derives from System.TimeoutException, NOT RedisException). Both fail-closed — a
+            // dropped publish only delays a UI badge until the next mutation or reconciliation republish.
+            catch (RedisException ex) { LogRedisDegraded(ex, "PublishStock", productId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "PublishStock", productId); }
         }
     }

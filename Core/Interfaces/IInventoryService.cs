@@ -50,5 +50,18 @@ namespace Core.Interfaces
         // Seed the Redis stock counters (stock:product:{id}) from committed PostgreSQL stock.
         // Invoked at startup (API/Program.cs) and re-invoked after each reconciliation pass.
         Task SeedStockCountersAsync();
+
+        // Reclaim Active reservations whose hold window has elapsed (ExpiresAt < now): transition each
+        // Active -> Expired, return the held quantity to the Redis counter (INCR), and publish the corrected
+        // stock, then persist the transitions. Also opportunistically deletes any residual Redis hold keys
+        // left behind for non-Active reservations still inside their TTL window (a hold-key deletion that a
+        // prior Redis outage may have skipped), converging Redis with committed PostgreSQL state.
+        //
+        // This is the SOLE-WRITER seam for reservation expiry: PostgreSQL has no native row TTL, so expiry is
+        // enforced exclusively here. The StockReconciliationService background loop ORCHESTRATES by invoking
+        // this method (it no longer mutates the Reservations table or the Redis stock keys itself), preserving
+        // the invariant that InventoryService is the only component that writes reservations and stock keys.
+        // Best-effort / fail-closed on a Redis outage: the DB reclaim (the authority) always proceeds.
+        Task ReclaimExpiredReservationsAsync();
     }
 }

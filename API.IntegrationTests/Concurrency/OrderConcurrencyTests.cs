@@ -239,7 +239,17 @@ namespace API.IntegrationTests.Concurrency
 
             var (productId, _) = await GetSeededProductAsync();
 
-            await SeedBasketAsync(BuildBasketDto(basketId, paymentIntentId, productId, clientPrice: 1m, quantity: 2));
+            // P8-3: the basket reserves this quantity; the two concurrent finalizations must commit that
+            // single hold EXACTLY ONCE (P6-1 idempotent commit), so the committed pool falls by exactly
+            // this amount — never twice.
+            const int reservedQuantity = 2;
+            await SeedBasketAsync(BuildBasketDto(basketId, paymentIntentId, productId, clientPrice: 1m, quantity: reservedQuantity));
+
+            // Capture the committed pool AFTER the basket reserve but BEFORE any order finalizes. The reserve
+            // path deliberately does NOT touch Products.StockQuantity (it mutates only the Redis counter and
+            // inserts the reservation row); the permanent pool decrement happens at commit. So this is the
+            // authoritative pre-commit baseline the decrement oracle below is measured against.
+            var stockBeforeCommit = await GetProductStockAsync(productId);
 
             var orderDto = BuildOrderDto(basketId);
 
@@ -285,6 +295,32 @@ namespace API.IntegrationTests.Concurrency
                 count.Should().BeInRange(1, ConcurrentSubmissionCount,
                     "under true concurrency without a production unique/transactional guard the stale-order " +
                     "path yields 1 or 2 orders; exactly-one is proven only for the sequential path");
+
+                // P8-3 stock-integrity oracle (proves the P6-1 idempotent-commit fix). Independent of how
+                // many ORDER rows the tolerated TOCTOU produced (1 or 2), the basket's single stock hold must
+                // be committed EXACTLY ONCE. Both submissions run CommitReservationAsync over the same basket,
+                // but each takes the same PostgreSQL "SELECT ... FOR UPDATE" lock on the product row and, once
+                // it holds the lock, re-reads the reservation: the first finalization flips it Active ->
+                // Committed and decrements the pool; the second sees it already Committed and SKIPS the
+                // decrement. The committed pool must therefore fall by EXACTLY the reserved quantity.
+                var stockAfterCommit = await GetProductStockAsync(productId);
+
+                // Decremented by exactly the reserved quantity — NOT twice. The pre-fix double-decrement bug
+                // (both finalizations decrementing) would leave stockBeforeCommit - 2*reservedQuantity here.
+                stockAfterCommit.Should().Be(stockBeforeCommit - reservedQuantity,
+                    "the concurrently double-submitted order must commit the basket's single reservation once " +
+                    "and decrement the committed pool by exactly the reserved quantity (P6-1 idempotent commit)");
+
+                // The row-locked, once-only commit must never drive the authoritative pool negative.
+                stockAfterCommit.Should().BeGreaterOrEqualTo(0,
+                    "the row-locked commit must never oversell the committed pool into negative stock");
+
+                // The basket's single line reservation ends in EXACTLY ONE Committed row with NO Active row
+                // remaining: committed once (not left Active, not committed twice, not duplicated).
+                (await CountReservationsByStatusAsync(basketId, ReservationStatus.Committed)).Should().Be(1,
+                    "the single basket-line reservation must be committed exactly once under concurrency");
+                (await CountReservationsByStatusAsync(basketId, ReservationStatus.Active)).Should().Be(0,
+                    "no Active hold may remain for the basket after its order(s) finalized");
             }
             finally
             {
@@ -294,9 +330,11 @@ namespace API.IntegrationTests.Concurrency
                     response.Dispose();
                 }
 
-                // MJ-04 deterministic cleanup: remove every order persisted for this payment intent and the
-                // basket key this test wrote, restoring this class's own infrastructure between its tests.
+                // MJ-04 deterministic cleanup: remove every order persisted for this payment intent, the
+                // basket's reservation rows, and the basket key this test wrote, restoring this class's own
+                // infrastructure between its tests.
                 await CleanupOrdersByPaymentIntentIdAsync(paymentIntentId);
+                await CleanupReservationsByBasketAsync(basketId);
                 await CleanupBasketAsync(basketId);
             }
         }
@@ -445,6 +483,41 @@ namespace API.IntegrationTests.Concurrency
         }
 
         /// <summary>
+        /// Reads the authoritative committed-pool stock (<c>Products.StockQuantity</c>) for
+        /// <paramref name="productId"/> through a FRESH no-tracking <see cref="StoreContext"/> scope, so the
+        /// value reflects committed database state with no stale change-tracking. This is the pool the
+        /// order-finalization commit permanently decrements (P8-3 stock-integrity oracle).
+        /// </summary>
+        /// <param name="productId">The seeded product whose committed pool to read.</param>
+        /// <returns>The current persisted <c>StockQuantity</c> for that product.</returns>
+        private async Task<int> GetProductStockAsync(int productId)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
+
+            return await ctx.Products.AsNoTracking().Where(p => p.Id == productId)
+                .Select(p => p.StockQuantity).SingleAsync();
+        }
+
+        /// <summary>
+        /// Counts the reservation rows for <paramref name="basketId"/> in a given
+        /// <paramref name="status"/>, through a FRESH no-tracking <see cref="StoreContext"/> scope. Used by
+        /// the P8-3 oracle to prove the basket's single hold is committed EXACTLY ONCE under concurrency
+        /// (exactly one <c>Committed</c> row, no lingering <c>Active</c> row).
+        /// </summary>
+        /// <param name="basketId">The basket whose reservation rows to count.</param>
+        /// <param name="status">The reservation status to match.</param>
+        /// <returns>The number of reservation rows for that basket in that status.</returns>
+        private async Task<int> CountReservationsByStatusAsync(string basketId, ReservationStatus status)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
+
+            return await ctx.Reservations.AsNoTracking()
+                .CountAsync(r => r.BasketId == basketId && r.Status == status);
+        }
+
+        /// <summary>
         /// MJ-04 deterministic cleanup: removes every order whose <c>PaymentId</c> equals
         /// <paramref name="paymentIntentId"/> (and, via the <c>onDelete: Cascade</c>
         /// <c>FK_OrderItems_Orders_OrderId</c> constraint, their order items) through a fresh scope, so this
@@ -464,6 +537,27 @@ namespace API.IntegrationTests.Concurrency
             }
 
             ctx.Orders.RemoveRange(orders);
+            await ctx.SaveChangesAsync();
+        }
+
+        /// <summary>
+        /// MJ-04 deterministic cleanup: removes every reservation row this test's basket created (the
+        /// basket reserve on <c>POST api/basket</c> inserts one), through a fresh scope, so no reservation
+        /// lingers in this class's shared database between its sequentially-run tests.
+        /// </summary>
+        /// <param name="basketId">The basket whose reservation rows should be removed.</param>
+        private async Task CleanupReservationsByBasketAsync(string basketId)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var ctx = scope.ServiceProvider.GetRequiredService<StoreContext>();
+
+            var reservations = await ctx.Reservations.Where(r => r.BasketId == basketId).ToListAsync();
+            if (reservations.Count == 0)
+            {
+                return;
+            }
+
+            ctx.Reservations.RemoveRange(reservations);
             await ctx.SaveChangesAsync();
         }
 

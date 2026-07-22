@@ -1106,5 +1106,101 @@ namespace Infrastructure.Tests.Services
             doc.RootElement.GetProperty("currentStock").GetInt64().Should().Be(8);
         }
 
+        // 20. (P7-1) ReclaimExpiredReservationsAsync — the SOLE-WRITER expiry seam that
+        // StockReconciliationService now delegates to. An Active hold whose window has elapsed transitions
+        // Active -> Expired, its held quantity is returned to the Redis counter (INCR), and the corrected
+        // stock is published; the transition is persisted to PostgreSQL. (This behavior moved here from the
+        // reconciliation tests when the reclaim writes were relocated behind the sole writer.)
+        [Fact]
+        public async Task ReclaimExpiredReservationsAsync_WhenActiveHoldExpired_MarksExpiredIncrementsCounterAndPublishes()
+        {
+            // Arrange: an Active hold whose ExpiresAt is already in the past.
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+            var reservations = await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 3, status: ReservationStatus.Active,
+                basketId: "basket-expired", flashSaleId: null,
+                expiresAt: DateTimeOffset.UtcNow.AddMinutes(-1));
+
+            // Act
+            await _sut.ReclaimExpiredReservationsAsync();
+
+            // Assert — reclaimed in PostgreSQL...
+            var reclaimed = await _context.Reservations.FindAsync(reservations[0].Id);
+            reclaimed.Status.Should().Be(ReservationStatus.Expired);
+
+            // ...held quantity (3) returned to the counter and the corrected stock published.
+            _mockDb.Verify(d => d.StringIncrementAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{productId}"), 3, It.IsAny<CommandFlags>()),
+                Times.Once);
+            _mockSub.Verify(s => s.PublishAsync(
+                It.Is<RedisChannel>(c => c == "stock-updates"), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
+                Times.AtLeastOnce);
+        }
+
+        // 21. (P7-1) ReclaimExpiredReservationsAsync leaves a still-valid Active hold (ExpiresAt in the
+        // future) untouched: no status change and no counter INCR for that product. (Migrated here from the
+        // reconciliation tests alongside the reclaim logic.)
+        [Fact]
+        public async Task ReclaimExpiredReservationsAsync_WhenActiveHoldNotExpired_LeavesReservationActiveAndCounterUnchanged()
+        {
+            // Arrange: an Active hold that has NOT yet expired.
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+            var reservations = await TestStoreContextFactory.SeedReservationsAsync(
+                _context, productId, quantity: 3, status: ReservationStatus.Active,
+                basketId: "basket-live", flashSaleId: null,
+                expiresAt: DateTimeOffset.UtcNow.AddMinutes(10));
+
+            // Act
+            await _sut.ReclaimExpiredReservationsAsync();
+
+            // Assert — still Active, and no reclaim INCR happened for this product.
+            var untouched = await _context.Reservations.FindAsync(reservations[0].Id);
+            untouched.Status.Should().Be(ReservationStatus.Active);
+            _mockDb.Verify(d => d.StringIncrementAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{productId}"), It.IsAny<long>(), It.IsAny<CommandFlags>()),
+                Times.Never);
+        }
+
+        // 22. P6-6 (MAJOR, fail-closed): a SERVER-side Redis fault on the counter mutation. The canonical case
+        // is a non-integer `stock:product:{id}` value, which makes StringDecrementAsync raise
+        // RedisServerException — a RedisException that is NEITHER a connection NOR a timeout error. Before the
+        // fix only RedisConnectionException/RedisTimeoutException were caught, so this escaped and surfaced as
+        // an HTTP 500 AFTER the reservation had already been durably committed to PostgreSQL. The reservation
+        // must still succeed (the row lock, not the counter, is the authority) AND the malformed counter must
+        // be self-healed by an idempotent SET to the DB-authoritative available value.
+        [Fact]
+        public async Task CreateReservationAsync_WhenRedisDecrementRaisesServerError_StillReservesAndReseedsCounter()
+        {
+            // Arrange: 10 in stock; the counter DECR faults with a server-side error (malformed counter).
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+            _mockDb.Setup(d => d.StringDecrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ThrowsAsync(new RedisServerException("ERR value is not an integer or out of range"));
+
+            // Act — reserve 2 of 10; the DB reservation commits first, then the Redis mirror DECR faults.
+            Func<Task> act = async () => await _sut.CreateReservationAsync("basket-servererr", productId, 2);
+
+            // Assert — NO exception escapes (fail-closed): a server-side Redis fault must not become a 500.
+            await act.Should().NotThrowAsync();
+
+            // The reservation was granted and persisted (the row lock is the authority, not the counter).
+            var reservation = await _context.Reservations
+                .FirstOrDefaultAsync(r => r.BasketId == "basket-servererr");
+            reservation.Should().NotBeNull();
+            reservation.Status.Should().Be(ReservationStatus.Active);
+            reservation.Quantity.Should().Be(2);
+
+            // The malformed counter was self-healed: an idempotent SET wrote the DB-authoritative available
+            // (capacity 10 - the 2 just reserved = 8), so the counter stops reporting garbage. This is the
+            // distinct-from-negative repair path (the DECR never returned a value to inspect; it threw).
+            _mockDb.Verify(d => d.StringSetAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{productId}"),
+                It.Is<RedisValue>(v => (long)v == 8),
+                It.IsAny<TimeSpan?>(), It.IsAny<When>(), It.IsAny<CommandFlags>()),
+                Times.Once);
+        }
+
     }
 }

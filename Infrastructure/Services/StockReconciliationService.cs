@@ -1,17 +1,11 @@
 using System;
-using System.Linq;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Core.Entities;
 using Core.Interfaces;
-using Infrastructure.Data;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using StackExchange.Redis;
 
 namespace Infrastructure.Services
 {
@@ -37,34 +31,31 @@ namespace Infrastructure.Services
     //
     // Lifetime & DI: this type is registered in the API layer via AddHostedService<T>(), which makes
     // it a SINGLETON. It must therefore NOT constructor-inject the scoped services it needs
-    // (StoreContext, IInventoryService, IFlashSaleService) directly — doing so would either fail
-    // validation (captive dependency) or reuse a disposed context. Instead it injects the
-    // singleton-safe IServiceScopeFactory and opens a fresh DI scope per pass, resolving the scoped
-    // services from that scope. IConfiguration, IConnectionMultiplexer and ILogger are all
-    // singleton-safe and injected directly.
+    // (IInventoryService, IFlashSaleService) directly — doing so would either fail validation (captive
+    // dependency) or reuse a disposed context. Instead it injects the singleton-safe IServiceScopeFactory
+    // and opens a fresh DI scope per pass, resolving the scoped services from that scope. IConfiguration
+    // and ILogger are singleton-safe and injected directly. No IConnectionMultiplexer is injected — this
+    // service performs NO direct Redis I/O (see the sole-writer note below).
     //
-    // Sole-writer note (documented, deliberate): IInventoryService is the primary sole writer of the
-    // Reservations table and the Redis stock keys. However, IInventoryService exposes no reclaim
-    // method, and the feature specification explicitly assigns reclaim (set Expired) + INCR + publish +
-    // reseed to THIS service. The reclaim DB write is performed directly on this service's per-pass
-    // scoped StoreContext; the per-reclaim INCR + publish provides immediate client feedback; and the
-    // AUTHORITATIVE Redis reconvergence is delegated to IInventoryService.SeedStockCountersAsync(),
-    // which supersedes the transient INCR and brings Redis into agreement with PostgreSQL.
+    // Sole-writer note (P7-1): IInventoryService is THE sole writer of the Reservations table and the
+    // Redis stock keys — reservation expiry included. This service ORCHESTRATES the periodic pass but no
+    // longer mutates reservations or stock keys itself: it delegates the whole reclaim (Active -> Expired,
+    // return held stock to the counters, publish, and residual hold-key cleanup) to
+    // IInventoryService.ReclaimExpiredReservationsAsync(), and the authoritative counter reconvergence to
+    // IInventoryService.SeedStockCountersAsync(). Previously this service set r.Status = Expired, called
+    // StringIncrementAsync, and published to "stock-updates" DIRECTLY on its own scoped context and an
+    // injected multiplexer, which violated that invariant; delegating restores it.
     //
-    // Resilience: PostgreSQL is the source of truth. Every Redis call is wrapped fail-closed
-    // (RedisConnectionException / RedisTimeoutException are swallowed) so a Redis outage never prevents
-    // the pass from persisting the Expired transitions and advancing flash-sale statuses in PostgreSQL.
+    // Resilience: PostgreSQL is the source of truth. The delegated reclaim and reseed are best-effort /
+    // fail-closed on Redis internally (any RedisException is swallowed inside InventoryService), so a
+    // Redis outage never prevents a pass from persisting the Expired transitions and advancing flash-sale
+    // statuses in PostgreSQL. A failing pass is caught in ExecuteAsync and the loop keeps running.
     //
-    // Provider compatibility: the pass uses only LINQ + SaveChangesAsync with no raw SQL and no
-    // explicit transaction, so it behaves identically on PostgreSQL (Npgsql), SQLite, and the EF Core
-    // in-memory provider used by the test suite.
+    // Provider compatibility: the delegated operations use only LINQ + SaveChangesAsync with no raw SQL
+    // and no explicit transaction, so a pass behaves identically on PostgreSQL (Npgsql), SQLite, and the
+    // EF Core in-memory provider used by the test suite.
     public class StockReconciliationService : BackgroundService
     {
-        // Verbatim Redis Pub/Sub channel name shared with InventoryService and the API-layer broadcast
-        // bridge. Every stock mutation (including a reclaim) is published here as
-        // { productId, currentStock, flashSaleId } in camelCase.
-        private const string StockUpdatesChannel = "stock-updates";
-
         // Default cadence (seconds) used when the Inventory:ReconciliationIntervalSeconds configuration
         // key is absent or cannot be parsed.
         private const int DefaultReconciliationIntervalSeconds = 30;
@@ -86,20 +77,22 @@ namespace Infrastructure.Services
 
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly IConfiguration _config;
-        private readonly IConnectionMultiplexer _redis;
         private readonly ILogger<StockReconciliationService> _logger;
 
         // The ILogger is optional (defaulted to null) so the service can be constructed directly in
         // unit tests with a mocked IServiceScopeFactory and a short interval, without wiring a logger.
+        //
+        // No IConnectionMultiplexer is injected: after P7-1 this service performs NO direct Redis I/O. All
+        // Redis mutation (the reclaim INCR + publish, and the authoritative counter reseed) is delegated to
+        // IInventoryService, resolved per-pass from the scope factory. This keeps InventoryService the sole
+        // writer of the Redis stock keys and removes this service's former direct dependency on the client.
         public StockReconciliationService(
             IServiceScopeFactory scopeFactory,
             IConfiguration config,
-            IConnectionMultiplexer redis,
             ILogger<StockReconciliationService> logger = null)
         {
             _scopeFactory = scopeFactory;
             _config = config;
-            _redis = redis;
             _logger = logger;
         }
 
@@ -181,80 +174,37 @@ namespace Infrastructure.Services
             }
         }
 
-        // Executes exactly one reconciliation pass inside its own DI scope. Steps:
-        //   (a) reclaim Active reservations past ExpiresAt -> Expired, with best-effort INCR + publish;
-        //   (b) persist the reclaimed status transitions to PostgreSQL;
-        //   (c) advance flash-sale statuses by time (Scheduled -> Active -> Ended);
-        //   (d) authoritatively reseed the Redis counters from committed PostgreSQL stock + republish.
+        // Executes exactly one reconciliation pass inside its own DI scope. This service ORCHESTRATES; it
+        // does NOT itself write the Reservations table or the Redis stock keys (P7-1). Steps:
+        //   (a)+(b) reclaim expired reservations (Active -> Expired) + return held stock to the counters +
+        //           persist — delegated to IInventoryService.ReclaimExpiredReservationsAsync(), the SOLE
+        //           writer of the Reservations table and the Redis stock keys;
+        //   (c)     advance flash-sale statuses by time (Scheduled -> Active -> Ended);
+        //   (d)     authoritatively reseed the Redis counters from committed PostgreSQL stock + republish.
         private async Task ReconcileOnceAsync(CancellationToken ct)
         {
             using var scope = _scopeFactory.CreateScope();
-            var context = scope.ServiceProvider.GetRequiredService<StoreContext>();
             var inventoryService = scope.ServiceProvider.GetRequiredService<IInventoryService>();
             var flashSaleService = scope.ServiceProvider.GetRequiredService<IFlashSaleService>();
 
-            var now = DateTimeOffset.UtcNow;
+            // (a)+(b) Reclaim Active reservations whose hold window has elapsed. The ENTIRE reclaim — the
+            // Active -> Expired transition, the persist, the per-reclaim INCR + publish, and the cleanup of
+            // any residual hold keys — now lives behind the sole stock writer (P7-1). Previously this method
+            // set r.Status = Expired, called StringIncrementAsync, and published to "stock-updates" DIRECTLY
+            // on this service's scoped StoreContext and the injected IConnectionMultiplexer, which violated
+            // the invariant that InventoryService is the ONLY component that writes the Reservations table
+            // and the Redis stock keys (AAP §0.1.2 / §0.7). The reclaim is best-effort / fail-closed
+            // internally, so a Redis outage never prevents the Expired transitions from being persisted to
+            // PostgreSQL (the authority).
+            await inventoryService.ReclaimExpiredReservationsAsync();
 
-            // (a) Reclaim Active reservations whose hold window has elapsed. Semantics are identical to
-            // ExpiredReservationsSpecification(now); expressed as direct LINQ so no API.Specifications
-            // dependency is introduced into the Infrastructure layer.
-            var expired = await context.Set<Reservation>()
-                .Where(r => r.Status == ReservationStatus.Active && r.ExpiresAt < now)
-                .ToListAsync(ct);
-
-            // Resolve the Redis primitives once for the pass. GetDatabase()/GetSubscriber() are cheap
-            // and normally non-throwing, but guard them fail-closed so a Redis outage leaves the DB
-            // reclaim path fully intact (database/subscriber simply remain null).
-            IDatabase database = null;
-            ISubscriber subscriber = null;
-            try
-            {
-                database = _redis.GetDatabase();
-                subscriber = _redis.GetSubscriber();
-            }
-            catch (RedisConnectionException) { }
-            catch (RedisTimeoutException) { }
-
-            foreach (var r in expired)
-            {
-                // Authoritative reclaim: the reservation no longer holds stock.
-                r.Status = ReservationStatus.Expired;
-
-                // Immediate hot-path feedback: return the held quantity to the counter and publish the
-                // corrected value so subscribed clients see stock come back promptly. Best-effort and
-                // fail-closed — a Redis failure here must not abort the DB reclaim; the authoritative
-                // reseed in step (d) will converge the counter regardless.
-                try
-                {
-                    if (database != null)
-                    {
-                        var currentStock = await database.StringIncrementAsync(
-                            $"stock:product:{r.ProductId}", r.Quantity);
-
-                        if (subscriber != null)
-                        {
-                            var payload = JsonSerializer.Serialize(
-                                new { productId = r.ProductId, currentStock, flashSaleId = r.FlashSaleId },
-                                new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
-                            await subscriber.PublishAsync(StockUpdatesChannel, payload);
-                        }
-                    }
-                }
-                catch (RedisConnectionException) { }
-                catch (RedisTimeoutException) { }
-            }
-
-            // (b) Persist the Expired transitions. This is the authoritative record of expiry and must
-            // succeed independently of Redis availability.
-            await context.SaveChangesAsync(ct);
-
-            // (c) Advance flash-sale statuses by time (Scheduled -> Active -> Ended). This runs on the
-            // same scoped context and saves its own changes; it is the only driver of sale transitions.
+            // (c) Advance flash-sale statuses by time (Scheduled -> Active -> Ended). Runs on its own scoped
+            // context and saves its own changes; it is the only driver of sale transitions.
             await flashSaleService.AdvanceFlashSaleStatusesAsync();
 
-            // (d) Authoritative Redis reconvergence via the sole stock writer: StringSet each counter
-            // from committed PostgreSQL stock and republish. This supersedes the transient per-reclaim
-            // INCR above and brings Redis into agreement with PostgreSQL within this interval.
+            // (d) Authoritative Redis reconvergence via the sole stock writer: StringSet each counter from
+            // committed PostgreSQL stock and republish. This brings Redis into agreement with PostgreSQL
+            // within this interval regardless of any transient counter drift during the pass.
             await inventoryService.SeedStockCountersAsync();
         }
     }
