@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;              // Flash-Sale feature (PHASE 8): List<int> for the rate-limit test's reservation-id cleanup.
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -1593,6 +1594,470 @@ namespace API.IntegrationTests.Contract
             ShouldExposeCamelCaseProperties(root, "statusCode", "message");
             root.GetProperty("statusCode").GetInt32().Should().Be(500);
             root.GetProperty("message").GetString().Should().NotBeNullOrWhiteSpace();
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // PHASE 8 — Flash-Sale & Inventory endpoints + backward-compatibility guards (Real-Time Inventory feature)
+        // ---------------------------------------------------------------------------------------------
+        //
+        // These facts lock the wire contract of the four NEW endpoints (POST/GET /api/flash-sales,
+        // POST/DELETE /api/inventory/reserve) and add explicit backward-compatibility guards proving the
+        // /api/products and /api/orders contracts did NOT change (AAP §0.5.2 — in particular that the new
+        // Products.Version concurrency token never leaks into any DTO). Every fact drives the REAL in-process
+        // app over genuine HttpClients against this class's isolated PostgreSQL + Redis (CR-01), asserts status
+        // + serialized JSON shape, awaits every async call, and disposes every response (MD-01). They are added
+        // as the final members of the class; nothing above is modified (strictly additive).
+        //
+        // Contract notes (verified against the committed controllers/DTOs/services — these deviate from the
+        // original skeletons because the committed implementation is authoritative for a contract-regression
+        // suite):
+        //   * A flash sale requires an EXISTING product and a sale price STRICTLY BELOW that product's base
+        //     price (FlashSaleService.ScheduleAsync validates both), and two ACTIVE sales for one product are
+        //     rejected as an overlap (409). Arbitrary product-id literals therefore cannot be used; instead a
+        //     REAL seeded product is discovered and each sale-creating fact uses a DISTINCT product (by a
+        //     stable id-ordered index) so its sale is the only active authority for that product.
+        //   * The reserve endpoint's sessionId MUST be a canonical RFC 4122 v4 UUID
+        //     ([Required]+[StringLength(36,36)]+[CanonicalUuidV4]); Guid.NewGuid().ToString() satisfies this
+        //     exactly, so every reserve fact uses a FRESH Guid per session (isolating the process-static,
+        //     session-keyed rate limiter). The rate-limit fact uses ONE dedicated Guid and fires exactly 11.
+        //   * DELETE /api/inventory/reserve/{id} requires the owning ?sessionId and returns 204 No Content on
+        //     success (not 200); a missing id (with a valid sessionId) returns a 404 ApiResponse.
+
+        /// <summary>
+        /// Flash-Sale feature helper: discovers the seeded product at <paramref name="productIndex"/> within a
+        /// stable, id-ordered view of <c>GET api/products</c> (ids/prices are DB-assigned, never hardcoded),
+        /// then schedules an ACTIVE flash sale for it (StartAt = now-1min, EndAt = now+1hr) via the
+        /// <c>[Authorize] POST api/flash-sales</c> with a sale price of half the base price — guaranteed
+        /// strictly below the base price and within <c>decimal(18,2)</c>, satisfying the service's
+        /// discount-below-base-price rule. Asserts <c>200 OK</c> and returns the created <c>FlashSaleDto</c>
+        /// root together with the resolved product id. A DISTINCT <paramref name="productIndex"/> per fact
+        /// isolates per-product availability and avoids the service's per-product non-overlap rejection (there
+        /// is no flash-sale DELETE endpoint, so created sales persist for the class lifetime). All intermediate
+        /// responses are disposed (MD-01).
+        /// </summary>
+        /// <param name="authenticatedClient">An authenticated client (scheduling a sale is <c>[Authorize]</c>).</param>
+        /// <param name="productIndex">Zero-based index into the id-ordered seeded products; distinct per fact.</param>
+        /// <param name="stockAllocation">The sale's stock allocation.</param>
+        /// <returns>The created <c>FlashSaleDto</c> root element and the resolved seeded product id.</returns>
+        private async Task<(JsonElement Sale, int ProductId)> CreateActiveFlashSaleForSeededProductAsync(
+            HttpClient authenticatedClient, int productIndex, int stockAllocation)
+        {
+            // Discover a REAL seeded product (id + base price). A flash sale requires an existing product and a
+            // sale price strictly below its base price, so arbitrary ids cannot be used. Order the discovered
+            // products by their unique, DB-assigned id (a total, stable order) so a given index always resolves
+            // to the same product across calls — giving distinct facts distinct, non-overlapping products.
+            using var productsResponse = await authenticatedClient.GetAsync("api/products?pageSize=18");
+            productsResponse.StatusCode.Should().Be(HttpStatusCode.OK);
+            var product = (await ReadRootAsync(productsResponse))
+                .GetProperty("data")
+                .EnumerateArray()
+                .OrderBy(p => p.GetProperty("id").GetInt32())
+                .ElementAt(productIndex);
+
+            var productId = product.GetProperty("id").GetInt32();
+            var basePrice = product.GetProperty("price").GetDecimal();
+            // A valid discount: strictly below the base price, positive, and two-decimal (decimal(18,2)).
+            var salePrice = decimal.Round(basePrice / 2m, 2);
+
+            using var response = await authenticatedClient.PostAsJsonAsync("api/flash-sales", new
+            {
+                productId,
+                startAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+                endAt = DateTimeOffset.UtcNow.AddHours(1),
+                salePrice,
+                stockAllocation
+            });
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            return (await ReadRootAsync(response), productId);
+        }
+
+        /// <summary>
+        /// <c>POST api/flash-sales</c> is <c>[Authorize]</c>: an ANONYMOUS caller is rejected with
+        /// <c>401 Unauthorized</c> BEFORE the action (and thus before any scheduling work), proving the hub's
+        /// JWT scheme also guards the scheduling endpoint (AAP R2/R6). The body is well-formed but irrelevant
+        /// because authorization short-circuits ahead of model binding.
+        /// </summary>
+        [Fact]
+        public async Task PostFlashSales_Anonymous_Returns401()
+        {
+            // Arrange
+            using var client = _fixture.CreateClient(); // anonymous
+
+            // Act — authorization runs before the action, so the body never reaches ScheduleAsync.
+            using var response = await client.PostAsJsonAsync("api/flash-sales", new
+            {
+                productId = 1,
+                startAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+                endAt = DateTimeOffset.UtcNow.AddHours(1),
+                salePrice = 1.00m,
+                stockAllocation = 50
+            });
+
+            // Assert — [Authorize] rejects the anonymous request.
+            response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        }
+
+        /// <summary>
+        /// <c>POST api/flash-sales</c> with an authenticated caller and a valid <c>CreateFlashSaleDto</c>
+        /// returns <c>200 OK</c> with a <c>FlashSaleDto</c> exposing EXACTLY the seven camelCase properties
+        /// <c>id, productId, salePrice, startAt, endAt, stockAllocation, quantityAvailable</c>. It asserts the
+        /// DTO does NOT expose the optimistic-concurrency <c>version</c> token (AAP §0.5.2), and that a
+        /// brand-new sale reports <c>quantityAvailable == stockAllocation</c> (no reservations yet).
+        /// </summary>
+        [Fact]
+        public async Task PostFlashSales_Authenticated_ReturnsFlashSaleDtoWithCamelCaseShape()
+        {
+            // Arrange + Act — schedule an active sale for a distinct seeded product (index 0), allocation 50.
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
+            var (root, _) = await CreateActiveFlashSaleForSeededProductAsync(
+                client, productIndex: 0, stockAllocation: 50);
+
+            // Assert — exact FlashSaleDto camelCase shape, no leaked concurrency token, computed availability.
+            ShouldExposeCamelCaseProperties(
+                root, "id", "productId", "salePrice", "startAt", "endAt", "stockAllocation", "quantityAvailable");
+            root.TryGetProperty("version", out _).Should()
+                .BeFalse("FlashSaleDto must not expose the optimistic-concurrency 'version' token");
+            root.GetProperty("quantityAvailable").GetInt32().Should()
+                .Be(root.GetProperty("stockAllocation").GetInt32());
+            root.GetProperty("stockAllocation").GetInt32().Should().Be(50);
+        }
+
+        /// <summary>
+        /// <c>GET api/flash-sales/active</c> (anonymous, deliberately NON-cached) returns <c>200 OK</c> with a
+        /// JSON ARRAY. After scheduling an active sale for a distinct seeded product, the just-created sale is
+        /// present in the array and exposes the exact <c>FlashSaleDto</c> shape with NO <c>version</c>.
+        /// </summary>
+        [Fact]
+        public async Task GetActiveFlashSales_AfterCreate_ReturnsArrayContainingCreatedSale()
+        {
+            // Arrange — create an active sale for a distinct seeded product (index 1).
+            using var authed = await _fixture.CreateAuthenticatedClientAsync();
+            var (_, productId) = await CreateActiveFlashSaleForSeededProductAsync(
+                authed, productIndex: 1, stockAllocation: 25);
+
+            // Act — the active-sales query is anonymous.
+            using var client = _fixture.CreateClient();
+            using var response = await client.GetAsync("api/flash-sales/active");
+
+            // Assert — 200 + JSON array; locate this sale by its product id and lock its shape.
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            root.ValueKind.Should().Be(JsonValueKind.Array);
+
+            // EnumerateArray().FirstOrDefault(...) yields a default JsonElement (ValueKind == Undefined) when
+            // absent; asserting ValueKind == Object is therefore the presence check.
+            var created = root.EnumerateArray()
+                .FirstOrDefault(e => e.TryGetProperty("productId", out var p) && p.GetInt32() == productId);
+            created.ValueKind.Should().Be(JsonValueKind.Object, "the just-created active sale must be present");
+            ShouldExposeCamelCaseProperties(
+                created, "id", "productId", "salePrice", "startAt", "endAt", "stockAllocation", "quantityAvailable");
+            created.TryGetProperty("version", out _).Should().BeFalse("FlashSaleDto must not expose 'version'");
+        }
+
+        /// <summary>
+        /// <c>POST api/inventory/reserve</c> (anonymous) against an ACTIVE sale with sufficient stock returns
+        /// <c>200 OK</c> with a <c>ReservationToReturnDto</c> exposing EXACTLY the five camelCase properties
+        /// <c>id, productId, quantity, sessionId, expiresAt</c>, echoing the requested product and session. The
+        /// created hold is released in <c>finally</c> via <c>DELETE .../reserve/{id}?sessionId=…</c> so it does
+        /// not outlive the test (MJ-04). The sessionId is a canonical v4 UUID (Guid), as the DTO requires.
+        /// </summary>
+        [Fact]
+        public async Task ReserveInventory_WithActiveSaleAndStock_ReturnsReservationDto()
+        {
+            // Arrange — fresh canonical v4 UUID session (isolates the process-static, session-keyed limiter).
+            var sessionId = Guid.NewGuid().ToString();
+            using var authed = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = _fixture.CreateClient(); // reserve/delete are anonymous
+            int? reservationId = null;
+            try
+            {
+                // Reserving requires an active sale first (else availability is 0 -> INSUFFICIENT_STOCK).
+                var (_, productId) = await CreateActiveFlashSaleForSeededProductAsync(
+                    authed, productIndex: 2, stockAllocation: 50);
+
+                // Act
+                using var response = await client.PostAsJsonAsync("api/inventory/reserve",
+                    new { productId, quantity = 1, sessionId });
+
+                // Assert — 200 + exact ReservationToReturnDto shape + echoed product/session.
+                response.StatusCode.Should().Be(HttpStatusCode.OK);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(root, "id", "productId", "quantity", "sessionId", "expiresAt");
+                root.GetProperty("productId").GetInt32().Should().Be(productId);
+                root.GetProperty("sessionId").GetString().Should().Be(sessionId);
+                reservationId = root.GetProperty("id").GetInt32();
+            }
+            finally
+            {
+                // Cleanup: release the hold (DELETE requires the owning sessionId and is not rate-limited).
+                if (reservationId != null)
+                {
+                    using var del = await client.DeleteAsync(
+                        $"api/inventory/reserve/{reservationId.Value}?sessionId={sessionId}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// <c>POST api/inventory/reserve</c> for a quantity that EXCEEDS the sale's allocation returns
+        /// <c>409 Conflict</c> with the EXACT user-contract body <c>{"error":"INSUFFICIENT_STOCK","available":N}</c>
+        /// (AAP §0.1.2): the <c>error</c> value is the verbatim uppercase-snake string, <c>available</c> is a
+        /// non-negative number, and the body is the BARE anonymous object — NOT an <c>ApiResponse</c> envelope
+        /// (no <c>statusCode</c>). No partial reservation is persisted, so no cleanup is required.
+        /// </summary>
+        [Fact]
+        public async Task ReserveInventory_ExceedingAllocation_Returns409InsufficientStock()
+        {
+            // Arrange — active sale with a tiny allocation (1); fresh canonical session.
+            var sessionId = Guid.NewGuid().ToString();
+            using var authed = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = _fixture.CreateClient();
+            var (_, productId) = await CreateActiveFlashSaleForSeededProductAsync(
+                authed, productIndex: 3, stockAllocation: 1);
+
+            // Act — request more than the allocation.
+            using var response = await client.PostAsJsonAsync("api/inventory/reserve",
+                new { productId, quantity = 5, sessionId });
+
+            // Assert — 409 + EXACT {error, available} body; value verbatim; number available; NOT an ApiResponse.
+            response.StatusCode.Should().Be(HttpStatusCode.Conflict); // 409
+            var root = await ReadRootAsync(response);
+            root.GetProperty("error").GetString().Should().Be("INSUFFICIENT_STOCK");
+            root.TryGetProperty("available", out var available).Should().BeTrue();
+            available.GetInt32().Should().BeGreaterOrEqualTo(0);
+            root.TryGetProperty("statusCode", out _).Should()
+                .BeFalse("the 409 body must be {error,available}, not an ApiResponse envelope");
+        }
+
+        /// <summary>
+        /// <c>POST api/inventory/reserve</c> is rate-limited to 10 requests/minute/session. Using ONE dedicated
+        /// canonical v4 UUID session, the first ten reserves succeed (<c>200 OK</c>) and the eleventh is
+        /// rejected with <c>429 Too Many Requests</c> and the EXACT body <c>{"error":"RATE_LIMIT_EXCEEDED"}</c>
+        /// emitted by <c>SessionRateLimitFilter</c> (AAP §0.6). The ten successful holds are released in
+        /// <c>finally</c>. A dedicated session (used by no other fact) keeps the process-static limiter isolated.
+        /// </summary>
+        [Fact]
+        public async Task ReserveInventory_ExceedingRateLimit_Returns429()
+        {
+            // Arrange — dedicated session + ample stock so only the RATE limit (not stock) can reject.
+            var sessionId = Guid.NewGuid().ToString(); // dedicated; used ONLY by this test
+            var reservationIds = new List<int>();
+            using var authed = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = _fixture.CreateClient();
+            try
+            {
+                var (_, productId) = await CreateActiveFlashSaleForSeededProductAsync(
+                    authed, productIndex: 4, stockAllocation: 100);
+
+                // Requests 1-10: allowed by the 10-req/min/session sliding window.
+                for (int i = 1; i <= 10; i++)
+                {
+                    using var ok = await client.PostAsJsonAsync("api/inventory/reserve",
+                        new { productId, quantity = 1, sessionId });
+                    ok.StatusCode.Should().Be(HttpStatusCode.OK, $"reserve #{i} (<= 10) must be allowed");
+                    var okRoot = await ReadRootAsync(ok);
+                    reservationIds.Add(okRoot.GetProperty("id").GetInt32());
+                }
+
+                // Act — request 11 exceeds the window.
+                using var limited = await client.PostAsJsonAsync("api/inventory/reserve",
+                    new { productId, quantity = 1, sessionId });
+
+                // Assert — 429 + EXACT rate-limit body.
+                limited.StatusCode.Should().Be(HttpStatusCode.TooManyRequests); // 429
+                var limitedRoot = await ReadRootAsync(limited);
+                limitedRoot.GetProperty("error").GetString().Should().Be("RATE_LIMIT_EXCEEDED");
+            }
+            finally
+            {
+                // Cleanup: release every successful hold (DELETE carries the owning sessionId, not rate-limited).
+                foreach (var id in reservationIds)
+                {
+                    using var del = await client.DeleteAsync(
+                        $"api/inventory/reserve/{id}?sessionId={sessionId}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// <c>DELETE api/inventory/reserve/{id}?sessionId=…</c> for an EXISTING hold owned by that session
+        /// performs the REST-correct <c>Active -&gt; Released</c> transition and returns <c>204 No Content</c>
+        /// (the committed controller returns <c>NoContent()</c>, not <c>200</c>). Arranged by scheduling an
+        /// active sale, reserving one unit, and then releasing it.
+        /// </summary>
+        [Fact]
+        public async Task DeleteReservation_ExistingOwnedBySession_Returns204NoContent()
+        {
+            // Arrange — active sale + a real, owned reservation to release.
+            var sessionId = Guid.NewGuid().ToString();
+            using var authed = await _fixture.CreateAuthenticatedClientAsync();
+            using var client = _fixture.CreateClient();
+
+            var (_, productId) = await CreateActiveFlashSaleForSeededProductAsync(
+                authed, productIndex: 5, stockAllocation: 10);
+            using var reserve = await client.PostAsJsonAsync("api/inventory/reserve",
+                new { productId, quantity = 1, sessionId });
+            reserve.StatusCode.Should().Be(HttpStatusCode.OK);
+            var reservationId = (await ReadRootAsync(reserve)).GetProperty("id").GetInt32();
+
+            // Act — release the owned hold (the owning sessionId is required).
+            using var response = await client.DeleteAsync(
+                $"api/inventory/reserve/{reservationId}?sessionId={sessionId}");
+
+            // Assert — 204 No Content on a successful release.
+            response.StatusCode.Should().Be(HttpStatusCode.NoContent);
+        }
+
+        /// <summary>
+        /// <c>DELETE api/inventory/reserve/{id}?sessionId=…</c> for a NON-existent reservation id (with a valid
+        /// canonical session so the request is not short-circuited as a missing-session <c>400</c>) returns
+        /// <c>404 NotFound</c> with the structured <c>ApiResponse</c> body (<c>statusCode == 404</c> and a
+        /// non-empty <c>message</c>).
+        /// </summary>
+        [Fact]
+        public async Task DeleteReservation_Missing_Returns404ApiResponse()
+        {
+            // Arrange — a valid canonical session is supplied so the release proceeds to the id lookup.
+            using var client = _fixture.CreateClient();
+            var sessionId = Guid.NewGuid().ToString();
+
+            // Act — no reservation with this id exists.
+            using var response = await client.DeleteAsync($"api/inventory/reserve/999999?sessionId={sessionId}");
+
+            // Assert — 404 + ApiResponse contract.
+            response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+            var root = await ReadRootAsync(response);
+            ShouldExposeCamelCaseProperties(root, "statusCode", "message");
+            root.GetProperty("statusCode").GetInt32().Should().Be(404);
+            root.GetProperty("message").GetString().Should().NotBeNullOrWhiteSpace();
+        }
+
+        /// <summary>
+        /// Backward-compatibility guard (AAP §0.5.2): after the Real-Time Inventory feature is added,
+        /// <c>GET api/products</c> STILL returns the unchanged pagination envelope (page 1, size 6, count 18,
+        /// 6-element <c>data</c>), and EACH item STILL exposes exactly
+        /// <c>{id, name, description, price, pictureUrl, productType, productBrand}</c> — proving in particular
+        /// that the new <c>Products.Version</c> concurrency token does NOT leak into <c>ProductToReturnDto</c>.
+        /// This is a NEW fact; the pre-existing products facts are untouched.
+        /// </summary>
+        [Fact]
+        public async Task GetProducts_AfterFeatureAdded_ItemShapeUnchangedAndHasNoVersion()
+        {
+            // Arrange
+            using var client = _fixture.CreateClient();
+
+            // Act
+            using var response = await client.GetAsync("api/products");
+
+            // Assert — unchanged envelope + unchanged item shape + NO leaked 'version'.
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            ShouldExposeCamelCaseProperties(root, "pageIndex", "pageSize", "count", "data");
+            root.GetProperty("pageIndex").GetInt32().Should().Be(1);
+            root.GetProperty("pageSize").GetInt32().Should().Be(6);
+            root.GetProperty("count").GetInt32().Should().Be(18);
+
+            var data = root.GetProperty("data");
+            data.ValueKind.Should().Be(JsonValueKind.Array);
+            data.GetArrayLength().Should().Be(6);
+
+            foreach (var item in data.EnumerateArray())
+            {
+                ShouldExposeCamelCaseProperties(
+                    item, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
+                item.TryGetProperty("version", out _).Should()
+                    .BeFalse("ProductToReturnDto must NOT expose the new Products.Version concurrency token (AAP §0.5.2)");
+            }
+        }
+
+        /// <summary>
+        /// Backward-compatibility guard (AAP §0.5.2): <c>GET api/products/{id}</c> STILL returns <c>200 OK</c>
+        /// with the unchanged single-item shape and NO <c>version</c>, and <c>GET api/products/9999</c> STILL
+        /// returns <c>404</c> with the <c>ApiResponse</c> body (<c>statusCode == 404</c>). The existing id is
+        /// discovered dynamically (ids are DB-assigned). This is a NEW fact; the pre-existing facts are untouched.
+        /// </summary>
+        [Fact]
+        public async Task GetProductById_AfterFeatureAdded_ShapeUnchanged()
+        {
+            // Arrange — discover a real seeded id dynamically.
+            using var client = _fixture.CreateClient();
+            using var listResponse = await client.GetAsync("api/products");
+            var listRoot = await ReadRootAsync(listResponse);
+            var existingId = listRoot.GetProperty("data")[0].GetProperty("id").GetInt32();
+
+            // Act + Assert — existing id: 200 + unchanged shape + no leaked 'version'.
+            using var byId = await client.GetAsync($"api/products/{existingId}");
+            byId.StatusCode.Should().Be(HttpStatusCode.OK);
+            var byIdRoot = await ReadRootAsync(byId);
+            ShouldExposeCamelCaseProperties(
+                byIdRoot, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
+            byIdRoot.GetProperty("id").GetInt32().Should().Be(existingId);
+            byIdRoot.TryGetProperty("version", out _).Should()
+                .BeFalse("ProductToReturnDto must NOT expose 'version' (AAP §0.5.2)");
+
+            // Act + Assert — nonexistent id: 404 ApiResponse.
+            using var missing = await client.GetAsync("api/products/9999");
+            missing.StatusCode.Should().Be(HttpStatusCode.NotFound);
+            var missingRoot = await ReadRootAsync(missing);
+            ShouldExposeCamelCaseProperties(missingRoot, "statusCode", "message");
+            missingRoot.GetProperty("statusCode").GetInt32().Should().Be(404);
+        }
+
+        /// <summary>
+        /// Backward-compatibility guard (AAP §0.5.2): <c>POST api/orders</c> is TRANSPARENT to the new
+        /// reservation-consume hook added to <c>OrderService.CreateOrderAsync</c> (a fire-and-forget try/catch
+        /// AFTER commit). It STILL returns <c>200 OK</c> serialising the raw <c>Order</c> entity with the same
+        /// shape locked by <c>CreateOrder_ValidBasketAndAddress_Returns200OrderEntityContract</c>: camelCase
+        /// <c>id, buyerEmail, orderDate, shipToAddress, deliveryMethod</c> (OBJECT), <c>orderItems, subtotal,
+        /// status, paymentId</c>; <c>buyerEmail</c> is the seeded user; <c>subtotal &gt; 0</c> (totals still
+        /// derive from <c>products.price</c>, never the sale price); and NO <c>total</c> member is serialised
+        /// (<c>Order.GetTotal()</c> is a method). The basket is cleaned in <c>finally</c> (MJ-04).
+        /// </summary>
+        [Fact]
+        public async Task PostOrders_AfterFeatureAdded_ContractUnchanged()
+        {
+            // Arrange
+            using var client = await _fixture.CreateAuthenticatedClientAsync();
+            string basketId = null;
+            try
+            {
+                basketId = await SeedRealSingleItemBasketAsync(client);
+
+                // Act — create the order for the seeded basket with a complete address.
+                using var response = await client.PostAsJsonAsync("api/orders", new
+                {
+                    basketId,
+                    deliveryMethodId = 1,
+                    shipToAddress = new
+                    {
+                        id = 1,
+                        firstName = "Bob",
+                        lastName = "Bobbity",
+                        street = "10 The Street",
+                        city = "NY",
+                        state = "NY",
+                        zipCode = "90210"
+                    }
+                });
+
+                // Assert — status + raw Order-entity contract, unchanged by the reservation-consume hook.
+                response.StatusCode.Should().Be(HttpStatusCode.OK);
+                var root = await ReadRootAsync(response);
+                ShouldExposeCamelCaseProperties(
+                    root, "id", "buyerEmail", "orderDate", "shipToAddress", "deliveryMethod",
+                    "orderItems", "subtotal", "status", "paymentId");
+                root.GetProperty("buyerEmail").GetString()
+                    .Should().Be(CustomWebApplicationFactory.DefaultTestUserEmail);
+                root.GetProperty("deliveryMethod").ValueKind.Should().Be(JsonValueKind.Object);
+                root.GetProperty("subtotal").GetDecimal().Should().BeGreaterThan(0);
+                // The reservation-consume hook must NOT alter the /api/orders contract (AAP §0.5.2):
+                root.TryGetProperty("total", out _).Should()
+                    .BeFalse("the raw Order entity still serialises no 'total' (GetTotal() is a method)");
+            }
+            finally
+            {
+                if (basketId != null) await TryDeleteBasketAsync(client, basketId);
+            }
         }
     }
 }
