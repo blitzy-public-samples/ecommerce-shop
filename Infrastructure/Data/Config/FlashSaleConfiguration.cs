@@ -33,6 +33,26 @@ namespace Infrastructure.Data.Config
             builder.HasIndex(x => x.ProductId);
             // Flash-Sale feature: active-window (StartAt <= now <= EndAt) queries
             builder.HasIndex(x => new { x.StartAt, x.EndAt });
+
+            // Flash-Sale feature (review finding M2 — database-integrity backstops): provider-compatible CHECK
+            // constraints enforce the flash-sale invariants at the DEEPEST layer, so a direct/buggy writer can
+            // never persist a row that would corrupt availability accounting or misroute events, even though the
+            // service layer (FlashSaleService.ScheduleAsync) already validates these on the write path:
+            //   * SalePrice > 0        — a sale must carry a positive discounted price (money, decimal(18,2)).
+            //   * StockAllocation > 0  — a sale must allocate at least one unit of stock.
+            //   * EndAt > StartAt      — the [StartAt, EndAt] window must be non-empty and correctly ordered.
+            // These are pure single-row predicates (no cross-table reference), so they are emitted verbatim into
+            // the additive migration and behave identically on PostgreSQL and on the relational test providers.
+            // (ProductId <-> FlashSaleId consistency between a reservation and its sale is NOT expressible as a
+            // single-row CHECK; it is guaranteed by construction — ReserveAsync stamps both the ProductId and the
+            // FlashSaleId from the SAME deterministically-selected sale, whose ProductId equals that productId —
+            // and both columns are independently FK-protected. A composite (FlashSaleId, ProductId) FK would
+            // require a new alternate key / unique index on FlashSales(Id, ProductId), which would break the
+            // frozen exact migration catalog contract and the AAP §0.5.2 minimal-change clause, so it is
+            // deliberately not added.)
+            builder.HasCheckConstraint("CK_FlashSales_SalePrice_Positive", "\"SalePrice\" > 0");
+            builder.HasCheckConstraint("CK_FlashSales_StockAllocation_Positive", "\"StockAllocation\" > 0");
+            builder.HasCheckConstraint("CK_FlashSales_EndAt_After_StartAt", "\"EndAt\" > \"StartAt\"");
         }
     }
 }

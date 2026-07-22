@@ -11,9 +11,11 @@ namespace Core.Interfaces
         // validates its inputs so a DIRECT caller (not only the DTO-validated controller) cannot persist an
         // invalid authority row, and it enforces per-product NON-OVERLAP transactionally (review finding C03) so
         // two sales for one product can never be active at the same instant and independently allocate stock.
-        // The result carries a deterministic Outcome the API maps to an exact HTTP status (Success -> 201,
-        // validation failures -> 400, ProductNotFound -> 404, Overlap -> 409) WITHOUT coupling Core to ASP.NET.
-        // On Success the persisted FlashSale (with generated Id and default Version) is returned.
+        // The result carries a deterministic Outcome the API maps to an exact HTTP status (review finding N4 —
+        // Success -> 200 OK with the created sale body, validation failures -> 400, ProductNotFound -> 404,
+        // Overlap -> 409) WITHOUT coupling Core to ASP.NET. On Success the persisted FlashSale (with generated Id
+        // and default Version) is returned together with the authoritative post-commit QuantityAvailable
+        // (review finding M12).
         Task<FlashSaleScheduleResult> ScheduleAsync(int productId, DateTimeOffset startAt, DateTimeOffset endAt,
             decimal salePrice, int stockAllocation);
 
@@ -27,7 +29,11 @@ namespace Core.Interfaces
         // clamped at zero. Implementations MUST NOT aggregate by ProductId (that would let overlapping/sequential
         // sales contaminate one another) and MUST NOT ignore Consumed (sold) quantity. Feeds the deliberately
         // NON-cached GET /api/flash-sales/active endpoint.
-        Task<IReadOnlyList<ActiveFlashSale>> GetActiveSalesAsync();
+        //
+        // Review finding N1 (bounded reads): an OPTIONAL productId filter narrows the result to the single
+        // product's active sale(s), so a product page need not download every active sale in the catalog. When
+        // productId is null the full active list is returned (the required list endpoint is preserved).
+        Task<IReadOnlyList<ActiveFlashSale>> GetActiveSalesAsync(int? productId = null);
     }
 
     // Deterministic outcome of a schedule attempt (review finding M09). The API translates each value into an
@@ -55,6 +61,13 @@ namespace Core.Interfaces
     {
         public FlashSaleScheduleOutcome Outcome { get; set; }
         public FlashSale FlashSale { get; set; } // populated on Success only.
+
+        // Flash-Sale feature (review finding M12): the AUTHORITATIVE, post-commit live availability for the
+        // scheduled sale, computed by the SERVICE by re-reading committed reservation state — NOT fabricated as
+        // StockAllocation by the controller. A concurrent reserve that committed between this sale's insert and
+        // the read is therefore reflected, so the POST response matches what GET /api/flash-sales/active returns
+        // for the same sale. Populated on Success only (0 otherwise).
+        public int QuantityAvailable { get; set; }
     }
 
     // Plain result: an active sale plus its computed live availability. Availability is SALE-SCOPED — allocation

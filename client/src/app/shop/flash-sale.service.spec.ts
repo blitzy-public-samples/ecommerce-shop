@@ -60,13 +60,16 @@ describe('FlashSaleService', () => {
   });
 
   describe('getActiveFlashSale', () => {
-    it('should resolve the single active sale for a product from the active list', () => {
+    it('should request the product-filtered active endpoint and resolve the single sale', () => {
+      // N1-fe: the productId is pushed to the server as a ?productId query parameter so the page no
+      // longer downloads every active sale; the server returns only the matching sale(s).
       let result: IFlashSale;
       service.getActiveFlashSale(2).subscribe(res => (result = res));
 
-      const req = httpMock.expectOne(activeUrl);
-      expect(req.request.method).toBe('GET');
-      req.flush(mockFlashSales);
+      const req = httpMock.expectOne(
+        r => r.method === 'GET' && r.url === activeUrl && r.params.get('productId') === '2'
+      );
+      req.flush([mockFlashSales[1]]);
 
       expect(result).toEqual(mockFlashSales[1]);
     });
@@ -108,12 +111,30 @@ describe('FlashSaleService', () => {
   });
 
   describe('releaseReservation', () => {
-    it('should DELETE the reservation by id', () => {
-      service.releaseReservation(10).subscribe();
+    it('should DELETE the reservation by id and send the explicit owning sessionId', () => {
+      // M6-fe: the backend requires the owning sessionId ([FromQuery] string sessionId) and returns
+      // 400 without it. An explicit sessionId is forwarded verbatim as a query parameter, and the
+      // successful release responds 204 No Content (no body).
+      service.releaseReservation(10, 'basket-123').subscribe();
 
-      const req = httpMock.expectOne(reserveUrl + '/10');
-      expect(req.request.method).toBe('DELETE');
-      req.flush({});
+      const req = httpMock.expectOne(
+        r => r.method === 'DELETE' && r.url === reserveUrl + '/10' && r.params.get('sessionId') === 'basket-123'
+      );
+      req.flush(null, { status: 204, statusText: 'No Content' });
+    });
+
+    it('should default the sessionId to the basket UUID in localStorage when omitted', () => {
+      // M6-fe: when the caller omits sessionId it defaults to localStorage['basket_id'] - the same
+      // identity reserve() stamps on the hold - so an owner can release without re-supplying it.
+      spyOn(localStorage, 'getItem').and.returnValue('ls-basket-uuid');
+
+      service.releaseReservation(11).subscribe();
+
+      const req = httpMock.expectOne(
+        r => r.method === 'DELETE' && r.url === reserveUrl + '/11' && r.params.get('sessionId') === 'ls-basket-uuid'
+      );
+      expect(localStorage.getItem).toHaveBeenCalledWith('basket_id');
+      req.flush(null, { status: 204, statusText: 'No Content' });
     });
   });
 });

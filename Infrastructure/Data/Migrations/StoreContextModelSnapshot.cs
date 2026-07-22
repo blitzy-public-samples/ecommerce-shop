@@ -52,6 +52,12 @@ namespace Infrastructure.Data.Migrations
                     b.HasIndex("StartAt", "EndAt");
 
                     b.ToTable("FlashSales");
+
+                    b.HasCheckConstraint("CK_FlashSales_SalePrice_Positive", "\"SalePrice\" > 0");
+
+                    b.HasCheckConstraint("CK_FlashSales_StockAllocation_Positive", "\"StockAllocation\" > 0");
+
+                    b.HasCheckConstraint("CK_FlashSales_EndAt_After_StartAt", "\"EndAt\" > \"StartAt\"");
                 });
 
             modelBuilder.Entity("Core.Entities.InventoryReservation", b =>
@@ -93,6 +99,8 @@ namespace Infrastructure.Data.Migrations
                     b.ToTable("InventoryReservations");
 
                     b.HasCheckConstraint("CK_InventoryReservations_Quantity_Positive", "\"Quantity\" > 0");
+
+                    b.HasCheckConstraint("CK_InventoryReservations_Status_Valid", "\"Status\" >= 0 AND \"Status\" <= 3");
                 });
 
             modelBuilder.Entity("Core.Entities.OrderAggregate.DeliveryMethod", b =>

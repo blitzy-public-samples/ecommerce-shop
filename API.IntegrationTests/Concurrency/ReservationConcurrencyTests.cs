@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using API.Dtos;
 using API.IntegrationTests.Infrastructure;
 using Core.Entities;
+using Core.Interfaces;                           // IInventoryReservationService + ReservationConsumeLine — C3 concurrent split-consume proof
 using FluentAssertions;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -81,6 +82,16 @@ namespace API.IntegrationTests.Concurrency
         // without risking a "53300 too many clients" / pool-timeout flake. All 500 tasks are still launched
         // behind the starting gun (they simply queue at the throttle once released).
         private const int MaxInFlightReservations = 64;
+
+        /// <summary>
+        /// Number of simultaneous <c>ConsumeReservationsAsync</c> calls fired at ONE shared 10-unit Active
+        /// hold in the C3 concurrent split-consume proof. Several concurrent consumers (each on its own DI
+        /// scope / <see cref="StoreContext"/>) reliably overlap their read-modify-write sequences on the
+        /// single hold, so at least one loses the Status-token-guarded transition and hits
+        /// <c>DbUpdateConcurrencyException</c> — exercising the exact guard the C3 fix adds. Well under the
+        /// PostgreSQL max_connections ceiling.
+        /// </summary>
+        private const int ConcurrentConsumeCount = 6;
 
         /// <summary>
         /// This class's dedicated fixture (started once for THIS class) providing the real Testcontainers
@@ -285,6 +296,126 @@ namespace API.IntegrationTests.Concurrency
             }
         }
 
+        /// <summary>
+        /// C3 (concurrent split double-sale) — the authoritative <b>relational-provider</b> proof that a
+        /// partial consume's Status-guarded <c>Active -&gt; Consumed</c> transition prevents a double-sell
+        /// under REAL concurrency. A single 10-unit Active hold is attacked by
+        /// <see cref="ConcurrentConsumeCount"/> simultaneous <c>ConsumeReservationsAsync</c> calls — each, like
+        /// a separate checkout, needing 6 of the 10 held units and each running on its OWN DI scope /
+        /// <see cref="StoreContext"/> (mandatory for a genuine optimistic-concurrency race). Only one consumer
+        /// can win the concurrency-token-guarded transition of any given Active row; losers hit
+        /// <c>DbUpdateConcurrencyException</c> and defensively skip (the order flow never breaks).
+        ///
+        /// <para>
+        /// <b>Timing-independent invariants.</b> Regardless of how the consumes interleave, the fix CONSERVES
+        /// units: for the product, <c>consumed + active-leftover</c> always equals the original 10, and the
+        /// sold (<c>Consumed</c>) total never exceeds 10. The pre-fix code decremented the original row's
+        /// <c>Quantity</c> WITHOUT flipping its <c>Status</c> (the sole concurrency token), so two concurrent
+        /// consumers each inserted a 6-unit <c>Consumed</c> row while the original stayed <c>Active</c> at 4 —
+        /// selling 12 and conserving 16, a double-sell (AAP R3 violation). EF Core's <b>InMemory</b> provider
+        /// does not enforce concurrency tokens, so — exactly as for the reserve guard above — this race can
+        /// only be proven on a real relational database; the single-threaded observable split is covered by
+        /// the <c>InventoryReservationService</c> unit test. Uses a DISTINCT seeded product (<c>skip: 2</c>)
+        /// so it never overlaps the two reserve facts on the shared per-class container.
+        /// </para>
+        /// </summary>
+        [Fact]
+        public async Task Consume_WithConcurrentSplitConsumesOfOneHold_NeverDoubleSellsAndConservesUnits()
+        {
+            // Arrange -----------------------------------------------------------------------------------
+            const int holdQuantity = 10;   // the single shared Active hold
+            const int perOrderQuantity = 6; // each concurrent order needs 6 of the 10 units (the finding's scenario)
+
+            // A DISTINCT seeded product (skip: 2) keeps this fact independent of the two reserve facts.
+            var productId = await GetSeededProductIdAsync(skip: 2);
+
+            // An ACTIVE sale so the post-consume availability re-broadcast resolves a real sale (allocation 100).
+            var sale = await CreateActiveFlashSaleAsync(productId, StockAllocation);
+
+            // A single canonical-UUID session owns ONE 10-unit Active hold against the active sale. A
+            // Guid.NewGuid().ToString() is a canonical v4 UUID, so it survives the service's session
+            // normalization (M15) and matches on consume.
+            var sessionId = Guid.NewGuid().ToString();
+            using (var seedScope = _fixture.Factory.Services.CreateScope())
+            {
+                var ctx = seedScope.ServiceProvider.GetRequiredService<StoreContext>();
+                ctx.InventoryReservations.Add(new InventoryReservation
+                {
+                    FlashSaleId = sale.Id,
+                    ProductId = productId,
+                    Quantity = holdQuantity,
+                    SessionId = sessionId,
+                    ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5), // comfortably non-expired for the whole test
+                    Status = ReservationStatus.Active
+                });
+                await ctx.SaveChangesAsync();
+            }
+
+            try
+            {
+                // Act -------------------------------------------------------------------------------------
+                // Fire N simultaneous consumes behind a synchronized starting gun so their read-modify-write
+                // sequences genuinely overlap on the single hold (a real race on the Status concurrency
+                // token). Each consume resolves the service from its OWN DI scope, hence its own StoreContext.
+                // RunContinuationsAsynchronously so SetResult does not inline-run the continuations serially.
+                var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var consumeTasks = Enumerable.Range(0, ConcurrentConsumeCount).Select(async _ =>
+                {
+                    await gate.Task; // park until the gun fires so the consumes overlap
+                    using var scope = _fixture.Factory.Services.CreateScope();
+                    var svc = scope.ServiceProvider.GetRequiredService<IInventoryReservationService>();
+                    await svc.ConsumeReservationsAsync(sessionId,
+                        new[] { new ReservationConsumeLine(productId, perOrderQuantity) });
+                }).ToList();
+
+                gate.SetResult(true);              // fire the starting gun — release all consumes together
+                await Task.WhenAll(consumeTasks);
+
+                // Assert ----------------------------------------------------------------------------------
+                using var verifyScope = _fixture.Factory.Services.CreateScope();
+                var verify = verifyScope.ServiceProvider.GetRequiredService<StoreContext>();
+                var rows = await verify.InventoryReservations.AsNoTracking()
+                    .Where(r => r.ProductId == productId)
+                    .ToListAsync();
+
+                // The consume path only transitions Active -> Consumed and inserts an Active leftover; it never
+                // releases, so every persisted row for the product is Consumed (sold) or Active (leftover).
+                rows.Should().OnlyContain(
+                    r => r.Status == ReservationStatus.Consumed || r.Status == ReservationStatus.Active,
+                    "the consume path only marks holds Consumed and inserts an Active leftover, never releases");
+
+                var consumedTotal = rows.Where(r => r.Status == ReservationStatus.Consumed).Sum(r => r.Quantity);
+                var activeTotal = rows.Where(r => r.Status == ReservationStatus.Active).Sum(r => r.Quantity);
+
+                // ZERO DOUBLE-SELL: the sold (Consumed) units can NEVER exceed the original 10-unit hold. The
+                // pre-fix unguarded Quantity write let concurrent consumers each insert a 6-unit Consumed row
+                // (12 sold); the Status-guarded transition caps the consumed total at the hold's 10.
+                consumedTotal.Should().BeLessThanOrEqualTo(holdQuantity,
+                    "the Status-guarded Active -> Consumed transition must never sell more than the 10-unit hold (pre-fix: 12)");
+
+                // UNITS CONSERVED: consumed + active-leftover always equals the original hold, regardless of
+                // interleaving (the split preserves total held quantity). Pre-fix this summed to 16.
+                (consumedTotal + activeTotal).Should().Be(holdQuantity,
+                    "consumed + active leftover conserves the original 10-unit hold (pre-fix: 16)");
+
+                // Progress is made: at least the first winner sells its 6 units (this is not a silent no-op).
+                consumedTotal.Should().BeGreaterThanOrEqualTo(perOrderQuantity,
+                    "at least one consumer wins the guarded transition and sells its 6 units");
+
+                // Availability observed through the same non-expired held-units sum the service uses: for the
+                // product, consumed + active-leftover held units equal the original 10, so the sale's
+                // quantityAvailable is allocation - 10 == 90 (never negative, never an oversell).
+                (await GetActiveReservedTotalAsync(productId)).Should().Be(holdQuantity,
+                    "consumed + active-leftover (all non-expired) held units equal the original hold");
+            }
+            finally
+            {
+                // Remove this test's reservations (both the split rows) and the flash sale so the shared
+                // per-class container is restored for the next test.
+                await CleanupReservationsAndSaleAsync(productId, sale.Id);
+            }
+        }
+
         // -----------------------------------------------------------------------------------------------
         // Private helpers — keep each test independent and repeatable on the SHARED per-class database.
         // -----------------------------------------------------------------------------------------------
@@ -470,4 +601,3 @@ namespace API.IntegrationTests.Concurrency
         }
     }
 }
-

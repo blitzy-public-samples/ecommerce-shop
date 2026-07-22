@@ -19,6 +19,7 @@ using Microsoft.Extensions.Configuration;       // IConfiguration
 using Microsoft.Extensions.DependencyInjection; // GetRequiredService, CreateScope
 using FluentAssertions;
 using Xunit;
+using Xunit.Abstractions;                       // ITestOutputHelper — N6: report (never swallow) DB-cleanup failures
 
 namespace API.IntegrationTests.Load
 {
@@ -182,6 +183,12 @@ namespace API.IntegrationTests.Load
         /// <summary>This class's dedicated Testcontainers-backed fixture (real PostgreSQL + Redis + in-process host).</summary>
         private readonly ContainerFixture _fixture;
 
+        // N6: xUnit injects ITestOutputHelper alongside the class fixture. A DB-cleanup failure in a test's
+        // finally block is REPORTED here (not silently swallowed), so a hiccup that could leave the shared
+        // container dirty for sibling tests is visible in test output — while still never failing an
+        // otherwise-passing test.
+        private readonly ITestOutputHelper _output;
+
         /// <summary>
         /// Receives this class's isolated <see cref="ContainerFixture"/> from xUnit's class-fixture machinery.
         /// By the time this constructor runs the fixture has started the containers, applied the EF Core
@@ -190,7 +197,11 @@ namespace API.IntegrationTests.Load
         /// the <c>bob@test.com</c> user).
         /// </summary>
         /// <param name="fixture">This class's isolated container fixture.</param>
-        public InventoryBroadcastLoadTests(ContainerFixture fixture) => _fixture = fixture;
+        public InventoryBroadcastLoadTests(ContainerFixture fixture, ITestOutputHelper output)
+        {
+            _fixture = fixture;
+            _output = output;
+        }
 
         /// <summary>
         /// Disposes every <see cref="HttpResponseMessage"/> produced by a batch of concurrent request tasks —
@@ -477,9 +488,12 @@ namespace API.IntegrationTests.Load
                     client.Dispose();
                 }
 
-                // Clean the shared DB so the containers stay pristine for sibling tests. Wrapped in try/catch so
-                // a cleanup hiccup never masks the real assertion outcome. Set<T>() is used so the cleanup does
-                // not depend on the exact DbSet property names on StoreContext.
+                // Clean the shared DB so the containers stay pristine for sibling tests. A cleanup failure must
+                // never fail an otherwise-passing test, but N6 requires it be REPORTED rather than silently
+                // swallowed — a swallowed failure could leave the shared container dirty for sibling tests with
+                // no signal. So the exception is caught and written to the test output (visible, separate from
+                // the assertion outcome). Set<T>() is used so cleanup does not depend on the exact DbSet
+                // property names on StoreContext.
                 try
                 {
                     using var scope = _fixture.Factory.Services.CreateScope();
@@ -493,9 +507,13 @@ namespace API.IntegrationTests.Load
 
                     await ctx.SaveChangesAsync();
                 }
-                catch
+                catch (Exception cleanupEx)
                 {
-                    // Intentionally swallowed: a cleanup failure must never fail an otherwise-passing test.
+                    // N6: report separately — do NOT swallow. This never fails the test, but the failure is
+                    // surfaced in test output so a cleanup problem (potential dirty shared state) is visible.
+                    _output.WriteLine(
+                        $"[cleanup] InventoryBroadcastLoadTests DB cleanup for product {pid} failed and was " +
+                        $"reported (not swallowed); sibling tests may see residual state: {cleanupEx}");
                 }
             }
         }

@@ -66,15 +66,17 @@ namespace API.Controllers
                 case FlashSaleScheduleOutcome.Success:
                 {
                     // MappingProfiles has NO FlashSale->FlashSaleDto map; it only maps ActiveFlashSale->FlashSaleDto.
-                    // Wrap the freshly-created sale in an ActiveFlashSale. QuantityAvailable == StockAllocation
-                    // because a brand-new sale has zero reservations (no aggregate query needed / do NOT invent an
-                    // aggregate), consistent with what GET /api/flash-sales/active returns for the same sale
-                    // immediately after.
+                    // Wrap the freshly-created sale in an ActiveFlashSale. Review finding M12: use the AUTHORITATIVE
+                    // post-commit availability the service computed (result.QuantityAvailable) rather than fabricating
+                    // it from StockAllocation here. For an immediately-active sale the service re-reads the same
+                    // sale-scoped aggregate that GET /api/flash-sales/active uses, so the value this action returns
+                    // is exactly what a subsequent active-list fetch would report — the controller no longer invents
+                    // an availability figure or assumes zero reservations.
                     var mapped = _mapper.Map<ActiveFlashSale, FlashSaleDto>(
                         new ActiveFlashSale
                         {
                             Sale = result.FlashSale,
-                            QuantityAvailable = result.FlashSale.StockAllocation
+                            QuantityAvailable = result.QuantityAvailable
                         });
                     return Ok(mapped);
                 }
@@ -109,10 +111,17 @@ namespace API.Controllers
         // DELIBERATELY NOT decorated with [Cached]. The [Cached(600)] Redis response cache used on
         // ProductsController would mask live price/stock changes for up to 600s; real-time accuracy is a
         // hard requirement, so this active-sales query must always hit the service. AAP section 0.6.
+        // Review finding N1: an optional ?productId query parameter narrows the result to a single product's
+        // active sale(s) so the product page fetches only what it needs; omitting it preserves the full
+        // active-list behaviour. A Cache-Control: no-store response header is also emitted so no shared or
+        // browser cache retains this real-time payload (defence-in-depth alongside the absence of [Cached]).
         [HttpGet("/api/flash-sales/active")]
-        public async Task<ActionResult<IReadOnlyList<FlashSaleDto>>> GetActiveSales()
+        public async Task<ActionResult<IReadOnlyList<FlashSaleDto>>> GetActiveSales([FromQuery] int? productId = null)
         {
-            var sales = await _flashSaleService.GetActiveSalesAsync();
+            // N1: explicitly forbid any caching layer from retaining this real-time response.
+            Response.Headers["Cache-Control"] = "no-store";
+
+            var sales = await _flashSaleService.GetActiveSalesAsync(productId);
             return Ok(_mapper.Map<IReadOnlyList<ActiveFlashSale>, IReadOnlyList<FlashSaleDto>>(sales));
         }
     }

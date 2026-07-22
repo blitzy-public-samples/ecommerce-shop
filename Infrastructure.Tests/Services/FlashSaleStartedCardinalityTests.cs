@@ -42,7 +42,8 @@ namespace Infrastructure.Tests.Services
         {
             public List<int> StartedSaleIds { get; } = new List<int>();
             public List<int> StartedProductIds { get; } = new List<int>();
-            public List<int> Ended { get; } = new List<int>();
+            // M9: FlashSaleEnded now carries (productId, saleId); the double records both.
+            public List<(int ProductId, int SaleId)> Ended { get; } = new List<(int, int)>();
             public List<(int ProductId, int Quantity)> Updated { get; } = new List<(int, int)>();
 
             public Task BroadcastInventoryUpdatedAsync(int productId, int quantityAvailable)
@@ -58,9 +59,9 @@ namespace Infrastructure.Tests.Services
                 return Task.CompletedTask;
             }
 
-            public Task BroadcastFlashSaleEndedAsync(int productId)
+            public Task BroadcastFlashSaleEndedAsync(int productId, int saleId)
             {
-                Ended.Add(productId);
+                Ended.Add((productId, saleId));
                 return Task.CompletedTask;
             }
         }

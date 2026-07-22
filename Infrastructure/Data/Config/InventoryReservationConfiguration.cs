@@ -33,6 +33,14 @@ namespace Infrastructure.Data.Config
             // PostgreSQL; the constraint is emitted into the additive migration.
             builder.HasCheckConstraint("CK_InventoryReservations_Quantity_Positive", "\"Quantity\" > 0");
 
+            // Flash-Sale feature (review finding M2 — database-integrity backstop): the persisted Status must
+            // stay within the ReservationStatus enum domain (Active=0, Consumed=1, Released=2, Expired=3). A
+            // direct/buggy writer could otherwise store an out-of-range Status that would silently vanish from
+            // the availability aggregation (which filters on Active/Consumed) — a row "holding" stock that is
+            // counted by nobody. This single-row CHECK guarantees the invariant at the deepest layer and is
+            // emitted into the additive migration; keep its upper bound in step with the enum if values are added.
+            builder.HasCheckConstraint("CK_InventoryReservations_Status_Valid", "\"Status\" >= 0 AND \"Status\" <= 3");
+
             // Flash-Sale feature (review finding M19): a reservation is a hold against a specific flash sale, so
             // configure the required FK InventoryReservation.FlashSaleId -> FlashSales.Id (scalar FK, no navigation
             // per repository convention). DeleteBehavior.Restrict is intentional: a sale that still has ANY

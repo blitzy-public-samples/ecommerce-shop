@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import { environment } from '../../environments/environment';
@@ -23,13 +23,23 @@ export class FlashSaleService {
   }
 
   // Non-cached endpoint (intentionally NOT [Cached] server-side) so live price/stock stays fresh.
-  getActiveFlashSales(): Observable<IFlashSale[]> {
-    return this.http.get<IFlashSale[]>(this.baseUrl + 'flash-sales/active');
+  // N1-fe: an optional productId narrows the read to a single product via the server-side
+  // ?productId filter, so a product page no longer downloads every active sale in the catalog.
+  // Called with no argument the full active list is returned (behaviour preserved for callers that
+  // need it). An empty HttpParams serialises to no query string, so the bare URL is unchanged.
+  getActiveFlashSales(productId?: number): Observable<IFlashSale[]> {
+    let params = new HttpParams();
+    if (productId != null) {
+      params = params.set('productId', productId.toString());
+    }
+    return this.http.get<IFlashSale[]>(this.baseUrl + 'flash-sales/active', { params });
   }
 
-  // Convenience: resolve the single active sale for a product (undefined if none) from the list.
+  // Convenience: resolve the single active sale for a product (undefined if none).
+  // N1-fe: pushes the productId to the server so only the relevant sale(s) are fetched; the
+  // defensive .find still guards against a server that returns an unfiltered list.
   getActiveFlashSale(productId: number): Observable<IFlashSale> {
-    return this.getActiveFlashSales().pipe(
+    return this.getActiveFlashSales(productId).pipe(
       map(sales => sales.find(sale => sale.productId === productId))
     );
   }
@@ -44,7 +54,14 @@ export class FlashSaleService {
     });
   }
 
-  releaseReservation(id: number): Observable<any> {
-    return this.http.delete(this.baseUrl + 'inventory/reserve/' + id);
+  // M6-fe: the backend DELETE /api/inventory/reserve/{id} performs an ownership check and REQUIRES
+  // the owning sessionId as a query-string parameter ([FromQuery] string sessionId); without it the
+  // controller fails fast with HTTP 400. We therefore forward the caller-supplied sessionId,
+  // defaulting to the basket UUID in localStorage['basket_id'] — the SAME identity reserve() stamps
+  // on the hold — so a shopper can release only a reservation it owns. Repeated owner-release of an
+  // already-released hold is idempotent server-side (returns 204), so callers may safely retry.
+  releaseReservation(id: number, sessionId: string = localStorage.getItem('basket_id') || ''): Observable<any> {
+    const params = new HttpParams().set('sessionId', sessionId);
+    return this.http.delete(this.baseUrl + 'inventory/reserve/' + id, { params });
   }
 }

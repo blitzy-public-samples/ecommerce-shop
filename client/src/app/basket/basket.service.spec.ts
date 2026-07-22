@@ -381,4 +381,35 @@ describe('BasketService', () => {
       expect(totals).toEqual({ shipping: 10, subtotal: 20, total: 30 });
     });
   });
+
+  // 15. getOrCreateBasketId (M15-fe: shared ensure-basket-ID path; no HTTP)
+  describe('getOrCreateBasketId', () => {
+    it('should return the existing basket_id without creating a new one', () => {
+      // Arrange — a basket UUID already exists in localStorage.
+      spyOn(localStorage, 'getItem').and.returnValue('existing-basket-uuid');
+      const setItem = spyOn(localStorage, 'setItem');
+
+      // Act — purely local; afterEach verify() guarantees no HTTP was issued.
+      const id = service.getOrCreateBasketId();
+
+      // Assert — the persisted id is returned verbatim and no new basket is created/persisted.
+      expect(id).toBe('existing-basket-uuid');
+      expect(localStorage.getItem).toHaveBeenCalledWith('basket_id');
+      expect(setItem).not.toHaveBeenCalled();
+    });
+
+    it('should create and persist a new basket UUID when none exists', () => {
+      // Arrange — no basket UUID yet.
+      spyOn(localStorage, 'getItem').and.returnValue(null);
+      const setItem = spyOn(localStorage, 'setItem');
+
+      // Act
+      const id = service.getOrCreateBasketId();
+
+      // Assert — a fresh UUID is generated, persisted under basket_id and returned (same
+      // createBasket() path used by addItemToBasket). No HTTP is issued.
+      expect(id).toBeTruthy();
+      expect(setItem).toHaveBeenCalledWith('basket_id', id);
+    });
+  });
 });

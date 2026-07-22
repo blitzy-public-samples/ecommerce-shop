@@ -26,23 +26,31 @@ namespace Core.Interfaces
 
         // Explicit release for DELETE /api/inventory/reserve/{id} (review findings C07, C09). Requires the owning
         // sessionId so a caller can only release a hold it owns, and performs a CONDITIONAL, atomic transition
-        // from Active -> Released ONLY (guarded by the reservation's Status concurrency token so a concurrent
+        // from Active -> Released (guarded by the reservation's Status concurrency token so a concurrent
         // consume/expiry can never be overwritten). Returns:
         //   - ReleaseOutcome.NotFound  when no reservation with that Id exists;
         //   - ReleaseOutcome.Forbidden when the row exists but is owned by a different sessionId;
-        //   - ReleaseOutcome.Conflict  when the row is owned but NOT Active (already Consumed/Released/Expired),
-        //                              or a concurrent transition won the race — releasing sold or already-freed
-        //                              stock is refused, so stock is never double-returned;
-        //   - ReleaseOutcome.Released  after a successful Active -> Released transition; freed availability is
-        //                              then re-broadcast via the ordered coordinator. Freeing stock can never
-        //                              oversell, so the sale's allocation authority (Version) is not contended.
+        //   - ReleaseOutcome.Released  after a successful Active -> Released transition (freed availability is
+        //                              then re-broadcast via the ordered coordinator), AND — review finding M6 —
+        //                              when the caller-owned hold is ALREADY Released: re-releasing an owned hold
+        //                              is IDEMPOTENT (returns Released, does NOT re-broadcast, and never
+        //                              double-returns stock), so a retried/duplicate DELETE is safe;
+        //   - ReleaseOutcome.Conflict  when the row is owned but is in a NON-releasable SOLD/EXPIRED state
+        //                              (already Consumed or Expired), or a concurrent transition won the race —
+        //                              releasing sold or reclaimed stock is refused, so stock is never
+        //                              double-returned. Freeing stock can never oversell, so the sale's
+        //                              allocation authority (Version) is not contended.
         Task<ReleaseOutcome> ReleaseAsync(int reservationId, string sessionId);
 
         // Checkout hook (review findings C08, C09, C10): invoked by OrderService.CreateOrderAsync AFTER a
         // successful _unitOfWork.Complete(). For each ordered line it consumes the caller session's ACTIVE,
         // non-expired hold for that product, honouring the EXACT ordered quantity and the hold's own FlashSaleId
         // (sale-scoped): a hold is consumed only up to the ordered quantity, never across sales, and never an
-        // already-expired hold. Each transition is a CONDITIONAL, atomic Active -> Consumed guarded by the Status
+        // already-expired hold. Review finding C3: when a single hold covers MORE than the ordered quantity it is
+        // SPLIT under the Status concurrency token — the original row transitions Active -> Consumed with its
+        // Quantity reduced to exactly the consumed amount, and a NEW Active row carries the leftover — so the
+        // consume is a guarded transition on the original (no unguarded field write) and the remainder stays
+        // reservable. Each transition is a CONDITIONAL, atomic Active -> Consumed guarded by the Status
         // concurrency token; Consumed rows REMAIN subtracted from availability (the units are sold) and are NEVER
         // deleted, which preserves the zero-oversell invariant (AAP R3). Fully defensive (C10): a null/empty set,
         // an unmatched line, or a lost concurrency race is skipped so a missing/contended hold never breaks the
@@ -70,9 +78,10 @@ namespace Core.Interfaces
         NotFound,
         Forbidden,
         // Flash-Sale feature (review finding C07/C09): the reservation exists and is owned by the caller, but it
-        // is NOT in a releasable (Active) state — it was already Consumed (sold), Released, or Expired. Release
-        // performs a conditional Active -> Released transition ONLY, so it returns Conflict here instead of
-        // restoring already-sold or already-freed stock. A future controller maps this to HTTP 409.
+        // is in a SOLD/EXPIRED terminal state — already Consumed (sold) or Expired. Release performs a conditional
+        // Active -> Released transition, so it returns Conflict here instead of restoring already-sold or reclaimed
+        // stock. Review finding M6: an already-RELEASED owned hold is NOT a Conflict — re-releasing is idempotent
+        // and returns Released (see ReleaseAsync). A future controller maps Conflict to HTTP 409.
         Conflict
     }
 

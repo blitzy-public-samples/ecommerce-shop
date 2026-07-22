@@ -10,6 +10,7 @@ using Core.Entities;                      // FlashSale
 using Core.Interfaces;                    // IFlashSaleService, ActiveFlashSale, FlashSaleScheduleResult/Outcome
 using FluentAssertions;
 using Microsoft.AspNetCore.Authorization; // AuthorizeAttribute (reflection assertion)
+using Microsoft.AspNetCore.Http;          // DefaultHttpContext (so GetActiveSales can write the N1 no-store header)
 using Microsoft.AspNetCore.Mvc;
 using Moq;
 using Xunit;
@@ -29,12 +30,13 @@ namespace API.Tests.Controllers
     /// <para>
     /// Contract note: the authored <see cref="IFlashSaleService.ScheduleAsync"/> returns a
     /// <see cref="FlashSaleScheduleResult"/> (a deterministic <see cref="FlashSaleScheduleOutcome"/>
-    /// plus, on success, the persisted <see cref="FlashSale"/>). <c>CreateFlashSale</c> switches on that
-    /// outcome and translates it into an exact HTTP status: <c>Success</c> -&gt; <c>200 OK</c> carrying
-    /// the mapped <see cref="FlashSaleDto"/>; <c>ProductNotFound</c> -&gt; <c>404</c>; <c>Overlap</c>
-    /// -&gt; <c>409</c>; and the four validation outcomes -&gt; <c>400</c>. On success the controller wraps
-    /// the new sale in an <see cref="ActiveFlashSale"/> whose <c>QuantityAvailable</c> equals the sale's
-    /// <c>StockAllocation</c> (a brand-new sale has zero reservations) before mapping.
+    /// plus, on success, the persisted <see cref="FlashSale"/> and the authoritative post-commit
+    /// <c>QuantityAvailable</c>). <c>CreateFlashSale</c> switches on that outcome and translates it into an
+    /// exact HTTP status: <c>Success</c> -&gt; <c>200 OK</c> carrying the mapped <see cref="FlashSaleDto"/>;
+    /// <c>ProductNotFound</c> -&gt; <c>404</c>; <c>Overlap</c> -&gt; <c>409</c>; and the four validation
+    /// outcomes -&gt; <c>400</c>. Review finding M12: on success the controller wraps the new sale in an
+    /// <see cref="ActiveFlashSale"/> whose <c>QuantityAvailable</c> is the service-computed value from the
+    /// result (NOT fabricated from <c>StockAllocation</c>) before mapping.
     /// </para>
     /// <para>
     /// Conventions (mirroring <c>BasketControllerTests</c>/<c>ProductsControllerTests</c>/<c>OrdersControllerTests</c>):
@@ -59,7 +61,16 @@ namespace API.Tests.Controllers
         {
             var service = new Mock<IFlashSaleService>();
             var mapper = new Mock<IMapper>();
-            var controller = new FlashSalesController(service.Object, mapper.Object);
+            var controller = new FlashSalesController(service.Object, mapper.Object)
+            {
+                // GetActiveSales writes a Cache-Control response header (review finding N1), which requires a
+                // live HttpContext. A DefaultHttpContext supplies a real, writable Response.Headers collection
+                // when the action is invoked directly in-process (no request pipeline runs in a unit test).
+                ControllerContext = new ControllerContext
+                {
+                    HttpContext = new DefaultHttpContext()
+                }
+            };
             return (controller, service, mapper);
         }
 
@@ -167,23 +178,31 @@ namespace API.Tests.Controllers
         }
 
         /// <summary>
-        /// A brand-new sale has zero reservations, so the controller must wrap the scheduled sale in an
-        /// <see cref="ActiveFlashSale"/> whose <c>QuantityAvailable</c> equals the sale's
-        /// <c>StockAllocation</c> before mapping. The exact instance passed to the mapper is captured and
-        /// inspected.
+        /// Review finding M12: the controller must wrap the scheduled sale in an <see cref="ActiveFlashSale"/>
+        /// whose <c>QuantityAvailable</c> is the AUTHORITATIVE, service-computed value carried on
+        /// <see cref="FlashSaleScheduleResult.QuantityAvailable"/> — NOT a figure the controller fabricates from
+        /// <c>StockAllocation</c>. Here the service reports 90 (e.g. a concurrently-created hold already consumed
+        /// 10 of the 100 units), and the controller must surface exactly that. The instance passed to the mapper
+        /// is captured and inspected.
         /// </summary>
         [Fact]
-        public async Task CreateFlashSale_WhenScheduled_MapsActiveFlashSaleWithQuantityEqualToStockAllocation()
+        public async Task CreateFlashSale_WhenScheduled_MapsActiveFlashSaleWithServiceComputedQuantityAvailable()
         {
             // Arrange
             var (controller, service, mapper) = CreateController();
             var dto = SampleValidDto();
             var sale = new FlashSale { Id = 11, ProductId = dto.ProductId, StockAllocation = 100 };
+            const int authoritativeAvailable = 90; // deliberately != StockAllocation to prove propagation, not fabrication
             ActiveFlashSale captured = null;
 
             service
                 .Setup(s => s.ScheduleAsync(It.IsAny<int>(), It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), It.IsAny<decimal>(), It.IsAny<int>()))
-                .ReturnsAsync(new FlashSaleScheduleResult { Outcome = FlashSaleScheduleOutcome.Success, FlashSale = sale });
+                .ReturnsAsync(new FlashSaleScheduleResult
+                {
+                    Outcome = FlashSaleScheduleOutcome.Success,
+                    FlashSale = sale,
+                    QuantityAvailable = authoritativeAvailable
+                });
             mapper
                 .Setup(m => m.Map<ActiveFlashSale, FlashSaleDto>(It.IsAny<ActiveFlashSale>()))
                 .Callback<ActiveFlashSale>(a => captured = a)
@@ -195,7 +214,7 @@ namespace API.Tests.Controllers
             // Assert
             captured.Should().NotBeNull();
             captured.Sale.Should().BeSameAs(sale);
-            captured.QuantityAvailable.Should().Be(sale.StockAllocation);
+            captured.QuantityAvailable.Should().Be(authoritativeAvailable);
         }
 
         // ------------------------------------------------------------------
@@ -330,7 +349,9 @@ namespace API.Tests.Controllers
                 new FlashSaleDto { Id = 2, ProductId = 6, StockAllocation = 50, QuantityAvailable = 50 }
             };
 
-            service.Setup(s => s.GetActiveSalesAsync()).ReturnsAsync(sales);
+            // N1: GetActiveSalesAsync now takes an optional productId; an explicit matcher is required because a
+            // Moq expression tree cannot omit optional arguments (CS0854).
+            service.Setup(s => s.GetActiveSalesAsync(It.IsAny<int?>())).ReturnsAsync(sales);
             mapper
                 .Setup(m => m.Map<IReadOnlyList<ActiveFlashSale>, IReadOnlyList<FlashSaleDto>>(sales))
                 .Returns(mapped);
@@ -344,7 +365,8 @@ namespace API.Tests.Controllers
             var returned = okResult.Value.Should().BeAssignableTo<IReadOnlyList<FlashSaleDto>>().Subject;
             returned.Should().HaveCount(2);
             returned[0].QuantityAvailable.Should().Be(80);
-            service.Verify(s => s.GetActiveSalesAsync(), Times.Once);
+            // N1: the action was called without a productId, so it must forward null (the full-list contract).
+            service.Verify(s => s.GetActiveSalesAsync((int?)null), Times.Once);
         }
 
         /// <summary>
@@ -359,7 +381,8 @@ namespace API.Tests.Controllers
             IReadOnlyList<ActiveFlashSale> sales = new List<ActiveFlashSale>();
             IReadOnlyList<FlashSaleDto> mapped = new List<FlashSaleDto>();
 
-            service.Setup(s => s.GetActiveSalesAsync()).ReturnsAsync(sales);
+            // N1: explicit matcher required (Moq expression tree cannot omit the new optional productId; CS0854).
+            service.Setup(s => s.GetActiveSalesAsync(It.IsAny<int?>())).ReturnsAsync(sales);
             mapper
                 .Setup(m => m.Map<IReadOnlyList<ActiveFlashSale>, IReadOnlyList<FlashSaleDto>>(sales))
                 .Returns(mapped);
@@ -372,6 +395,68 @@ namespace API.Tests.Controllers
             var returned = okResult.Value.Should().BeAssignableTo<IReadOnlyList<FlashSaleDto>>().Subject;
             returned.Should().NotBeNull();
             returned.Should().BeEmpty();
+        }
+
+        /// <summary>
+        /// N1: when a <c>?productId</c> query value is supplied, the controller must forward that EXACT value
+        /// to <see cref="IFlashSaleService.GetActiveSalesAsync"/> so the result is narrowed to the single
+        /// product (the product-details page subscribes per product). Proven by invoking the action with an
+        /// explicit id and verifying the service received the same id — never the full-list <c>null</c>.
+        /// </summary>
+        [Fact]
+        public async Task GetActiveSales_WhenProductIdProvided_ForwardsProductIdToService()
+        {
+            // Arrange
+            var (controller, service, mapper) = CreateController();
+            const int productId = 7;
+            IReadOnlyList<ActiveFlashSale> sales = new List<ActiveFlashSale>
+            {
+                new ActiveFlashSale { Sale = new FlashSale { Id = 3, ProductId = productId, StockAllocation = 40 }, QuantityAvailable = 40 }
+            };
+            IReadOnlyList<FlashSaleDto> mapped = new List<FlashSaleDto>
+            {
+                new FlashSaleDto { Id = 3, ProductId = productId, StockAllocation = 40, QuantityAvailable = 40 }
+            };
+            // N1: explicit matcher required (Moq expression tree cannot omit the optional productId; CS0854).
+            service.Setup(s => s.GetActiveSalesAsync(It.IsAny<int?>())).ReturnsAsync(sales);
+            mapper
+                .Setup(m => m.Map<IReadOnlyList<ActiveFlashSale>, IReadOnlyList<FlashSaleDto>>(sales))
+                .Returns(mapped);
+
+            // Act
+            var result = await controller.GetActiveSales(productId);
+
+            // Assert
+            var okResult = result.Result.Should().BeOfType<OkObjectResult>().Subject;
+            okResult.Value.Should().BeSameAs(mapped);
+            // The exact supplied id must be forwarded (the single-product filter contract), never null.
+            service.Verify(s => s.GetActiveSalesAsync(productId), Times.Once);
+            service.Verify(s => s.GetActiveSalesAsync((int?)null), Times.Never);
+        }
+
+        /// <summary>
+        /// N1: the active-sales response must carry <c>Cache-Control: no-store</c> so no shared proxy or
+        /// browser cache retains the real-time price/stock payload (the endpoint is also deliberately NOT
+        /// decorated with <c>[Cached]</c>). Proven by reading the header the action wrote onto the live
+        /// response supplied by the test's <see cref="Microsoft.AspNetCore.Http.DefaultHttpContext"/>.
+        /// </summary>
+        [Fact]
+        public async Task GetActiveSales_WritesNoStoreCacheControlHeader()
+        {
+            // Arrange
+            var (controller, service, mapper) = CreateController();
+            IReadOnlyList<ActiveFlashSale> sales = new List<ActiveFlashSale>();
+            service.Setup(s => s.GetActiveSalesAsync(It.IsAny<int?>())).ReturnsAsync(sales);
+            mapper
+                .Setup(m => m.Map<IReadOnlyList<ActiveFlashSale>, IReadOnlyList<FlashSaleDto>>(sales))
+                .Returns(new List<FlashSaleDto>());
+
+            // Act
+            await controller.GetActiveSales();
+
+            // Assert — the action explicitly forbids any caching layer from retaining this real-time response.
+            controller.Response.Headers.Should().ContainKey("Cache-Control");
+            controller.Response.Headers["Cache-Control"].ToString().Should().Be("no-store");
         }
 
         // ------------------------------------------------------------------

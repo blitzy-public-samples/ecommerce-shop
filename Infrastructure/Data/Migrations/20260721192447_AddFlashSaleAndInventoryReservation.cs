@@ -24,6 +24,12 @@ namespace Infrastructure.Data.Migrations
                 constraints: table =>
                 {
                     table.PrimaryKey("PK_FlashSales", x => x.Id);
+                    // Flash-Sale feature (review finding M2): database-integrity CHECK constraints — a positive
+                    // sale price, a positive stock allocation, and a correctly-ordered non-empty [StartAt, EndAt]
+                    // window, so a direct/buggy row can never corrupt availability accounting or event routing.
+                    table.CheckConstraint("CK_FlashSales_SalePrice_Positive", "\"SalePrice\" > 0");
+                    table.CheckConstraint("CK_FlashSales_StockAllocation_Positive", "\"StockAllocation\" > 0");
+                    table.CheckConstraint("CK_FlashSales_EndAt_After_StartAt", "\"EndAt\" > \"StartAt\"");
                     table.ForeignKey(
                         name: "FK_FlashSales_Products_ProductId",
                         column: x => x.ProductId,
@@ -49,6 +55,10 @@ namespace Infrastructure.Data.Migrations
                 {
                     table.PrimaryKey("PK_InventoryReservations", x => x.Id);
                     table.CheckConstraint("CK_InventoryReservations_Quantity_Positive", "\"Quantity\" > 0");
+                    // Flash-Sale feature (review finding M2): Status must stay within the ReservationStatus enum
+                    // domain (Active=0, Consumed=1, Released=2, Expired=3) so a hold can never fall out of the
+                    // availability aggregation (which counts only Active/Consumed rows).
+                    table.CheckConstraint("CK_InventoryReservations_Status_Valid", "\"Status\" >= 0 AND \"Status\" <= 3");
                     table.ForeignKey(
                         name: "FK_InventoryReservations_FlashSales_FlashSaleId",
                         column: x => x.FlashSaleId,

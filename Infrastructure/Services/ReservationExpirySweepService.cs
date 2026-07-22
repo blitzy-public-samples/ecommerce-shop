@@ -213,20 +213,26 @@ namespace Infrastructure.Services
             //    distinct products whose stock was actually released this tick.
             var releasedProductIds = await ExpireStaleReservationsAsync(context, now, stoppingToken);
 
-            // 2) M16: sales currently INSIDE their window, treated as half-open [StartAt, EndAt) for boundary
-            //    events so "started" and "ended" are mutually exclusive at the exact EndAt instant.
+            // 2) M16: sales currently INSIDE their window. Review finding M10: the window is INCLUSIVE of both
+            //    bounds — [StartAt, EndAt] — to match AAP 0.1.1 ("valid inside [start_at, end_at]") and every other
+            //    read path (FlashSaleService.GetActiveSalesAsync, InventoryReservationService.ReserveAsync, and
+            //    ComputeSaleScopedAvailabilityAsync below all use EndAt >= now). The exact EndAt instant therefore
+            //    belongs to "active", and "ended" begins strictly AFTER EndAt (fs.EndAt < now in step 3), so the two
+            //    sets remain mutually exclusive at the boundary instant.
             var activeSales = await context.FlashSales
-                .Where(fs => fs.StartAt <= now && fs.EndAt > now)
+                .Where(fs => fs.StartAt <= now && fs.EndAt >= now)
                 .OrderBy(fs => fs.Id)
                 .Take(BatchSize)
                 .ToListAsync(stoppingToken);
 
             // 3) M15/M16: sales whose window has CLOSED, restricted to a RECENT lookback so this set is bounded
-            //    (a sale that ended long ago is never re-scanned and never re-announced).
+            //    (a sale that ended long ago is never re-scanned and never re-announced). Review finding M10: a sale
+            //    has ended only STRICTLY after EndAt (fs.EndAt < now), the complement of the inclusive active window
+            //    in step 2, so a sale sitting exactly on EndAt is "active", never "ended".
             var lookbackMs = Math.Max((long)PollIntervalMs * 5, 60000);
             var endedLookback = now - TimeSpan.FromMilliseconds(lookbackMs);
             var endedSales = await context.FlashSales
-                .Where(fs => fs.EndAt <= now && fs.EndAt > endedLookback)
+                .Where(fs => fs.EndAt < now && fs.EndAt > endedLookback)
                 .OrderBy(fs => fs.Id)
                 .Take(BatchSize)
                 .ToListAsync(stoppingToken);
@@ -251,7 +257,9 @@ namespace Infrastructure.Services
             {
                 if (_endedSaleIds.Add(sale.Id))
                 {
-                    await _coordinator.PublishFlashSaleEndedAsync(sale.ProductId);
+                    // M9: carry the sale id alongside the product id so clients can reconcile the exact sale that
+                    // ended (a product may have had more than one sale over its lifetime).
+                    await _coordinator.PublishFlashSaleEndedAsync(sale.ProductId, sale.Id);
                 }
             }
             _endedSaleIds.IntersectWith(endedIds); // M15: prune ids outside the recent-ended window -> bounded.

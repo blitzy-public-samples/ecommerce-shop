@@ -412,6 +412,18 @@ namespace API.IntegrationTests.Migrations
             foreignKeys["FK_FlashSales_Products_ProductId"].Should().Be(
                 "FOREIGN KEY (\"ProductId\") REFERENCES \"Products\"(\"Id\") ON DELETE RESTRICT");
 
+            // Review finding M2: the three database-integrity CHECK constraints exist with their exact,
+            // PostgreSQL-normalized predicate text — a positive sale price, a positive stock allocation, and a
+            // correctly-ordered non-empty [StartAt, EndAt] window. (numeric literal 0 is deparsed as
+            // "(0)::numeric" for the decimal SalePrice column.)
+            var checks = await GetConstraintDefinitionsAsync(context, "FlashSales", 'c');
+            checks.Should().ContainKey("CK_FlashSales_SalePrice_Positive");
+            checks["CK_FlashSales_SalePrice_Positive"].Should().Be("CHECK ((\"SalePrice\" > (0)::numeric))");
+            checks.Should().ContainKey("CK_FlashSales_StockAllocation_Positive");
+            checks["CK_FlashSales_StockAllocation_Positive"].Should().Be("CHECK ((\"StockAllocation\" > 0))");
+            checks.Should().ContainKey("CK_FlashSales_EndAt_After_StartAt");
+            checks["CK_FlashSales_EndAt_After_StartAt"].Should().Be("CHECK ((\"EndAt\" > \"StartAt\"))");
+
             // Exact primary key.
             var primaryKeys = await GetConstraintDefinitionsAsync(context, "FlashSales", 'p');
             primaryKeys.Should().ContainKey("PK_FlashSales");
@@ -452,6 +464,12 @@ namespace API.IntegrationTests.Migrations
             var checks = await GetConstraintDefinitionsAsync(context, "InventoryReservations", 'c');
             checks.Should().ContainKey("CK_InventoryReservations_Quantity_Positive");
             checks["CK_InventoryReservations_Quantity_Positive"].Should().Be("CHECK ((\"Quantity\" > 0))");
+
+            // Review finding M2: the Status-domain CHECK constraint keeps Status within the ReservationStatus
+            // enum range (Active=0 .. Expired=3), with its exact PostgreSQL-normalized text.
+            checks.Should().ContainKey("CK_InventoryReservations_Status_Valid");
+            checks["CK_InventoryReservations_Status_Valid"].Should().Be(
+                "CHECK (((\"Status\" >= 0) AND (\"Status\" <= 3)))");
 
             // Exact primary key.
             var primaryKeys = await GetConstraintDefinitionsAsync(context, "InventoryReservations", 'p');
@@ -526,6 +544,136 @@ namespace API.IntegrationTests.Migrations
                         FlashSaleId = sale.Id,
                         ProductId = seededProductId,
                         Quantity = 3,
+                        SessionId = Guid.NewGuid().ToString(),
+                        ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+                        Status = ReservationStatus.Active
+                    });
+                    await context.SaveChangesAsync();
+
+                    (await context.FlashSales.CountAsync()).Should().Be(1);
+                    (await context.InventoryReservations.CountAsync()).Should().Be(1);
+                }
+            }
+            finally
+            {
+                // Always drop the throwaway database so nothing leaks on the shared server.
+                await DropIsolatedDatabaseAsync(_fixture.StoreConnectionString, databaseName);
+            }
+        }
+
+        [Fact]
+        public async Task StoreDatabase_AddingVersionTokenToPopulated202112Schema_BackfillsExistingRowsAndAddsFeatureTables()
+        {
+            // Review finding M4: the realistic production upgrade path starts at the ORIGINAL, already-populated
+            // 20211212023144 ("PostGres initial") schema — which has NO Products.Version column — and then
+            // migrates forward through BOTH feature migrations: first AddProductVersionConcurrencyToken (which
+            // must add the NON-NULL `oid` token to the already-populated Products table, backfilling every
+            // pre-existing row with the default 0u), then AddFlashSaleAndInventoryReservation (the two new
+            // tables). The sibling PreservesDataAndAddsFeatureTables test seeds AFTER Version already exists, so
+            // it cannot prove that adding the non-null token to the original populated schema succeeds and
+            // backfills existing rows; this test closes exactly that gap.
+            //
+            // Seeding is intentionally done via RAW SQL, not the EF model. The current StoreContext model
+            // already includes Product.Version, so any EF insert (context.Products.Add + SaveChanges) at the
+            // pre-Version schema would emit SQL referencing a "Version" column that does not yet exist and fail.
+            // Raw INSERTs that name only the original 202112 columns are the faithful way to reproduce rows that
+            // pre-date the token. Runs on an ISOLATED, disposable database on the SAME Testcontainers server so
+            // it never mutates the shared, seeded e-commerce database the other tests rely on.
+            var databaseName = "blitzy_adhoc_initupgrade_" + Guid.NewGuid().ToString("N");
+            var connectionString =
+                await CreateIsolatedDatabaseAsync(_fixture.StoreConnectionString, databaseName);
+
+            try
+            {
+                // 1) Migrate ONLY to the original 202112 initial schema (before Version and the feature tables).
+                await using (var context = CreateStoreContext(connectionString))
+                {
+                    var initialMigrationId = ResolveMigrationId(context, "PostGres initial");
+                    await MigrateToAsync(context, initialMigrationId);
+
+                    // The concurrency token does NOT exist yet ...
+                    (await GetColumnMetadataAsync(context, "Products"))
+                        .Should().NotContainKey("Version",
+                            "the original 202112 schema predates the optimistic-concurrency token");
+                    // ... and neither do the feature tables.
+                    var initialTables = await GetPublicTableNamesAsync(context);
+                    initialTables.Should().NotContain("FlashSales");
+                    initialTables.Should().NotContain("InventoryReservations");
+                }
+
+                // 2) Populate representative catalog rows via RAW SQL at the pre-Version schema. Two products
+                //    (referencing one brand + one type) are inserted so the backfill is proven across multiple
+                //    pre-existing rows. Column lists name only original 202112 columns; identity Ids are
+                //    generated by the database and the products resolve their FKs via scalar subqueries.
+                await using (var context = CreateStoreContext(connectionString))
+                {
+                    await context.Database.ExecuteSqlRawAsync(
+                        "INSERT INTO \"ProductBrands\" (\"Name\") VALUES ('M4InitBrand');");
+                    await context.Database.ExecuteSqlRawAsync(
+                        "INSERT INTO \"ProductTypes\" (\"Name\") VALUES ('M4InitType');");
+                    await context.Database.ExecuteSqlRawAsync(
+                        "INSERT INTO \"Products\" " +
+                        "(\"Name\",\"Description\",\"Price\",\"PictureUrl\",\"ProductTypeId\",\"ProductBrandId\") " +
+                        "VALUES ('M4 Init Product A','Seeded on the pre-Version 202112 schema',111.11," +
+                        "'images/products/m4a.png'," +
+                        "(SELECT \"Id\" FROM \"ProductTypes\" WHERE \"Name\"='M4InitType')," +
+                        "(SELECT \"Id\" FROM \"ProductBrands\" WHERE \"Name\"='M4InitBrand'));");
+                    await context.Database.ExecuteSqlRawAsync(
+                        "INSERT INTO \"Products\" " +
+                        "(\"Name\",\"Description\",\"Price\",\"PictureUrl\",\"ProductTypeId\",\"ProductBrandId\") " +
+                        "VALUES ('M4 Init Product B','Seeded on the pre-Version 202112 schema',222.22," +
+                        "'images/products/m4b.png'," +
+                        "(SELECT \"Id\" FROM \"ProductTypes\" WHERE \"Name\"='M4InitType')," +
+                        "(SELECT \"Id\" FROM \"ProductBrands\" WHERE \"Name\"='M4InitBrand'));");
+                }
+
+                // 3) Migrate forward through BOTH feature migrations (MigrateAsync applies all pending: the
+                //    Version-token migration, THEN the feature-tables migration) onto the POPULATED schema.
+                await using (var context = CreateStoreContext(connectionString))
+                {
+                    await context.Database.MigrateAsync();
+
+                    // Both feature migrations are now recorded as applied.
+                    var applied = await context.Database.GetAppliedMigrationsAsync();
+                    applied.Should().Contain(id => id.EndsWith("AddProductVersionConcurrencyToken"),
+                        "the non-null concurrency token migration must run against the populated schema");
+                    applied.Should().Contain(id => id.EndsWith("AddFlashSaleAndInventoryReservation"),
+                        "the additive feature-tables migration must run after the token migration");
+
+                    // The non-null Version token now exists on Products (the core M4 proof: adding a NON-NULL
+                    // column to an already-populated table succeeded).
+                    var upgradedColumns = await GetColumnMetadataAsync(context, "Products");
+                    upgradedColumns.Should().ContainKey("Version");
+                    upgradedColumns["Version"].IsNullable.Should().BeFalse(
+                        "the concurrency token is added as NOT NULL");
+
+                    // Every PRE-EXISTING row survived AND was backfilled with the migration's default (0u); no
+                    // data was lost when the non-null token was introduced.
+                    var products = await context.Products.AsNoTracking().OrderBy(p => p.Price).ToListAsync();
+                    products.Should().HaveCount(2, "both pre-Version rows survive the token addition");
+                    products.Select(p => p.Name).Should().Equal("M4 Init Product A", "M4 Init Product B");
+                    products.Should().OnlyContain(p => p.Version == 0u,
+                        "adding the non-null token to a populated table backfills existing rows with the 0u default");
+
+                    // The two feature tables are genuinely usable end-to-end, including their FKs to a
+                    // backfilled, pre-existing product (a real FlashSale + a real InventoryReservation).
+                    var target = products.First();
+                    var sale = new FlashSale
+                    {
+                        ProductId = target.Id,
+                        StartAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+                        EndAt = DateTimeOffset.UtcNow.AddHours(1),
+                        SalePrice = 55.55m,
+                        StockAllocation = 40
+                    };
+                    context.FlashSales.Add(sale);
+                    await context.SaveChangesAsync();
+
+                    context.InventoryReservations.Add(new InventoryReservation
+                    {
+                        FlashSaleId = sale.Id,
+                        ProductId = target.Id,
+                        Quantity = 4,
                         SessionId = Guid.NewGuid().ToString(),
                         ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
                         Status = ReservationStatus.Active

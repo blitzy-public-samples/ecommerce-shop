@@ -10,9 +10,10 @@
          (unparseable tokens could be logged before application log filtering). The hub introduces query-string
          token ingress, so the affected 5.0.8 build is upgraded to the patched, runtime-aligned 5.0.17. -->
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="5.0.17" />
-    <!-- Flash-Sale feature (review finding M23): keep the sibling auth package on the same patched 5.0.17
-         runtime line so the auth stack is not a mixed 5.0.8/5.0.17 set (package is currently unused in code). -->
-    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="5.0.17" />
+    <!-- Flash-Sale feature (review finding M18): the previously-added Microsoft.AspNetCore.Authentication
+         .OpenIdConnect reference was UNUSED anywhere in code and is removed to honour the frozen minimal .NET
+         package footprint (AAP §0.3.1). The JwtBearer scheme above is the only authentication package the app
+         actually consumes (IdentityServiceExtensions.AddJwtBearer). -->
     <!-- Flash-Sale feature (review finding M24): pin the IdentityModel/JWT stack to patched 6.35.0
          (GHSA-59j7-ghrg-fj52: oversized compressed tokens -> excessive CPU/memory). These DIRECT references
          override the vulnerable 6.12.0 pulled transitively by the auth packages above; query-string hub auth is

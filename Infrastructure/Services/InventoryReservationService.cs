@@ -76,8 +76,23 @@ namespace Infrastructure.Services
         {
             normalized = null;
             if (string.IsNullOrWhiteSpace(sessionId)) return false;
-            if (!Guid.TryParse(sessionId.Trim(), out var g)) return false;
-            normalized = g.ToString("D");
+
+            // Flash-Sale feature (review finding M15): enforce the SAME canonical RFC 4122 version-4 UUID
+            // contract as the API boundary (CanonicalUuidV4Attribute / ReserveInventoryDto) at THIS service
+            // boundary too, so every layer keys a basket off exactly ONE identity and the "any Guid version"
+            // gap is closed. Guid.TryParseExact(.., "D") accepts ONLY the 36-char hyphenated form (rejecting
+            // the brace/parenthesis/no-hyphen "B"/"P"/"N" shapes and any non-parseable text); the version
+            // nibble (canonical index 14) must be '4' and the variant nibble (index 19) must be one of
+            // 8/9/a/b (RFC 4122 10xx). A non-v4 Guid — which the client uuidv4() can never emit — is rejected
+            // before any database work, byte-for-byte matching the API validator so reserve/release/consume
+            // all key off the identical canonical identity.
+            if (!Guid.TryParseExact(sessionId.Trim(), "D", out var g)) return false;
+            var canonical = g.ToString("D");
+            if (canonical[14] != '4') return false;
+            var variant = canonical[19];
+            if (variant != '8' && variant != '9' && variant != 'a' && variant != 'b') return false;
+
+            normalized = canonical;
             return true;
         }
 
@@ -215,8 +230,18 @@ namespace Infrastructure.Services
                 return ReleaseOutcome.Forbidden;
             }
 
-            // C07/C09 — refuse to "release" anything but an Active hold. Releasing a Consumed (sold), Released,
-            // or Expired hold would restore stock that is not free to return, so it is a Conflict, not a release.
+            // M6 — a repeat DELETE by the OWNER of an already-Released hold is IDEMPOTENT success: the stock is
+            // already back in the pool, so reporting the same Released outcome (rather than 409) lets a retried
+            // or duplicated cart-cancellation converge without a spurious error. Ownership was already proven
+            // above, so this branch can never re-release a foreign hold.
+            if (reservation.Status == ReservationStatus.Released)
+            {
+                return ReleaseOutcome.Released; // idempotent: this owner already released this hold.
+            }
+
+            // C07/C09 — refuse to "release" a Consumed (sold) or Expired hold. Restoring their stock would
+            // return units that are not free to return (sold, or already swept back), so it is a Conflict, not
+            // a release. Only an Active hold performs the real Active -> Released transition below.
             if (reservation.Status != ReservationStatus.Active)
             {
                 return ReleaseOutcome.Conflict;
@@ -290,11 +315,10 @@ namespace Infrastructure.Services
                 {
                     if (remaining <= 0) break; // this product's order is fully satisfied.
 
-                    // Consume the whole hold when it does not exceed what is still ordered; otherwise SPLIT it:
-                    // consume exactly `remaining` units as a new Consumed row and leave the leftover Active.
+                    // Consume the whole hold when it does not exceed what is still ordered; otherwise SPLIT it.
                     var wholeHold = hold.Quantity <= remaining;
                     var consumeQty = wholeHold ? hold.Quantity : remaining;
-                    InventoryReservation consumedPart = null;
+                    InventoryReservation remainderPart = null;
 
                     try
                     {
@@ -304,33 +328,51 @@ namespace Infrastructure.Services
                         }
                         else
                         {
-                            consumedPart = new InventoryReservation
+                            // C3 FIX (concurrent split double-sale): a partial consume now transitions the
+                            // ORIGINAL hold's STATUS (Active -> Consumed) — carrying exactly the consumed
+                            // quantity — and represents the untouched leftover as a NEW Active row. Previously
+                            // the original row STAYED Active with only a decremented Quantity, an UNGUARDED
+                            // field write: because Status (the sole concurrency token) was unchanged, two
+                            // concurrent consumes of the same 10-unit hold could BOTH pass "WHERE Status =
+                            // Active", each inserting a 6-unit Consumed row and each writing Quantity = 4 —
+                            // selling 12 while 4 stayed held (an oversell, violating AAP R3). By flipping the
+                            // original row's Status here, the guarded UPDATE ("SET Status = Consumed, Quantity =
+                            // @consumeQty WHERE Id = @id AND Status = Active") is won by EXACTLY ONE consumer;
+                            // the loser matches zero rows -> DbUpdateConcurrencyException -> defensive skip. The
+                            // total held quantity is preserved (Consumed @consumeQty + new Active leftover ==
+                            // the original hold), so the split itself never changes availability.
+                            var leftover = hold.Quantity - consumeQty; // > 0 here (hold.Quantity > remaining).
+                            hold.Status = ReservationStatus.Consumed;   // guarded Active -> Consumed transition.
+                            hold.Quantity = consumeQty;                 // original row records exactly what sold.
+
+                            remainderPart = new InventoryReservation
                             {
                                 FlashSaleId = hold.FlashSaleId,
                                 ProductId = hold.ProductId,
-                                Quantity = consumeQty,
+                                Quantity = leftover,
                                 SessionId = hold.SessionId,
-                                ExpiresAt = hold.ExpiresAt,
-                                Status = ReservationStatus.Consumed
+                                ExpiresAt = hold.ExpiresAt, // leftover keeps the original hold's TTL.
+                                Status = ReservationStatus.Active
                             };
-                            _context.InventoryReservations.Add(consumedPart);
-                            hold.Quantity -= consumeQty; // leftover remains an Active hold (expires via TTL).
+                            _context.InventoryReservations.Add(remainderPart);
                         }
 
                         // The Status concurrency token guards the hold's UPDATE (WHERE ... AND Status = Active);
-                        // the split INSERT commits atomically in the same SaveChanges.
+                        // the split's leftover INSERT commits atomically in the same SaveChanges.
                         await _context.SaveChangesAsync();
                         remaining -= consumeQty;
                         affected.Add(productId);
                     }
                     catch (DbUpdateConcurrencyException)
                     {
-                        // A concurrent expiry/release moved this hold off Active first (C09). Detach the pending
-                        // changes and SKIP this hold — the order flow must never break (C10).
-                        if (consumedPart != null) _context.Entry(consumedPart).State = EntityState.Detached;
+                        // A concurrent consume/expiry/release won this hold's Active transition first (C3/C09).
+                        // Detach the pending changes (the un-persisted leftover INSERT and the rolled-back hold)
+                        // and SKIP this hold — the order flow must never break (C10). `remaining` is left intact
+                        // so the next eligible hold, if any, can still satisfy this order line.
+                        if (remainderPart != null) _context.Entry(remainderPart).State = EntityState.Detached;
                         _context.Entry(hold).State = EntityState.Detached;
                         _logger.LogDebug(
-                            "Flash-Sale: skipped consuming contended reservation {ReservationId} for product {ProductId}; a concurrent expiry/release won the transition.",
+                            "Flash-Sale: skipped consuming contended reservation {ReservationId} for product {ProductId}; a concurrent consume/expiry/release won the transition.",
                             hold.Id, productId);
                     }
                 }

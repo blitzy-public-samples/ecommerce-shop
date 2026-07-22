@@ -1,5 +1,8 @@
-<div class="flash-sale-banner alert alert-danger d-flex align-items-center mb-3" role="alert">
-  <span class="badge badge-light text-danger text-uppercase mr-3">Flash Sale</span>
+<!-- M20: d-flex + flex-wrap lets the badge and the two currency values wrap onto additional lines on
+     narrow (phone) widths or with long localized prices, instead of overflowing/clamping inside the
+     50%-width product column. N7: the badge uses the accessible .flash-sale-badge red (see SCSS). -->
+<div class="flash-sale-banner alert alert-danger d-flex flex-wrap align-items-center mb-3" role="alert">
+  <span class="flash-sale-badge badge badge-light text-uppercase mr-3">Flash Sale</span>
   <span class="sale-price font-weight-bold mr-2">{{ flashSale?.salePrice | currency }}</span>
   <!-- base price is NOT .text-muted: keeps the struck-through price at WCAG AA contrast (SCSS F13) -->
   <span class="base-price"><del>{{ basePrice | currency }}</del></span>

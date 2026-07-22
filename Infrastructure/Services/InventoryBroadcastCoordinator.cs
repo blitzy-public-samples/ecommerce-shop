@@ -149,20 +149,21 @@ namespace Infrastructure.Services
         }
 
         // See IInventoryBroadcastCoordinator. Announces an ended sale under the per-product lock; never throws.
-        public async Task PublishFlashSaleEndedAsync(int productId)
+        // Review finding M9: carries the saleId through to the broadcast so the client clears only the ended sale.
+        public async Task PublishFlashSaleEndedAsync(int productId, int saleId)
         {
             var gate = _productLocks.GetOrAdd(productId, _ => new SemaphoreSlim(1, 1));
             await gate.WaitAsync();
             try
             {
-                await _broadcaster.BroadcastFlashSaleEndedAsync(productId);
+                await _broadcaster.BroadcastFlashSaleEndedAsync(productId, saleId);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex,
-                    "Flash-Sale: failed to publish FlashSaleEnded for product {ProductId}; " +
+                    "Flash-Sale: failed to publish FlashSaleEnded for product {ProductId} (sale {SaleId}); " +
                     "the ended state is persisted and will be reconciled by the next sweep broadcast.",
-                    productId);
+                    productId, saleId);
             }
             finally
             {

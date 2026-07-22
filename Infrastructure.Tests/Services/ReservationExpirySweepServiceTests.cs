@@ -78,7 +78,8 @@ namespace Infrastructure.Tests.Services
         {
             public List<(int ProductId, int Available)> AvailabilityPublications { get; } = new List<(int, int)>();
             public List<int> FlashSaleStarted { get; } = new List<int>();
-            public List<int> FlashSaleEnded { get; } = new List<int>();
+            // M9: FlashSaleEnded now carries (productId, saleId); the double records both.
+            public List<(int ProductId, int SaleId)> FlashSaleEnded { get; } = new List<(int, int)>();
 
             // QA Issue 1 fix: this fake faithfully models the real InventoryBroadcastCoordinator's contract, in
             // which PublishFlashSaleStartedAsync is IDEMPOTENT per sale id and ForgetStartedAnnouncements releases
@@ -120,9 +121,9 @@ namespace Infrastructure.Tests.Services
                 }
             }
 
-            public Task PublishFlashSaleEndedAsync(int productId)
+            public Task PublishFlashSaleEndedAsync(int productId, int saleId)
             {
-                FlashSaleEnded.Add(productId);
+                FlashSaleEnded.Add((productId, saleId));
                 return Task.CompletedTask;
             }
         }
@@ -290,8 +291,9 @@ namespace Infrastructure.Tests.Services
             // Act
             await sut.RunOnceAsync(CancellationToken.None);
 
-            // Assert — a just-closed window fires FlashSaleEnded exactly once for the affected product.
-            _coordinator.FlashSaleEnded.Should().ContainSingle().Which.Should().Be(1);
+            // Assert — a just-closed window fires FlashSaleEnded exactly once for the affected product, carrying
+            // both the product id and the ending sale's id (M9). The lone seeded sale is auto-assigned Id 1.
+            _coordinator.FlashSaleEnded.Should().ContainSingle().Which.Should().Be((1, 1));
         }
 
         [Fact]

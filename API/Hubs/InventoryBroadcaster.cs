@@ -8,9 +8,11 @@ namespace API.Hubs
     // Flash-Sale feature: adapter implementing the Core-defined IInventoryBroadcaster over
     // IHubContext<InventoryHub>. This is the ONLY class in the feature that depends on SignalR, so
     // Infrastructure services (FlashSaleService, InventoryReservationService, ReservationExpirySweepService)
-    // stay SignalR-free and unit-testable against the Core abstraction. Registered as
-    // AddScoped<IInventoryBroadcaster, InventoryBroadcaster>() in API/Extension/ApplicationServicesExtensions.cs;
-    // IHubContext<InventoryHub> is supplied automatically by AddSignalR().
+    // stay SignalR-free and unit-testable against the Core abstraction. Review finding N4: registered as
+    // AddSingleton<IInventoryBroadcaster, InventoryBroadcaster>() in API/Extension/ApplicationServicesExtensions.cs
+    // (NOT scoped) — it is stateless and depends only on the singleton IHubContext, and a singleton lifetime is
+    // required so the singleton IInventoryBroadcastCoordinator can consume it without a captive-dependency
+    // violation. IHubContext<InventoryHub> is supplied automatically by AddSignalR().
     public class InventoryBroadcaster : IInventoryBroadcaster
     {
         private readonly IHubContext<InventoryHub> _hubContext;
@@ -43,8 +45,11 @@ namespace API.Hubs
                     quantityAvailable
                 });
 
-        public Task BroadcastFlashSaleEndedAsync(int productId) =>
+        // Review finding M9: the FlashSaleEnded payload now carries the ending sale's id alongside productId
+        // ({ productId, saleId }) so the Angular client can reconcile the exact sale that closed (a product may
+        // have run more than one sale). Matches the client IFlashSaleEnded { productId, saleId } model.
+        public Task BroadcastFlashSaleEndedAsync(int productId, int saleId) =>
             _hubContext.Clients.Group(InventoryHub.ProductGroup(productId))
-                .SendAsync("FlashSaleEnded", new { productId });
+                .SendAsync("FlashSaleEnded", new { productId, saleId });
     }
 }

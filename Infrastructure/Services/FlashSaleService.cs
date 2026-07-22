@@ -141,10 +141,17 @@ namespace Infrastructure.Services
                     sale, () => ComputeAvailableAsync(sale.Id, sale.StockAllocation));
             }
 
+            // --- M12: compute the AUTHORITATIVE post-commit availability by re-reading committed reservation
+            // state, instead of letting the controller fabricate QuantityAvailable = StockAllocation. This
+            // reflects any reserve that committed between this sale's insert and now, so the POST response is
+            // consistent with what GET /api/flash-sales/active returns for the same sale a moment later.
+            var quantityAvailable = await ComputeAvailableAsync(sale.Id, sale.StockAllocation);
+
             return new FlashSaleScheduleResult
             {
                 Outcome = FlashSaleScheduleOutcome.Success,
-                FlashSale = sale
+                FlashSale = sale,
+                QuantityAvailable = quantityAvailable
             };
         }
 
@@ -152,15 +159,23 @@ namespace Infrastructure.Services
         /// Returns every flash sale whose window currently contains <see cref="DateTimeOffset.UtcNow"/> (inclusive
         /// of both bounds), each paired with a freshly-computed, SALE-SCOPED live <c>QuantityAvailable</c>.
         /// Aggregates reservations for ALL active sales in ONE grouped query to avoid N+1 round trips (M10).
+        /// Review finding N1: an optional <paramref name="productId"/> narrows the result to a single product's
+        /// active sale(s); a null value preserves the full active-list behaviour.
         /// </summary>
-        public async Task<IReadOnlyList<ActiveFlashSale>> GetActiveSalesAsync()
+        public async Task<IReadOnlyList<ActiveFlashSale>> GetActiveSalesAsync(int? productId = null)
         {
             var now = DateTimeOffset.UtcNow;
 
-            // Only sales whose window contains "now" (inclusive on both ends) are active.
-            var activeSales = await _context.FlashSales
-                .Where(fs => fs.StartAt <= now && fs.EndAt >= now)
-                .ToListAsync();
+            // Only sales whose window contains "now" (inclusive on both ends) are active. N1: when a productId is
+            // supplied, narrow to that product's active sale(s) so a product page fetches only what it needs
+            // rather than every active sale in the catalog.
+            var query = _context.FlashSales
+                .Where(fs => fs.StartAt <= now && fs.EndAt >= now);
+            if (productId.HasValue)
+            {
+                query = query.Where(fs => fs.ProductId == productId.Value);
+            }
+            var activeSales = await query.ToListAsync();
 
             if (activeSales.Count == 0)
             {

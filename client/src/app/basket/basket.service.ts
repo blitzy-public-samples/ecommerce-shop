@@ -63,6 +63,20 @@ export class BasketService {
     return this.basketSource.value;
   }
 
+  // M15-fe: Shared "ensure a basket UUID exists" path. Returns the basket UUID persisted in
+  // localStorage['basket_id'], creating (and persisting) a fresh one via the SAME createBasket()
+  // path used by addItemToBasket() when none exists yet. This is the single source of truth for the
+  // reuse-the-basket-UUID session identity (sessionId = basket UUID), so a first-time shopper who
+  // reserves a flash-sale item BEFORE adding anything to the basket still sends a valid canonical
+  // UUID v4 rather than null. No new identity concept is introduced (AAP R8 / §0.6).
+  getOrCreateBasketId(): string {
+    const existing = localStorage.getItem('basket_id');
+    if (existing) {
+      return existing;
+    }
+    return this.createBasket().id;
+  }
+
   addItemToBasket(item: IProduct, quantity = 1) {
     const itemToAdd: IBasketItem = this.mapProductItemToBasketItem(item, quantity);
     const basket = this.getCurrentBasketValue() ?? this.createBasket();

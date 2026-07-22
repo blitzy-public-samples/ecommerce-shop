@@ -50,6 +50,13 @@ namespace API.Helpers
             SizeLimit = MaxTrackedSessions
         });
 
+        // Review finding M7: MemoryCache.GetOrCreate is NOT atomic — two SIMULTANEOUS first requests for the same
+        // key can both miss the cache, each run the value factory, and each obtain a SEPARATE SessionBucket, so the
+        // first burst is counted against two independent buckets and the 10/min cap is effectively doubled for that
+        // window. This gate serializes ONLY the rare first-miss creation (a fast, in-memory Set); the hot path
+        // (bucket already present) never touches it, and per-request counting still locks the per-bucket Gate.
+        private static readonly object CreationGate = new object();
+
         public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
         {
             if (!TryResolveSessionKey(context, out var key))
@@ -108,13 +115,8 @@ namespace API.Helpers
         private static bool IsAllowed(string key)
         {
             // Fetch-or-create a bounded, self-expiring per-session bucket. Sliding expiration reclaims idle
-            // sessions and Size = 1 participates in the SizeLimit cap (M05).
-            var bucket = Buckets.GetOrCreate(key, entry =>
-            {
-                entry.Size = 1;
-                entry.SlidingExpiration = Window;
-                return new SessionBucket();
-            });
+            // sessions and Size = 1 participates in the SizeLimit cap (M05). Creation is atomic per key (M7).
+            var bucket = GetOrCreateBucket(key);
 
             var now = DateTimeOffset.UtcNow;
             var cutoff = now - Window;
@@ -131,6 +133,38 @@ namespace API.Helpers
 
                 bucket.Add(now); // record ONLY the accepted request (M06)
                 return true;
+            }
+        }
+
+        // Review finding M7: atomic, single-canonical-bucket-per-key fetch-or-create. The fast path is a lock-free
+        // TryGetValue (the overwhelmingly common case once a session is known). Only a genuine miss takes the
+        // CreationGate and DOUBLE-CHECKS inside the lock, so two concurrent first requests for the same key
+        // observe exactly ONE bucket: the first creates+Sets it, the second re-reads it. This preserves the M05
+        // bounded, self-expiring MemoryCache (Size = 1 + sliding expiration) while closing the first-miss race that
+        // MemoryCache.GetOrCreate leaves open. A later eviction (size pressure / 60s idle) followed by a brand-new
+        // request legitimately starts a fresh window — that is the intended reclaim, not the double-count race.
+        private static SessionBucket GetOrCreateBucket(string key)
+        {
+            if (Buckets.TryGetValue(key, out SessionBucket existing))
+            {
+                return existing;
+            }
+
+            lock (CreationGate)
+            {
+                // Double-check: another thread may have created the bucket between the miss above and this lock.
+                if (Buckets.TryGetValue(key, out existing))
+                {
+                    return existing;
+                }
+
+                var created = new SessionBucket();
+                Buckets.Set(key, created, new MemoryCacheEntryOptions
+                {
+                    Size = 1,                 // participates in the SizeLimit cap (M05)
+                    SlidingExpiration = Window // idle sessions expire and are reclaimed (M05)
+                });
+                return created;
             }
         }
 

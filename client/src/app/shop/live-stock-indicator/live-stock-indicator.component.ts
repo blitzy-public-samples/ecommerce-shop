@@ -1,4 +1,4 @@
-import { Component, Input, OnInit } from '@angular/core';
+import { Component, Input } from '@angular/core';
 
 /**
  * Live per-product stock indicator.
@@ -7,23 +7,21 @@ import { Component, Input, OnInit } from '@angular/core';
  * updates live from the SignalR `InventoryUpdated` stream. All display state derives from a single
  * normalised value so a missing/invalid quantity can never masquerade as a healthy "in stock" state
  * (review finding m04).
+ *
+ * N5: display state is fully derived from getters over the @Input bindings, so the empty constructor
+ * and empty ngOnInit/OnInit boilerplate were removed (no initialisation logic exists).
  */
 @Component({
   selector: 'app-live-stock-indicator',
   templateUrl: './live-stock-indicator.component.html',
   styleUrls: ['./live-stock-indicator.component.scss']
 })
-export class LiveStockIndicatorComponent implements OnInit {
+export class LiveStockIndicatorComponent {
   /** Raw available quantity supplied by the host / hub stream. May be undefined until first update. */
   @Input() quantityAvailable: number;
 
   /** At or below this count the indicator switches to the low-stock (danger) treatment. */
   @Input() lowStockThreshold = 5;
-
-  constructor() { }
-
-  ngOnInit(): void {
-  }
 
   /**
    * m04: normalise the raw input to a finite, non-negative integer, or `null` when the value is

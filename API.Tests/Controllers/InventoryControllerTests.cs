@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Threading;                        // Interlocked (M7 concurrent-burst rate-limit test)
 using System.Threading.Tasks;
 using API.Controllers;
 using API.Dtos;
@@ -347,12 +348,14 @@ namespace API.Tests.Controllers
         }
 
         /// <summary>
-        /// QA finding — Issue #2 (HTTP semantics): when the reservation is owned by the caller but is no longer
-        /// in a releasable (Active) state — e.g. already Consumed, Released, or Expired — the service reports
-        /// <see cref="ReleaseOutcome.Conflict"/>, which the controller now maps to <c>409 Conflict</c> with an
-        /// <see cref="ApiResponse"/> (status 409) rather than the old generic <c>400</c>. A terminal-state
-        /// conflict on an already-released hold is semantically a 409, and only the verified owner can reach this
-        /// arm (a non-owner is mapped to a uniform 404 first), so the 409 leaks no existence information.
+        /// QA finding — Issue #2 (HTTP semantics): when the reservation is owned by the caller but is in a
+        /// PROTECTED terminal state — Consumed (sold) or Expired — the service reports
+        /// <see cref="ReleaseOutcome.Conflict"/>, which the controller maps to <c>409 Conflict</c> with an
+        /// <see cref="ApiResponse"/> (status 409) rather than the old generic <c>400</c>. (An already-Released
+        /// hold is NOT a conflict: per review finding M6 a repeat owner release is idempotent success and the
+        /// service returns <see cref="ReleaseOutcome.Released"/> — see the No-Content test above.) Only the
+        /// verified owner can reach this arm (a non-owner is mapped to a uniform 404 first), so the 409 leaks no
+        /// existence information.
         /// </summary>
         [Fact]
         public async Task ReleaseReservation_WhenReservationNotActive_ReturnsConflict409()
@@ -492,6 +495,63 @@ namespace API.Tests.Controllers
             var content = ctx.Result.Should().BeOfType<ContentResult>().Subject;
             content.StatusCode.Should().Be(400);
             content.Content.Should().Be("{\"error\":\"INVALID_SESSION\"}");
+        }
+
+        /// <summary>
+        /// Review finding M7: a burst of CONCURRENT FIRST requests for a single brand-new session must be counted
+        /// against ONE shared bucket, so the 10/min cap holds even under the first-miss race. Before the fix,
+        /// <c>MemoryCache.GetOrCreate</c> could hand two racing first-miss callers SEPARATE buckets, letting the
+        /// initial burst admit more than ten. This releases a large burst simultaneously against one fresh session
+        /// key (via a shared gate to maximise contention on bucket creation) and asserts EXACTLY ten are admitted
+        /// and the rest receive HTTP 429 — proving the atomic, single-canonical-bucket-per-key creation. A unique
+        /// GUID keeps the process-static counter isolated from every other test.
+        /// </summary>
+        [Fact]
+        public async Task SessionRateLimitFilter_WhenManyConcurrentFirstRequestsForOneSession_AdmitsExactlyTen()
+        {
+            // Arrange — a fresh key so the ENTIRE burst is a first-miss racing to create the same bucket.
+            var filter = new SessionRateLimitFilter();
+            var sessionId = Guid.NewGuid().ToString();
+            const int concurrentRequests = 64;
+            const int expectedAdmitted = 10; // MaxRequests (10 req/min/session, AAP §0.6)
+            var admitted = 0;
+            var rejected429 = 0;
+
+            // A shared gate so every task blocks and is released together, maximising the first-miss contention.
+            var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            // Act
+            var tasks = new List<Task>(concurrentRequests);
+            for (var i = 0; i < concurrentRequests; i++)
+            {
+                tasks.Add(Task.Run(async () =>
+                {
+                    await gate.Task; // park until the whole burst is released at once
+                    var ctx = BuildExecutingContext(sessionId);
+                    await filter.OnActionExecutionAsync(ctx, () =>
+                    {
+                        Interlocked.Increment(ref admitted);
+                        return Task.FromResult(new ActionExecutedContext(ctx, ctx.Filters, ctx.Controller));
+                    });
+
+                    // A rejected request short-circuits with a 429 ContentResult and never invokes next().
+                    if (ctx.Result is ContentResult cr && cr.StatusCode == 429)
+                    {
+                        Interlocked.Increment(ref rejected429);
+                    }
+                }));
+            }
+
+            gate.SetResult(true);        // release the burst
+            await Task.WhenAll(tasks);
+
+            // Assert — the atomic single-bucket guarantee admits EXACTLY the 10/min limit regardless of how many
+            // first requests raced to create the bucket; every other request is a clean 429 (never a silent extra
+            // admission through a duplicate first-miss bucket).
+            admitted.Should().Be(expectedAdmitted,
+                "a concurrent first-request burst must be counted against ONE shared bucket (M7)");
+            rejected429.Should().Be(concurrentRequests - expectedAdmitted,
+                "every non-admitted request must be an explicit 429, proving no duplicate bucket admitted extras");
         }
 
         /// <summary>

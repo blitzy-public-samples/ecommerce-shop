@@ -19,6 +19,13 @@ export class CountdownTimerComponent implements OnInit, OnChanges, OnDestroy {
   /** ISO-8601 timestamp of the flash sale's end (`end_at`). */
   @Input() endAt: string;
 
+  /**
+   * N8: contextual label rendered before the time and folded into the timer's accessible name, so the
+   * bare HH:MM:SS is no longer presented without meaning. Defaults to "Ends in"; the host can override
+   * it (e.g. "Flash sale ends in") for extra context.
+   */
+  @Input() label = 'Ends in';
+
   /** Emitted exactly once per distinct valid deadline, when that deadline is reached. */
   @Output() expired = new EventEmitter<void>();
 
@@ -33,6 +40,16 @@ export class CountdownTimerComponent implements OnInit, OnChanges, OnDestroy {
 
   private timerSub: Subscription;
   private expiredEmitted = false;
+
+  /**
+   * N8: accessible name for the timer live-region, combining the contextual label with the remaining
+   * time (or a defined phrase when the deadline is unavailable), so screen-reader users get meaning
+   * rather than a bare "HH:MM:SS".
+   */
+  get ariaLabel(): string {
+    return this.invalid ? this.label + ': time unavailable' : this.label + ' ' + this.remaining;
+  }
+
   /** Parsed deadline in epoch milliseconds; `NaN` when `endAt` is invalid (m01). */
   private deadlineMs = NaN;
   /** Guards against a redundant second start when both ngOnChanges and ngOnInit fire on first bind. */

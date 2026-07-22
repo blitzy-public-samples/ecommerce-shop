@@ -11,6 +11,9 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+// Review finding M18: Microsoft.Extensions.Hosting supplies the modern IsDevelopment() extension for
+// IWebHostEnvironment (via IHostEnvironment), used to make the HSTS security header environment-aware.
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.FileProviders;
 using StackExchange.Redis;
 
@@ -61,6 +64,12 @@ namespace API
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
         {
+            // Review finding M18: capture the environment ONCE so the security-headers middleware can be
+            // environment-aware. Strict-Transport-Security (HSTS) must NOT be emitted in Development — a dev
+            // browser hitting https://localhost with the self-signed cert would otherwise pin HSTS for a year and
+            // refuse future plain-HTTP localhost access. The other baseline headers remain unconditional.
+            var isDevelopment = env.IsDevelopment();
+
             // Flash-Sale feature — QA finding Issue #3 (security hardening, MINOR): baseline security response
             // headers were absent on EVERY response (controllers, SignalR hub negotiate, error/404 pages, static
             // files, and authenticated endpoints such as /api/orders). This middleware is registered FIRST so it
@@ -85,7 +94,9 @@ namespace API
                         headers["X-Frame-Options"] = "DENY";
                     // HSTS: the API redirects to HTTPS (UseHttpsRedirection below); instruct browsers to only ever
                     // use HTTPS, closing the downgrade gap QA flagged (UseHttpsRedirection present, UseHsts absent).
-                    if (!headers.ContainsKey("Strict-Transport-Security"))
+                    // Review finding M18: emit HSTS in NON-Development environments only, so a dev browser on the
+                    // self-signed https://localhost cert is never pinned to HTTPS-only for a year.
+                    if (!isDevelopment && !headers.ContainsKey("Strict-Transport-Security"))
                         headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains";
                     // Do not allow shared/browser caches to store AUTHENTICATED responses (e.g. /api/orders,
                     // /api/account). Anonymous catalog responses are deliberately left untouched so the [Cached]
@@ -134,7 +145,22 @@ namespace API
                 // SAME value used by the JwtBearerEvents.OnMessageReceived hub-path check in
                 // IdentityServiceExtensions.cs — authentication and routing can no longer target different URLs.
                 // Registered BEFORE the SPA catch-all so MapFallbackToController remains the LAST mapping.
-                endpoints.MapHub<InventoryHub>(InventoryHub.ResolveHubPath(_config["SIGNALR_HUB_PATH"]));
+                var hubPath = InventoryHub.ResolveHubPath(_config["SIGNALR_HUB_PATH"]);
+                // Review finding M19: validate the RESOLVED hub path format ONCE, at startup, before mapping.
+                // ASP.NET Core PathString (used by the JWT query-token StartsWithSegments check in
+                // IdentityServiceExtensions) REQUIRES a leading '/', and endpoints.MapHub would otherwise map a
+                // slash-less value to an unintended URL — so a misconfigured SIGNALR_HUB_PATH such as
+                // "hubs/inventory" would silently break WebSocket authentication and routing at runtime with a
+                // cryptic per-request error. Failing fast here turns that into an obvious boot-time configuration
+                // error, and because the app cannot start with a bad path the per-request JWT site is transitively
+                // protected too.
+                if (!hubPath.StartsWith("/"))
+                {
+                    throw new System.InvalidOperationException(
+                        $"SIGNALR_HUB_PATH must be an absolute path beginning with '/'. Configured value " +
+                        $"'{_config["SIGNALR_HUB_PATH"]}' resolved to '{hubPath}'.");
+                }
+                endpoints.MapHub<InventoryHub>(hubPath);
                 endpoints.MapFallbackToController("Index", "Fallback");
             });
         }

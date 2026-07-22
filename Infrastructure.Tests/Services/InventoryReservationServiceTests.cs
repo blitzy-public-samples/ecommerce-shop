@@ -67,18 +67,20 @@ namespace Infrastructure.Tests.Services
 
         // Canonical basket-UUID session keys. Review finding C05 makes the service a trust boundary that accepts
         // ONLY a canonical GUID (the basket UUID reused as the session key, AAP R8) and returns Outcome.Invalid
-        // for anything else. Distinct constants model distinct shopper sessions; each is already in canonical
-        // "D" (lowercase) form, so it equals the value the service normalises and stores.
-        private const string SessionS = "11111111-1111-1111-1111-111111111111";
-        private const string SessionSess1 = "22222222-2222-2222-2222-222222222222";
-        private const string SessionSess42 = "33333333-3333-3333-3333-333333333333";
-        private const string SessionOther = "44444444-4444-4444-4444-444444444444";
-        private const string SessionStale = "55555555-5555-5555-5555-555555555555";
-        private const string SessionSold = "66666666-6666-6666-6666-666666666666";
-        private const string SessionOwner = "77777777-7777-7777-7777-777777777777";
-        private const string SessionAttacker = "88888888-8888-8888-8888-888888888888";
-        private const string SessionSomeoneElse = "99999999-9999-9999-9999-999999999999";
-        private const string SessionNobody = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        // for anything else. Distinct constants model distinct shopper sessions; each is a canonical RFC 4122
+        // version-4 UUID in lowercase "D" form (version nibble '4' at index 14, variant nibble '8' at index 19),
+        // matching the client uuidv4() contract now enforced at the service boundary (review finding M15), so
+        // each equals the value the service normalises and stores.
+        private const string SessionS = "11111111-1111-4111-8111-111111111111";
+        private const string SessionSess1 = "22222222-2222-4222-8222-222222222222";
+        private const string SessionSess42 = "33333333-3333-4333-8333-333333333333";
+        private const string SessionOther = "44444444-4444-4444-8444-444444444444";
+        private const string SessionStale = "55555555-5555-4555-8555-555555555555";
+        private const string SessionSold = "66666666-6666-4666-8666-666666666666";
+        private const string SessionOwner = "77777777-7777-4777-8777-777777777777";
+        private const string SessionAttacker = "88888888-8888-4888-8888-888888888888";
+        private const string SessionSomeoneElse = "99999999-9999-4999-8999-999999999999";
+        private const string SessionNobody = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
         /// <summary>
         /// In-test recording double for <see cref="IInventoryBroadcastCoordinator"/>. The reservation service
@@ -91,7 +93,8 @@ namespace Infrastructure.Tests.Services
         {
             public List<(int ProductId, int Available)> AvailabilityPublications { get; } = new List<(int, int)>();
             public List<int> FlashSaleStarted { get; } = new List<int>();
-            public List<int> FlashSaleEnded { get; } = new List<int>();
+            // M9: FlashSaleEnded now carries (productId, saleId); the double records both.
+            public List<(int ProductId, int SaleId)> FlashSaleEnded { get; } = new List<(int, int)>();
 
             public async Task PublishAvailabilityAsync(int productId, Func<Task<int>> computeAuthoritativeAvailabilityAsync)
             {
@@ -113,9 +116,9 @@ namespace Infrastructure.Tests.Services
             {
             }
 
-            public Task PublishFlashSaleEndedAsync(int productId)
+            public Task PublishFlashSaleEndedAsync(int productId, int saleId)
             {
-                FlashSaleEnded.Add(productId);
+                FlashSaleEnded.Add((productId, saleId));
                 return Task.CompletedTask;
             }
         }
@@ -553,6 +556,68 @@ namespace Infrastructure.Tests.Services
             _coordinator.AvailabilityPublications.Should().BeEmpty();
         }
 
+        [Fact]
+        public async Task ReleaseAsync_WhenOwnerReleasesAlreadyReleasedHold_IsIdempotentReleaseAndDoesNotRebroadcast()
+        {
+            // Review finding M6: a repeat DELETE by the OWNER of an already-Released hold is IDEMPOTENT success
+            // (the stock is already back in the pool), so it returns Released again rather than 409 — and since
+            // nothing changed, it performs NO second rebroadcast.
+            var dbName = Guid.NewGuid().ToString();
+            using var context = TestStoreContextFactory.CreateInMemoryContext(dbName);
+            var sale = await SeedSaleAsync(context, productId: 1, stockAllocation: 100);
+            var reservation = new InventoryReservation
+            {
+                FlashSaleId = sale.Id,
+                ProductId = 1,
+                Quantity = 10,
+                SessionId = SessionOwner,
+                ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+                Status = ReservationStatus.Released
+            };
+            context.InventoryReservations.Add(reservation);
+            await context.SaveChangesAsync();
+            var sut = CreateSut(context);
+
+            // Act — the same owner releases the already-Released hold again.
+            var outcome = await sut.ReleaseAsync(reservation.Id, SessionOwner);
+
+            // Assert — idempotent Released; row unchanged; no rebroadcast (nothing changed).
+            outcome.Should().Be(ReleaseOutcome.Released);
+            context.InventoryReservations.Single().Status.Should().Be(ReservationStatus.Released);
+            _coordinator.AvailabilityPublications.Should().BeEmpty();
+        }
+
+        [Fact]
+        public async Task ReleaseAsync_WhenReleasingConsumedHold_ReturnsConflictAndDoesNotRebroadcast()
+        {
+            // Review finding M6: a Consumed (sold) hold remains PROTECTED — "releasing" it would restore stock
+            // that is not free to return — so an owner release of a Consumed hold is a Conflict, never idempotent
+            // success, and never rebroadcasts. (Expired holds are protected the same way.)
+            var dbName = Guid.NewGuid().ToString();
+            using var context = TestStoreContextFactory.CreateInMemoryContext(dbName);
+            var sale = await SeedSaleAsync(context, productId: 1, stockAllocation: 100);
+            var reservation = new InventoryReservation
+            {
+                FlashSaleId = sale.Id,
+                ProductId = 1,
+                Quantity = 10,
+                SessionId = SessionOwner,
+                ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+                Status = ReservationStatus.Consumed
+            };
+            context.InventoryReservations.Add(reservation);
+            await context.SaveChangesAsync();
+            var sut = CreateSut(context);
+
+            // Act
+            var outcome = await sut.ReleaseAsync(reservation.Id, SessionOwner);
+
+            // Assert — protected: Conflict, row stays Consumed, no rebroadcast.
+            outcome.Should().Be(ReleaseOutcome.Conflict);
+            context.InventoryReservations.Single().Status.Should().Be(ReservationStatus.Consumed);
+            _coordinator.AvailabilityPublications.Should().BeEmpty();
+        }
+
         // ---------------------------------------------------------------------------------------------
         // ConsumeReservationsAsync — checkout hook (Active -> Consumed; never deletes)
         // ---------------------------------------------------------------------------------------------
@@ -578,6 +643,51 @@ namespace Infrastructure.Tests.Services
             context.InventoryReservations.Count().Should().Be(2);
             context.InventoryReservations.Should().OnlyContain(r => r.Status == ReservationStatus.Consumed);
             _coordinator.AvailabilityPublications.Should().ContainSingle().Which.Should().Be((1, 85));
+        }
+
+        [Fact]
+        public async Task ConsumeReservationsAsync_WhenOrderNeedsFewerUnitsThanHold_SplitsByConsumingOriginalAndLeavingActiveRemainder()
+        {
+            // Review finding C3 (split double-sale): a partial consume must transition the ORIGINAL hold's
+            // Status (Active -> Consumed) — the guarded concurrency-token write — carrying EXACTLY the consumed
+            // quantity, and represent the untouched leftover as a NEW Active row. Previously the original row
+            // stayed Active with only a decremented Quantity (an unguarded write), letting concurrent consumes
+            // double-sell the same units. This proves the observable outcome of the fix single-threaded; the
+            // concurrent race itself is proven by the PostgreSQL concurrency test.
+            var dbName = Guid.NewGuid().ToString();
+            using var context = TestStoreContextFactory.CreateInMemoryContext(dbName);
+            var sale = await SeedSaleAsync(context, productId: 1, stockAllocation: 100);
+            var hold = new InventoryReservation
+            {
+                FlashSaleId = sale.Id,
+                ProductId = 1,
+                Quantity = 10,
+                SessionId = SessionSess1,
+                ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+                Status = ReservationStatus.Active
+            };
+            context.InventoryReservations.Add(hold);
+            await context.SaveChangesAsync();
+            var originalId = hold.Id;
+            var sut = CreateSut(context);
+
+            // Act — the order needs only 6 of the 10 held units.
+            await sut.ConsumeReservationsAsync(SessionSess1, new[] { new ReservationConsumeLine(1, 6) });
+
+            // Assert — the ORIGINAL row is now Consumed carrying exactly 6 units (the guarded transition), and a
+            // SEPARATE new Active row carries the 4-unit leftover with the same session/sale/TTL. Total held is
+            // preserved (6 + 4 == 10), so availability is unchanged by the split: 100 − (6 + 4) = 90.
+            var rows = context.InventoryReservations.OrderBy(r => r.Id).ToList();
+            rows.Should().HaveCount(2);
+            var consumed = rows.Single(r => r.Id == originalId);
+            consumed.Status.Should().Be(ReservationStatus.Consumed);
+            consumed.Quantity.Should().Be(6);
+            var remainder = rows.Single(r => r.Id != originalId);
+            remainder.Status.Should().Be(ReservationStatus.Active);
+            remainder.Quantity.Should().Be(4);
+            remainder.SessionId.Should().Be(SessionSess1);
+            remainder.FlashSaleId.Should().Be(sale.Id);
+            _coordinator.AvailabilityPublications.Should().ContainSingle().Which.Should().Be((1, 90));
         }
 
         [Fact]

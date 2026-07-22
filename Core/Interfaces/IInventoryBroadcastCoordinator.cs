@@ -61,9 +61,10 @@ namespace Core.Interfaces
         // safe no-op. Single-instance, in-memory, no backplane (AAP §0.5.2).
         void ForgetStartedAnnouncements(IEnumerable<int> endedSaleIds);
 
-        // Flash-Sale feature (review finding M14, M13): persistence-authoritative "flash sale ended"
+        // Flash-Sale feature (review findings M14, M13, M9): persistence-authoritative "flash sale ended"
         // publication used by the expiry sweep when a sale crosses its EndAt. Shares the per-product lock for
-        // ordering and never throws.
-        Task PublishFlashSaleEndedAsync(int productId);
+        // ordering and never throws. Carries the saleId (M9) so the broadcast lets a client clear ONLY the sale
+        // that ended, never a newer sale delivered for the same product by a racing FlashSaleStarted.
+        Task PublishFlashSaleEndedAsync(int productId, int saleId);
     }
 }
