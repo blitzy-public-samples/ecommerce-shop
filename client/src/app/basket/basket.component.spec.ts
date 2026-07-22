@@ -46,7 +46,12 @@ describe('BasketComponent (template gating)', () => {
   let component: BasketComponent;
   let fixture: ComponentFixture<BasketComponent>;
   let basketServiceStub: { basket$: any; basketTotal$: any };
-  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy; unsubscribeFromProduct: jasmine.Spy; connectionState$: any };
+  let stockServiceStub: {
+    subscribeToProduct: jasmine.Spy;
+    getStock$: jasmine.Spy;
+    unsubscribeFromProduct: jasmine.Spy;
+    connectionState$: any;
+  };
 
   // A basket item's id IS the product id, so stock is tracked on item.id. Two items
   // (ids 1 and 2) make the per-item subscribe assertions and the "ANY item at zero"

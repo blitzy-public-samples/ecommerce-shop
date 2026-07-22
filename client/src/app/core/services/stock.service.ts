@@ -203,7 +203,7 @@ export class StockService implements OnDestroy {
     if (this.hubConnection.state !== HubConnectionState.Connected) {
       this.startConnection();
     }
-  };
+  }
 
   /**
    * Removes the `online` listener when the root singleton is torn down (application shutdown /
