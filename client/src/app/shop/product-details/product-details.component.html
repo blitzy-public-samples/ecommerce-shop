@@ -6,6 +6,12 @@
     <div class="col-6">
       <h3>{{product.name}}</h3>
       <p style="font-size: 1.7em">{{product.price | currency}}</p>
+      <!-- Real-Time Inventory & Flash Sale - promotional banner (only while a sale is active) -->
+      <app-flash-sale-banner *ngIf="activeFlashSale" [flashSale]="activeFlashSale" [basePrice]="product.price"></app-flash-sale-banner>
+      <!-- Real-Time Inventory & Flash Sale - live countdown to sale end (only while a sale is active) -->
+      <app-countdown-timer *ngIf="activeFlashSale" [endAt]="activeFlashSale.endAt"></app-countdown-timer>
+      <!-- Real-Time Inventory & Flash Sale - live available-stock indicator (only while a sale is active) -->
+      <app-live-stock-indicator *ngIf="activeFlashSale" [quantityAvailable]="quantityAvailable"></app-live-stock-indicator>
       <div class="d-flex justify-content-start align-items-center">
         <i (click)="decrementQuantity()" class="fa fa-minus-circle text-warning mr-2"  style="cursor: pointer; font-size: 2em"></i>
         <span class="font-weight-bold" style="font-size: 1.5em;">{{quantity}}</span>
