@@ -106,6 +106,13 @@ namespace Infrastructure.Tests.Services
                 AvailabilityPublications.Add((sale.ProductId, available));
             }
 
+            // QA Issue 1 fix: satisfy the IInventoryBroadcastCoordinator contract. The reservation path never
+            // publishes FlashSaleStarted, so this recording double has no started markers to release; the method
+            // is a no-op here purely to implement the interface.
+            public void ForgetStartedAnnouncements(IEnumerable<int> endedSaleIds)
+            {
+            }
+
             public Task PublishFlashSaleEndedAsync(int productId)
             {
                 FlashSaleEnded.Add(productId);

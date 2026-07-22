@@ -5,7 +5,8 @@ using API.Helpers;
 using AutoMapper;
 using Core.Entities;
 using Core.Interfaces;
-using Microsoft.AspNetCore.Http;
+// Microsoft.AspNetCore.Http was previously imported only for StatusCodes.Status403Forbidden, which was removed
+// when the ReleaseReservation 403 arm was folded into a uniform 404 (QA Issue #1); the using is dropped with it.
 using Microsoft.AspNetCore.Mvc;
 
 namespace API.Controllers
@@ -110,14 +111,27 @@ namespace API.Controllers
                     // that succeeds carries no response body, so NoContent() is the REST-correct result.
                     return NoContent();
 
+                // QA finding — Issue #1 (CWE-204 existence oracle, MINOR security). A non-owner MUST NOT be able to
+                // tell whether a reservation id exists. Previously "no such reservation" (NotFound) returned 404 while
+                // "exists but owned by another session" (Forbidden) returned 403, so an anonymous caller could
+                // enumerate live reservation ids by observing the 403-vs-404 difference (the oracle spanned Active AND
+                // Released holds because ReleaseAsync checks ownership BEFORE status). Both cases now return the
+                // IDENTICAL 404 ApiResponse body, making them indistinguishable to a non-owner and blocking sequential
+                // id enumeration. The 204 owner-success path and the 409 owner-conflict path (below) are unchanged —
+                // an authorized owner may still learn the state of a hold it actually owns. The service still returns
+                // its richer ReleaseOutcome.Forbidden (kept for internal semantics/tests); the uniformity is enforced
+                // here at the HTTP boundary where the oracle was observed.
                 case ReleaseOutcome.NotFound:
-                    // 404: no reservation with that id exists.
+                case ReleaseOutcome.Forbidden:
                     return NotFound(new ApiResponse(404));
 
-                case ReleaseOutcome.Forbidden:
-                    // 403: the reservation exists but is owned by a different session; the caller may not release it.
-                    return StatusCode(StatusCodes.Status403Forbidden,
-                        new ApiResponse(StatusCodes.Status403Forbidden, "You do not own this reservation"));
+                // QA finding — Issue #2 (HTTP semantics, INFO). The reservation is owned by the caller but is no
+                // longer Active (already Consumed/Released/Expired), so it cannot be released again. A terminal-state
+                // conflict is semantically 409 Conflict, not the generic 400 the old default arm produced. Only the
+                // VERIFIED owner can reach this arm — ReleaseAsync returns Forbidden (mapped to 404 above) for any
+                // non-owner before the status check — so mapping it to 409 introduces no existence oracle.
+                case ReleaseOutcome.Conflict:
+                    return Conflict(new ApiResponse(409, "Reservation is no longer active and cannot be released"));
 
                 default:
                     // Defensive: switch exhaustiveness for any future ReleaseOutcome value. Not expected to be hit.

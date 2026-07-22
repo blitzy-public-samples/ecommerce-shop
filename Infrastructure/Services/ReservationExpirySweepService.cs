@@ -104,10 +104,17 @@ namespace Infrastructure.Services
         private readonly IConfiguration _config;
         private readonly ILogger<ReservationExpirySweepService> _logger;
 
-        // M15: bounded idempotency sets. Membership is reconciled (pruned) against DB-derived active/recently-ended
-        // sale ids on every tick (see ExecuteSweepAsync), so these are bounded by live catalog concurrency and can
-        // never grow without bound over the process lifetime. Single-instance, no backplane (AAP §0.5.2).
-        private readonly HashSet<int> _startedSaleIds = new HashSet<int>();
+        // M15: bounded idempotency set for the ENDED boundary event. The sweep is the SOLE publisher of
+        // FlashSaleEnded, so its dedup can safely stay local here; membership is reconciled (pruned) against the
+        // DB-derived recently-ended set on every tick, so it is bounded by live catalog concurrency and can never
+        // grow without bound. Single-instance, no backplane (AAP §0.5.2).
+        //
+        // QA Issue 1 fix: the STARTED dedup set is deliberately NOT held here any more. FlashSaleStarted has TWO
+        // publishers (this sweep AND FlashSaleService.ScheduleAsync for a created-already-active sale); a set
+        // private to the sweep could not see ScheduleAsync's publication, so the two produced a duplicate event.
+        // The "already announced started" marker now lives in the shared IInventoryBroadcastCoordinator, which
+        // dedups PublishFlashSaleStartedAsync atomically across BOTH publishers. This sweep keeps it bounded by
+        // calling _coordinator.ForgetStartedAnnouncements(...) with the just-ended sale ids each tick.
         private readonly HashSet<int> _endedSaleIds = new HashSet<int>();
 
         // M17: an upper bound on the rows touched per tick so a large backlog is drained across several ticks
@@ -224,19 +231,19 @@ namespace Infrastructure.Services
                 .Take(BatchSize)
                 .ToListAsync(stoppingToken);
 
-            // 4) FlashSaleStarted — once per sale per active window (M15 bounded dedup, M13/M14 via coordinator).
-            var activeIds = activeSales.Select(s => s.Id).ToHashSet();
+            // 4) FlashSaleStarted — once per sale per active window (M13/M14 via coordinator). QA Issue 1 fix:
+            //    the sweep no longer keeps its own "already announced" set; it publishes every active sale through
+            //    the shared coordinator, which is now IDEMPOTENT per sale id. So a sale that FlashSaleService
+            //    .ScheduleAsync already announced at creation (created-already-active) is a no-op here, and a
+            //    future-scheduled sale the sweep is the FIRST to observe is announced exactly once — the two
+            //    publishers can no longer produce a duplicate.
             foreach (var sale in activeSales)
             {
-                if (_startedSaleIds.Add(sale.Id)) // Add returns false if already announced this window.
-                {
-                    var startedSale = sale; // capture for the closure
-                    await _coordinator.PublishFlashSaleStartedAsync(
-                        startedSale,
-                        () => ComputeSaleScopedAvailabilityAsync(context, startedSale.ProductId, now));
-                }
+                var startedSale = sale; // capture for the closure
+                await _coordinator.PublishFlashSaleStartedAsync(
+                    startedSale,
+                    () => ComputeSaleScopedAvailabilityAsync(context, startedSale.ProductId, now));
             }
-            _startedSaleIds.IntersectWith(activeIds); // M15: prune ids no longer active -> bounded.
 
             // 5) FlashSaleEnded — once per sale as its window closes (M15 bounded dedup, M13/M14 via coordinator).
             var endedIds = endedSales.Select(s => s.Id).ToHashSet();
@@ -248,6 +255,13 @@ namespace Infrastructure.Services
                 }
             }
             _endedSaleIds.IntersectWith(endedIds); // M15: prune ids outside the recent-ended window -> bounded.
+
+            // QA Issue 1 fix: keep the coordinator's shared "already announced started" set bounded. Now that a
+            // sale has left its window, the coordinator can forget its started marker; a future re-use of the id
+            // will not occur (ids are monotonic), and this prevents the set from growing over the process
+            // lifetime. Pruning by JUST-ENDED ids (not by an active snapshot) is race-free: a sale created active
+            // concurrently with this tick is never in endedSales, so it can never be forgotten-then-re-announced.
+            _coordinator.ForgetStartedAnnouncements(endedIds);
 
             // 6) M14/C11: authoritative availability reconciliation. Re-broadcast the sale-scoped availability for
             //    every product whose holds were just released, plus every product with an active sale (periodic

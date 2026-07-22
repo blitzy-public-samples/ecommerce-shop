@@ -80,6 +80,12 @@ namespace Infrastructure.Tests.Services
             public List<int> FlashSaleStarted { get; } = new List<int>();
             public List<int> FlashSaleEnded { get; } = new List<int>();
 
+            // QA Issue 1 fix: this fake faithfully models the real InventoryBroadcastCoordinator's contract, in
+            // which PublishFlashSaleStartedAsync is IDEMPOTENT per sale id and ForgetStartedAnnouncements releases
+            // those markers. The sweep no longer owns a private started-dedup set, so this double is what makes
+            // the "exactly once per entered window" behavior observable end-to-end through the sweep's ticks.
+            private readonly HashSet<int> _startedSaleIds = new HashSet<int>();
+
             public async Task PublishAvailabilityAsync(int productId, Func<Task<int>> computeAuthoritativeAvailabilityAsync)
             {
                 var available = await computeAuthoritativeAvailabilityAsync();
@@ -88,10 +94,30 @@ namespace Infrastructure.Tests.Services
 
             public async Task PublishFlashSaleStartedAsync(FlashSale sale, Func<Task<int>> computeAuthoritativeAvailabilityAsync)
             {
+                // Idempotent per sale id, exactly as InventoryBroadcastCoordinator: the FIRST call for a sale id
+                // records the started event; a later call for the SAME id is a no-op (until ForgetStartedAnnouncements
+                // releases it). This is what dedups the two publishers (sweep + ScheduleAsync).
+                if (!_startedSaleIds.Add(sale.Id))
+                {
+                    return;
+                }
+
                 // Exercise the compute delegate exactly as the real coordinator would (authoritative re-read),
                 // then record the boundary event by product id.
                 await computeAuthoritativeAvailabilityAsync();
                 FlashSaleStarted.Add(sale.ProductId);
+            }
+
+            public void ForgetStartedAnnouncements(IEnumerable<int> endedSaleIds)
+            {
+                if (endedSaleIds == null)
+                {
+                    return;
+                }
+                foreach (var id in endedSaleIds)
+                {
+                    _startedSaleIds.Remove(id);
+                }
             }
 
             public Task PublishFlashSaleEndedAsync(int productId)
@@ -325,8 +351,9 @@ namespace Infrastructure.Tests.Services
                 PollConfig(null).Object,
                 NullLogger<ReservationExpirySweepService>.Instance);
 
-            // Act — tick the SAME instance twice so the in-memory idempotency set (_startedSaleIds) persists
-            // across ticks.
+            // Act — tick the SAME instance twice against the SAME coordinator so the coordinator's idempotency
+            // marker (QA Issue 1 fix: the started-dedup now lives in the shared IInventoryBroadcastCoordinator,
+            // not privately in the sweep) persists across ticks.
             await sut.RunOnceAsync(CancellationToken.None);
             await sut.RunOnceAsync(CancellationToken.None);
 

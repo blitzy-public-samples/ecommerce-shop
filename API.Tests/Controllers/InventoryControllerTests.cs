@@ -45,8 +45,9 @@ namespace API.Tests.Controllers
     /// reservation returns the mapped DTO inside <c>200 OK</c>; insufficient stock returns
     /// <c>409 {"error":"INSUFFICIENT_STOCK","available":N}</c>; an optimistic-concurrency conflict
     /// returns <c>409 {"error":"RESERVATION_CONFLICT"}</c>; and the DELETE release maps the service's
-    /// <see cref="ReleaseOutcome"/> to <c>204 No Content</c> / <c>404 Not Found</c> / <c>403 Forbidden</c>
-    /// / <c>400 Bad Request</c>. Tests follow the repository convention
+    /// <see cref="ReleaseOutcome"/> to <c>204 No Content</c> (owner released), a uniform <c>404 Not Found</c>
+    /// for BOTH not-found and not-owned (QA Issue #1 — no 403 existence oracle), and <c>409 Conflict</c> for an
+    /// owner's already-terminal hold (QA Issue #2). Tests follow the repository convention
     /// <c>MethodName_StateUnderTest_ExpectedBehavior</c> with an Arrange-Act-Assert structure and assert
     /// with FluentAssertions plus Moq verification. No production code is modified by these tests.
     /// </para>
@@ -318,13 +319,16 @@ namespace API.Tests.Controllers
         }
 
         /// <summary>
-        /// When the reservation exists but is owned by a different session, the service reports
-        /// <see cref="ReleaseOutcome.Forbidden"/> and the action returns <c>403 Forbidden</c> (an
-        /// <see cref="ObjectResult"/> with status 403) carrying an <see cref="ApiResponse"/> explaining
-        /// the caller does not own the reservation. This proves ownership enforcement on release.
+        /// QA finding — Issue #1 (CWE-204 existence oracle): when the reservation exists but is owned by a
+        /// different session the service still reports <see cref="ReleaseOutcome.Forbidden"/>, but the controller
+        /// now maps it to the SAME <c>404 Not Found</c> <see cref="ApiResponse"/> (status 404, default
+        /// "Resource not found" message) it returns for a genuinely non-existent id. Because the not-owned and
+        /// not-found responses are byte-identical, a non-owner cannot distinguish the two cases and therefore
+        /// cannot enumerate live reservation ids from the 403-vs-404 difference. Ownership is still enforced (the
+        /// caller is denied the release); only the leaky status-code distinction is removed.
         /// </summary>
         [Fact]
-        public async Task ReleaseReservation_WhenCallerDoesNotOwnReservation_ReturnsForbiddenWithApiResponse403()
+        public async Task ReleaseReservation_WhenCallerDoesNotOwnReservation_ReturnsUniform404NotFound()
         {
             // Arrange
             var (controller, service, _) = CreateController();
@@ -334,23 +338,24 @@ namespace API.Tests.Controllers
             // Act
             var result = await controller.ReleaseReservation(5, sessionId);
 
-            // Assert
-            var forbidden = result.Should().BeOfType<ObjectResult>().Subject;
-            forbidden.StatusCode.Should().Be(403);
-            var api = forbidden.Value.Should().BeOfType<ApiResponse>().Subject;
-            api.StatusCode.Should().Be(403);
-            api.Message.Should().Be("You do not own this reservation");
+            // Assert — identical to the not-found response (no 403 existence oracle).
+            var notFound = result.Should().BeOfType<NotFoundObjectResult>().Subject;
+            notFound.StatusCode.Should().Be(404);
+            var api = notFound.Value.Should().BeOfType<ApiResponse>().Subject;
+            api.StatusCode.Should().Be(404);
+            api.Message.Should().Be("Resource not found");
         }
 
         /// <summary>
-        /// When the reservation is owned by the caller but is no longer in a releasable (Active) state —
-        /// e.g. already Consumed, Released, or Expired — the service reports
-        /// <see cref="ReleaseOutcome.Conflict"/>, which the controller's defensive <c>default</c> switch
-        /// arm maps to <c>400 Bad Request</c> with an <see cref="ApiResponse"/> (status 400), refusing to
-        /// double-return already-sold or already-freed stock.
+        /// QA finding — Issue #2 (HTTP semantics): when the reservation is owned by the caller but is no longer
+        /// in a releasable (Active) state — e.g. already Consumed, Released, or Expired — the service reports
+        /// <see cref="ReleaseOutcome.Conflict"/>, which the controller now maps to <c>409 Conflict</c> with an
+        /// <see cref="ApiResponse"/> (status 409) rather than the old generic <c>400</c>. A terminal-state
+        /// conflict on an already-released hold is semantically a 409, and only the verified owner can reach this
+        /// arm (a non-owner is mapped to a uniform 404 first), so the 409 leaks no existence information.
         /// </summary>
         [Fact]
-        public async Task ReleaseReservation_WhenReservationNotActive_ReturnsBadRequestWithApiResponse400()
+        public async Task ReleaseReservation_WhenReservationNotActive_ReturnsConflict409()
         {
             // Arrange
             var (controller, service, _) = CreateController();
@@ -361,9 +366,10 @@ namespace API.Tests.Controllers
             var result = await controller.ReleaseReservation(3, sessionId);
 
             // Assert
-            var badRequest = result.Should().BeOfType<BadRequestObjectResult>().Subject;
-            var api = badRequest.Value.Should().BeOfType<ApiResponse>().Subject;
-            api.StatusCode.Should().Be(400);
+            var conflict = result.Should().BeOfType<ConflictObjectResult>().Subject;
+            conflict.StatusCode.Should().Be(409);
+            var api = conflict.Value.Should().BeOfType<ApiResponse>().Subject;
+            api.StatusCode.Should().Be(409);
         }
 
         /// <summary>
