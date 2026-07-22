@@ -2,8 +2,11 @@
   <div class="image position-relative" style="cursor: pointer;">
     <img src="{{product.pictureUrl}}" alt="{{product.name}}" class="img-fluid bg-secondary">
     <div class="d-flex align-items-center justify-content-center hover-overlay">
-      <button (click) = "addItemToBasket()" [disabled]="stock === 0" type="button" aria-label="Add to cart" class="btn btn-primary fa fa-shopping-cart mr-2"></button>
-      <button routerLink="/shop/{{product.id}}"type="button" class="btn btn-primary">View</button>
+      <button (click)="addItemToBasket()" [disabled]="addToCartDisabled"
+              [attr.aria-label]="'Add ' + product.name + ' to cart'"
+              type="button" class="btn btn-primary fa fa-shopping-cart mr-2"></button>
+      <button routerLink="/shop/{{product.id}}" type="button" class="btn btn-primary"
+              [attr.aria-label]="'View details for ' + product.name">View</button>
     </div>
   </div>
   <div class="card-body d-flex flex-column">
@@ -11,7 +14,16 @@
       <h6 class="text-uppercase">{{product.name}}</h6>
     </a>
     <span class="mb-2">{{product.price | currency}}</span>
-    <span *ngIf="stock > 0 && stock <= 5" class="badge badge-warning" role="status" aria-live="polite">Only {{stock}} left!</span>
-    <span *ngIf="stock === 0" class="badge badge-danger" role="status" aria-live="polite">Out of stock</span>
+    <!-- Live-stock badge precedence (QA F4/F12/F6), fail-closed:
+         link down            -> "Live stock unavailable" (non-blocking, badge-secondary)
+         link up + unknown     -> "Checking availability…" (badge-secondary)
+         link up + stock 0     -> "Out of stock" (badge-danger)
+         link up + 0<stock<=N  -> "Only N left!" (badge-warning), N = server threshold -->
+    <span *ngIf="!stockConnected" class="badge badge-secondary align-self-start" role="status" aria-live="polite">Live stock unavailable</span>
+    <ng-container *ngIf="stockConnected">
+      <span *ngIf="stock === undefined" class="badge badge-secondary align-self-start" role="status" aria-live="polite">Checking availability…</span>
+      <span *ngIf="stock === 0" class="badge badge-danger align-self-start" role="status" aria-live="polite">Out of stock</span>
+      <span *ngIf="stock > 0 && stock <= lowStockThreshold" class="badge badge-warning align-self-start" role="status" aria-live="polite">Only {{stock}} left!</span>
+    </ng-container>
   </div>
 </div>

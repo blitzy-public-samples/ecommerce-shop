@@ -26,6 +26,11 @@ namespace API.Hubs
         private static readonly TimeSpan InitialSubscribeBackoff = TimeSpan.FromSeconds(1);
         private static readonly TimeSpan MaxSubscribeBackoff = TimeSpan.FromSeconds(30);
 
+        // One-time guard (0 = not yet logged, 1 = logged) for the first-broadcast diagnostic below.
+        // HandleMessageAsync runs on Redis-managed threads and may be entered concurrently, so the flag
+        // is flipped with Interlocked.CompareExchange to guarantee the diagnostic is emitted exactly once.
+        private int _firstMessageLogged;
+
         // ILogger is an OPTIONAL trailing dependency (defaults to null) so this bridge can be
         // constructed without a logger (e.g., in a focused test) while the DI container injects the
         // real logger in production. All logging is via _logger?. so a null logger is a safe no-op.
@@ -98,6 +103,16 @@ namespace API.Hubs
                     var subscriber = _redis.GetSubscriber();
                     var queue = await subscriber.SubscribeAsync(StockUpdatesChannel);
                     queue.OnMessage(channelMessage => HandleMessageAsync(channelMessage.Message));
+
+                    // Happy-path observability (OBS-GAP-1): emit a single Information log confirming the
+                    // bridge is live, so operators can see the Redis->SignalR path is active once the
+                    // subscription is established (at startup, or after Redis recovery via this retry loop)
+                    // instead of only ever logging on failure. Without this, a silently non-subscribed
+                    // bridge is invisible; health could only be inferred from `PUBSUB NUMSUB`.
+                    _logger?.LogInformation(
+                        "StockBroadcastBackgroundService subscribed to the Redis '{Channel}' channel; " +
+                        "real-time StockChanged broadcasts are active.", StockUpdatesChannel);
+
                     return queue;
                 }
                 catch (RedisConnectionException ex)
@@ -159,6 +174,18 @@ namespace API.Hubs
             {
                 await _hub.Clients.Group(message.ProductId.ToString())
                     .SendAsync("StockChanged", message.ProductId, message.CurrentStock);
+
+                // One-time first-message diagnostic (QA Issue #5): emit a single Information line the first
+                // time a message is actually received off the channel and forwarded. This distinguishes a
+                // live, message-delivering bridge from one that subscribed but never receives anything —
+                // the previously invisible "healthy-looking but end-to-end dead" case.
+                if (Interlocked.CompareExchange(ref _firstMessageLogged, 1, 0) == 0)
+                {
+                    _logger?.LogInformation(
+                        "StockBroadcastBackgroundService received its first '{Channel}' message and broadcast " +
+                        "StockChanged for product {ProductId} (currentStock {CurrentStock}); the real-time " +
+                        "bridge is delivering.", StockUpdatesChannel, message.ProductId, message.CurrentStock);
+                }
             }
             catch (Exception ex)
             {

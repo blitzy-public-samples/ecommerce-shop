@@ -7,14 +7,33 @@
       <h3>{{product.name}}</h3>
       <p style="font-size: 1.7em">{{product.price | currency}}</p>
       <div class="mb-2">
-        <span *ngIf="stock > 0 && stock <= 5" class="badge badge-warning" role="status" aria-live="polite">Only {{stock}} left!</span>
-        <span *ngIf="stock === 0" class="badge badge-danger" role="status" aria-live="polite">Out of stock</span>
+        <!-- Live-stock badge precedence (QA F4/F12/F6), fail-closed:
+             link down -> "Live stock unavailable"; link up + unknown -> "Checking availability…";
+             link up + 0 -> "Out of stock"; link up + 0<stock<=threshold -> "Only N left!". -->
+        <span *ngIf="!stockConnected" class="badge badge-secondary" role="status" aria-live="polite">Live stock unavailable</span>
+        <ng-container *ngIf="stockConnected">
+          <span *ngIf="stock === undefined" class="badge badge-secondary" role="status" aria-live="polite">Checking availability…</span>
+          <span *ngIf="stock === 0" class="badge badge-danger" role="status" aria-live="polite">Out of stock</span>
+          <span *ngIf="stock > 0 && stock <= lowStockThreshold" class="badge badge-warning" role="status" aria-live="polite">Only {{stock}} left!</span>
+        </ng-container>
       </div>
       <div class="d-flex justify-content-start align-items-center">
-        <i (click)="decrementQuantity()" class="fa fa-minus-circle text-warning mr-2"  style="cursor: pointer; font-size: 2em"></i>
-        <span class="font-weight-bold" style="font-size: 1.5em;">{{quantity}}</span>
-        <i (click)="incrementQuantity()" class="fa fa-plus-circle text-warning mx-2" style="cursor: pointer; font-size: 2em"></i>
-        <button (click)="addItemToBasket()" [disabled]="stock === 0" class="btn btn-outline-primary btn-lg ml-4">Add to Cart</button>
+        <!-- QA F7: the quantity steppers are real <button>s (keyboard-operable —
+             Enter/Space activate) with accessible names; the icon is decorative. -->
+        <button type="button" (click)="decrementQuantity()" [disabled]="quantity <= 1"
+                aria-label="Decrease quantity"
+                class="btn btn-link p-0 border-0 text-warning mr-2 quantity-control">
+          <i class="fa fa-minus-circle" style="font-size: 2em" aria-hidden="true"></i>
+        </button>
+        <span class="font-weight-bold" style="font-size: 1.5em;" aria-live="polite">{{quantity}}</span>
+        <button type="button" (click)="incrementQuantity()"
+                aria-label="Increase quantity"
+                class="btn btn-link p-0 border-0 text-warning mx-2 quantity-control">
+          <i class="fa fa-plus-circle" style="font-size: 2em" aria-hidden="true"></i>
+        </button>
+        <button (click)="addItemToBasket()" [disabled]="addToCartDisabled"
+                [attr.aria-label]="'Add ' + (product?.name || 'product') + ' to cart'"
+                class="btn btn-outline-primary btn-lg ml-4">Add to Cart</button>
       </div>
     </div>
     <div class="row mt-5">

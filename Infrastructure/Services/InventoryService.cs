@@ -114,6 +114,9 @@ namespace Infrastructure.Services
             if (quantity <= 0) return false;
 
             await using var tx = await BeginLockingTransactionAsync();
+            // Issue 2 (connection-pool exhaustion): track commit state so the catch never rolls back an
+            // already-committed transaction after the post-commit (best-effort) Redis call below.
+            var committed = false;
             try
             {
                 await AcquireProductRowLockAsync(productId);
@@ -172,15 +175,25 @@ namespace Infrastructure.Services
 
                 await _context.SaveChangesAsync();
 
-                // Redis best-effort (fail-closed): hold key + DECR counter + publish
+                // Issue 2 (connection-pool exhaustion) fix — COMMIT FIRST, then touch Redis. Committing
+                // releases the pooled Npgsql connection AND the SELECT ... FOR UPDATE row lock BEFORE any
+                // Redis round-trip. Redis is only a best-effort hot-path accelerator (never the oversell
+                // authority — that is the DB row lock + Active-reservation SUM above), so it must not extend
+                // the critical section that holds a scarce pooled connection across Redis latency.
+                if (tx != null) await tx.CommitAsync();
+                committed = true;
+
+                // Redis best-effort (fail-closed): hold key + DECR counter + publish. Runs AFTER commit; the
+                // row lock is already released, so a slow/unreachable Redis no longer pins a pooled connection.
                 await TryReserveRedisAsync(basketId, productId, quantity, expiresAt - now, flashSaleId);
 
-                if (tx != null) await tx.CommitAsync();
                 return true;
             }
             catch (Exception)
             {
-                if (tx != null) await tx.RollbackAsync();
+                // Only roll back when the transaction has NOT already been committed; a post-commit failure
+                // must never attempt to roll back a committed transaction.
+                if (tx != null && !committed) await tx.RollbackAsync();
                 throw; // genuine DB errors propagate; insufficient stock already returned false above
             }
         }
@@ -193,6 +206,9 @@ namespace Infrastructure.Services
         public async Task<bool> ExtendReservationAsync(string basketId, int productId, int quantity)
         {
             await using var tx = await BeginLockingTransactionAsync();
+            // Issue 2 (connection-pool exhaustion): see CreateReservationAsync. Track commit state so the
+            // catch never rolls back an already-committed transaction after the post-commit Redis call.
+            var committed = false;
             try
             {
                 await AcquireProductRowLockAsync(productId);
@@ -266,11 +282,15 @@ namespace Infrastructure.Services
                     });
                     await _context.SaveChangesAsync();
 
+                    // Issue 2 fix — COMMIT FIRST, then touch Redis (releases the pooled connection + FOR
+                    // UPDATE row lock before the Redis round-trip; see CreateReservationAsync).
+                    if (tx != null) await tx.CommitAsync();
+                    committed = true;
+
                     // Redis best-effort (fail-closed): set the hold key with TTL, DECR the counter by the
                     // newly-held quantity, and publish — identical to the create path's counter movement.
                     await TryReserveRedisAsync(basketId, productId, quantity, expiresAt - now, newFlashSaleId);
 
-                    if (tx != null) await tx.CommitAsync();
                     return true;
                 }
 
@@ -316,6 +336,8 @@ namespace Infrastructure.Services
                         existing.ExpiresAt = expiresAt;
                         await _context.SaveChangesAsync();
                         if (tx != null) await tx.CommitAsync();
+                        committed = true;
+                        // Issue 2: Redis TTL refresh runs AFTER commit (fail-closed); the row lock is already released.
                         await TrySetHoldTtlAsync(basketId, productId, expiresAt - now);
                         return false;
                     }
@@ -327,6 +349,11 @@ namespace Infrastructure.Services
                 if (quantity > 0) existing.Quantity = quantity;
                 await _context.SaveChangesAsync();
 
+                // Issue 2 fix — COMMIT FIRST, then touch Redis (releases the pooled connection + FOR UPDATE
+                // row lock before the Redis round-trip; see CreateReservationAsync).
+                if (tx != null) await tx.CommitAsync();
+                committed = true;
+
                 // The Redis counter tracks available stock = pool - SUM(Active reservation quantities),
                 // so it MUST move by exactly the amount the authoritative DB hold moved. Because the hold
                 // quantity is unchanged when quantity <= 0, availability is unchanged and the counter must
@@ -334,15 +361,17 @@ namespace Infrastructure.Services
                 // counter by the held amount and transiently over-report available stock (and the broadcast
                 // badge) until the next reconciliation reseed. Mirror the DB change in the counter delta.
                 var counterDelta = quantity > 0 ? delta : 0;
-                // adjust counter by counterDelta (>0 => DECR, <0 => INCR, 0 => publish-only), refresh hold TTL
-                await TryAdjustReserveRedisAsync(basketId, productId, counterDelta, expiresAt - now, existing.FlashSaleId);
+                // adjust counter by counterDelta (>0 => DECR, <0 => INCR, 0 => publish-only), refresh hold TTL,
+                // and write the authoritative held quantity (existing.Quantity — already updated above when
+                // quantity > 0, unchanged on a TTL-only refresh) to the hold-key value (F-REDIS-1).
+                await TryAdjustReserveRedisAsync(basketId, productId, existing.Quantity, counterDelta, expiresAt - now, existing.FlashSaleId);
 
-                if (tx != null) await tx.CommitAsync();
                 return true;
             }
             catch (Exception)
             {
-                if (tx != null) await tx.RollbackAsync();
+                // Only roll back when the transaction has NOT already been committed (see CreateReservationAsync).
+                if (tx != null && !committed) await tx.RollbackAsync();
                 throw;
             }
         }
@@ -592,27 +621,62 @@ namespace Infrastructure.Services
             return (available < 0 ? 0 : available, flashSaleId);
         }
 
+        /// <summary>
+        /// Redis cache-miss self-heal for the hot-path stock counter. An atomic <c>DECR</c>/<c>INCR</c>
+        /// against an ABSENT <c>stock:product:{id}</c> key (never seeded, evicted under memory pressure,
+        /// or lost to a <c>FLUSHDB</c>) is materialized by Redis as 0 and then driven below zero, so the
+        /// counter — and every low-stock badge derived from it — reports a spurious negative available
+        /// stock. When the value observed after a mutation is negative, reconverge the counter to the
+        /// authoritative committed value computed from PostgreSQL (pool capacity minus the sum of Active
+        /// reservations, already inclusive of the reservation just persisted in the surrounding
+        /// row-locked transaction) via an idempotent <c>SET</c>, and return that repaired value so the
+        /// caller publishes truth rather than the transient negative. A non-negative observation is
+        /// returned unchanged, leaving the normal DECR/INCR/GET hot path completely untouched.
+        ///
+        /// This NEVER widens the oversell surface: the PostgreSQL <c>SELECT ... FOR UPDATE</c> row lock
+        /// remains the sole authority on whether a reservation is granted (that decision has already been
+        /// made and committed before this runs); this only repairs the read-only mirror clients observe.
+        /// It executes inside the caller's Redis try/catch, so a Redis outage during the repair itself is
+        /// swallowed under the same fail-closed contract as the mutation it follows.
+        /// </summary>
+        private async Task<long> RepairCounterIfNegativeAsync(int productId, long observedStock)
+        {
+            if (observedStock >= 0) return observedStock;
+
+            var (available, _) = await ComputeAvailableFromDbAsync(productId);
+            await _database.StringSetAsync(StockKey(productId), available);
+            return available;
+        }
+
         private async Task TryReserveRedisAsync(string basketId, int productId, int quantity, TimeSpan ttl, int? flashSaleId)
         {
             try
             {
                 await _database.StringSetAsync(HoldKey(basketId, productId), quantity, ttl > TimeSpan.Zero ? ttl : (TimeSpan?)null);
                 var currentStock = await _database.StringDecrementAsync(StockKey(productId), quantity);
+                currentStock = await RepairCounterIfNegativeAsync(productId, currentStock);
                 await PublishStockAsync(productId, currentStock, flashSaleId);
             }
             catch (RedisConnectionException ex) { LogRedisDegraded(ex, "ReserveRedis", productId, basketId); }
             catch (RedisTimeoutException ex) { LogRedisDegraded(ex, "ReserveRedis", productId, basketId); }
         }
 
-        private async Task TryAdjustReserveRedisAsync(string basketId, int productId, int delta, TimeSpan ttl, int? flashSaleId)
+        private async Task TryAdjustReserveRedisAsync(string basketId, int productId, int heldQuantity, int delta, TimeSpan ttl, int? flashSaleId)
         {
             try
             {
-                await _database.StringSetAsync(HoldKey(basketId, productId), 0, ttl > TimeSpan.Zero ? ttl : (TimeSpan?)null, when: When.Exists);
+                // F-REDIS-1: write the CURRENT held quantity to the hold-key value (NOT a literal 0) so an
+                // operator inspecting `reservation:{basketId}:{productId}` sees the true held amount, matching
+                // the create path (TryReserveRedisAsync writes the quantity). When.Exists (XX) is preserved so
+                // an already-expired/absent hold key is NOT recreated here — reservation expiry authority stays
+                // exclusively with PostgreSQL + the reconciliation service (the value is never read for
+                // correctness; this fixes its observability fidelity only).
+                await _database.StringSetAsync(HoldKey(basketId, productId), heldQuantity, ttl > TimeSpan.Zero ? ttl : (TimeSpan?)null, when: When.Exists);
                 long currentStock;
                 if (delta > 0) currentStock = await _database.StringDecrementAsync(StockKey(productId), delta);
                 else if (delta < 0) currentStock = await _database.StringIncrementAsync(StockKey(productId), -delta);
                 else currentStock = (long)await _database.StringGetAsync(StockKey(productId));
+                currentStock = await RepairCounterIfNegativeAsync(productId, currentStock);
                 await PublishStockAsync(productId, currentStock, flashSaleId);
             }
             catch (RedisConnectionException ex) { LogRedisDegraded(ex, "AdjustReserveRedis", productId, basketId); }

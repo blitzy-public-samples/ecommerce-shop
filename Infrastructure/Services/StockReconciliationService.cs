@@ -69,6 +69,21 @@ namespace Infrastructure.Services
         // key is absent or cannot be parsed.
         private const int DefaultReconciliationIntervalSeconds = 30;
 
+        // Lower bound (seconds): a misconfigured 0 or negative value must never turn the loop into a
+        // tight CPU-spin (Task.Delay(<=0) returns immediately).
+        private const int MinReconciliationIntervalSeconds = 1;
+
+        // Upper bound (seconds): 24 hours. This caps the configured interval so that
+        // TimeSpan.FromSeconds(interval) can never overflow Int32 milliseconds when handed to
+        // Task.Delay. Task.Delay's ceiling is Int32.MaxValue ms (~24.855 days ≈ 2,147,483 s); any
+        // configured value at/above ~2,147,484 s would throw ArgumentOutOfRangeException synchronously
+        // and — since a .NET 5 BackgroundService does not observe an ExecuteAsync fault — SILENTLY kill
+        // the loop (the sole enforcer of reservation expiry + the Redis↔PostgreSQL reconverger) after a
+        // single pass with no log. 86,400 s = 86,400,000 ms is far below the ceiling, so a clamped value
+        // is always safe. Any operator value above this sane maximum is bounded here rather than allowed
+        // to disable reconciliation. (QA Issue #3.)
+        private const int MaxReconciliationIntervalSeconds = 86_400;
+
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly IConfiguration _config;
         private readonly IConnectionMultiplexer _redis;
@@ -93,12 +108,16 @@ namespace Infrastructure.Services
         // because the binder package is absent from Infrastructure's dependency closure and would not
         // compile against the current reference set.
         // Evaluated once per loop iteration so the interval is test-overridable via configuration.
-        // Clamped to a minimum of 1 second: a misconfigured 0 or negative value must never turn the
-        // reconciliation loop into a tight, CPU-spinning loop (Task.Delay(<=0) returns immediately) nor
-        // throw ArgumentOutOfRangeException. A missing/unparseable key falls back to the default (30s).
+        // Clamped to [MinReconciliationIntervalSeconds, MaxReconciliationIntervalSeconds]:
+        //   * the LOWER clamp (1s) stops a misconfigured 0/negative value from turning the loop into a
+        //     tight, CPU-spinning loop (Task.Delay(<=0) returns immediately);
+        //   * the UPPER clamp (86,400s / 24h) stops an extreme value from overflowing Int32 milliseconds
+        //     inside TimeSpan.FromSeconds → Task.Delay and silently killing the loop (QA Issue #3).
+        // Because the effective value is always within the safe range, Task.Delay can NEVER throw
+        // ArgumentOutOfRangeException here. A missing/unparseable key falls back to the default (30s).
         private int ReconciliationIntervalSeconds =>
             int.TryParse(_config["Inventory:ReconciliationIntervalSeconds"], out var v)
-                ? Math.Max(1, v)
+                ? Math.Clamp(v, MinReconciliationIntervalSeconds, MaxReconciliationIntervalSeconds)
                 : DefaultReconciliationIntervalSeconds;
 
         // BackgroundService entry point. Runs one reconciliation pass, then waits the configured
@@ -106,6 +125,13 @@ namespace Infrastructure.Services
         // the service keeps running; only cancellation ends the loop.
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
+            // Positive hosted-service startup confirmation (QA Issue #6): a single Information line so an
+            // operator can tell from the logs alone that the reconciliation loop actually began and at what
+            // cadence — liveness is no longer only inferable from side effects (counter reseeds).
+            _logger?.LogInformation(
+                "StockReconciliationService started; reconciliation interval = {IntervalSeconds}s.",
+                ReconciliationIntervalSeconds);
+
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
@@ -131,6 +157,26 @@ namespace Infrastructure.Services
                 {
                     // Delay interrupted by shutdown: exit the loop.
                     break;
+                }
+                catch (ArgumentOutOfRangeException ex)
+                {
+                    // Defense in depth (QA Issue #3): the clamp on ReconciliationIntervalSeconds already
+                    // guarantees the delay is within Task.Delay's Int32-millisecond ceiling, so this branch
+                    // should be unreachable. But if some future change ever produced an out-of-range delay,
+                    // this catch prevents the fault from escaping ExecuteAsync and silently terminating the
+                    // loop (which a .NET 5 BackgroundService would NOT surface). Log it and fall back to the
+                    // default cadence so the sole enforcer of reservation expiry keeps running.
+                    _logger?.LogWarning(ex,
+                        "Reconciliation delay was out of range; falling back to the default interval of " +
+                        "{DefaultIntervalSeconds}s.", DefaultReconciliationIntervalSeconds);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(DefaultReconciliationIntervalSeconds), stoppingToken);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        break;
+                    }
                 }
             }
         }

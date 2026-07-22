@@ -292,6 +292,73 @@ namespace API.Tests.Controllers
         }
 
         /// <summary>
+        /// F6-D1 (compensating release on a FRESH basket): on a multi-line partial failure, a hold that
+        /// WAS granted earlier in the same call must not be left orphaned when the update is rejected.
+        /// With no prior persisted basket, the granted line's freshly-created hold is released before the
+        /// action returns <c>409</c>, so no reservation survives a basket that was never persisted.
+        /// </summary>
+        [Fact]
+        public async Task UpdateBasket_WhenPartialFailureOnFreshBasket_ReleasesGrantedLineBeforeReturning409()
+        {
+            // Arrange — fresh basket (no prior). Line 1 (qty 3) reserves OK; line 2 (qty 1) is short, so the
+            // whole update is rejected. This is the deterministic F6-D1 repro (product granted, then a later
+            // short line) that previously left product 1 as an orphaned Active hold.
+            var (controller, repo, mapper, inventory) = CreateController();
+            var dto = new CustomerBasketDto { Id = "basket-1" };
+            var mapped = new CustomerBasket("basket-1");
+            mapped.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 3 });
+            mapped.Items.Add(new BasketItem { Id = 2, ProductName = "Typescript Entry Board", Price = 120m, Quantity = 1 });
+            mapper.Setup(m => m.Map<CustomerBasketDto, CustomerBasket>(dto)).Returns(mapped);
+            // No prior basket (GetBasketAsync returns null by default) => nothing to restore to.
+            inventory.Setup(i => i.ExtendReservationAsync("basket-1", 2, 1)).ReturnsAsync(false);
+
+            // Act
+            var result = await controller.UpdateBasket(dto);
+
+            // Assert — 409, NOT persisted, and the granted line (product 1) hold is released (no orphan),
+            // while the denied line (product 2) — never granted — is not released.
+            result.Result.Should().BeOfType<ConflictObjectResult>();
+            ((ConflictObjectResult)result.Result).StatusCode.Should().Be(409);
+            repo.Verify(r => r.UpdateBasketAsync(It.IsAny<CustomerBasket>()), Times.Never);
+            inventory.Verify(i => i.ReleaseReservationAsync("basket-1", 1), Times.Once);
+            inventory.Verify(i => i.ReleaseReservationAsync("basket-1", 2), Times.Never);
+        }
+
+        /// <summary>
+        /// F6-D1 (compensating restore with a PRIOR hold): on a multi-line partial failure where a granted
+        /// product already held stock from the previously-persisted basket, the hold is restored to that
+        /// prior quantity (not released) before returning <c>409</c>, so the reservation state keeps
+        /// mirroring the still-persisted prior basket rather than the rejected larger request.
+        /// </summary>
+        [Fact]
+        public async Task UpdateBasket_WhenPartialFailureWithPriorHold_RestoresGrantedLineToPriorQuantity()
+        {
+            // Arrange — prior basket held product 1 at qty 2. Incoming grows product 1 to qty 5 (granted)
+            // and adds product 2 qty 1 (short), so the update is rejected.
+            var (controller, repo, mapper, inventory) = CreateController();
+            var dto = new CustomerBasketDto { Id = "basket-1" };
+            var mapped = new CustomerBasket("basket-1");
+            mapped.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 5 });
+            mapped.Items.Add(new BasketItem { Id = 2, ProductName = "Typescript Entry Board", Price = 120m, Quantity = 1 });
+            var prior = new CustomerBasket("basket-1");
+            prior.Items.Add(new BasketItem { Id = 1, ProductName = "Angular Speedster Board 2000", Price = 200m, Quantity = 2 });
+            mapper.Setup(m => m.Map<CustomerBasketDto, CustomerBasket>(dto)).Returns(mapped);
+            repo.Setup(r => r.GetBasketAsync("basket-1")).ReturnsAsync(prior);
+            inventory.Setup(i => i.ExtendReservationAsync("basket-1", 2, 1)).ReturnsAsync(false);
+
+            // Act
+            var result = await controller.UpdateBasket(dto);
+
+            // Assert — 409, NOT persisted, product 1's hold restored to the prior total (2) rather than
+            // released, and the kept product is not released.
+            result.Result.Should().BeOfType<ConflictObjectResult>();
+            ((ConflictObjectResult)result.Result).StatusCode.Should().Be(409);
+            repo.Verify(r => r.UpdateBasketAsync(It.IsAny<CustomerBasket>()), Times.Never);
+            inventory.Verify(i => i.ExtendReservationAsync("basket-1", 1, 2), Times.Once);
+            inventory.Verify(i => i.ReleaseReservationAsync("basket-1", 1), Times.Never);
+        }
+
+        /// <summary>
         /// F2 (duplicate-line normalization): repeated lines for the same product are collapsed
         /// into a single line whose quantity is the SUM, and the reservation is made for that
         /// combined total (not the last duplicate's quantity).

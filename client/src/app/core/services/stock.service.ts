@@ -46,6 +46,17 @@ export class StockService {
   /** Per-product streams of the latest known stock value, keyed by product id. */
   private stockSubjects = new Map<number, ReplaySubject<number>>();
 
+  /**
+   * Latest known stock value per product id, mirrored synchronously alongside the
+   * per-product ReplaySubject. A ReplaySubject does not expose its buffered value
+   * synchronously, so this map lets non-reactive callers (e.g. the checkout
+   * `StockGuard`) read the current authoritative-as-known stock without subscribing.
+   * A product id maps to a value ONLY after a valid broadcast has been applied for
+   * it; an id that has never been observed returns `undefined` (unknown), which
+   * consumers treat as fail-closed.
+   */
+  private lastKnownStock = new Map<number, number>();
+
   /** Every product id the client is currently subscribed to, replayed on reconnect. */
   private trackedProductIds = new Set<number>();
 
@@ -89,6 +100,22 @@ export class StockService {
    */
   readonly connectionState$: Observable<HubConnectionState> = this.connectionStateSubject.asObservable();
 
+  /**
+   * Backing subject for the backend-managed low-stock threshold. Seeded with the
+   * AAP-documented default of 5 so the "Only N left!" badge threshold is correct
+   * even before the hub delivers the authoritative value (fail-safe default).
+   */
+  private lowStockThresholdSubject = new BehaviorSubject<number>(5);
+
+  /**
+   * Observable of the backend low-stock threshold (the AAP `Inventory:LowStockThreshold`
+   * key, default 5). The hub pushes it via the `LowStockThreshold` message on subscribe
+   * so the product/detail badges render "Only N left!" from a SINGLE source of truth
+   * instead of a hardcoded client constant. Consuming templates bind to this (async)
+   * or to the `lowStockThreshold` snapshot.
+   */
+  readonly lowStockThreshold$: Observable<number> = this.lowStockThresholdSubject.asObservable();
+
   constructor() {
     // Build the hub connection against the environment-configured hub host.
     // Dev  -> https://localhost:5001/hubs/stock ; Prod -> hubs/stock.
@@ -104,6 +131,15 @@ export class StockService {
     // payload is validated and unsolicited/untracked ids are ignored (see applyStock).
     this.hubConnection.on('StockChanged', (productId: number, currentStock: number) => {
       this.applyStock(productId, currentStock);
+    });
+
+    // Server -> client push of the backend low-stock threshold (AAP
+    // Inventory:LowStockThreshold). Captured into a subject so badges use a single
+    // source of truth rather than a hardcoded client constant. Validated the same
+    // way the server clamps it (a positive integer); a malformed value is ignored so
+    // a rogue frame cannot corrupt the badge threshold.
+    this.hubConnection.on('LowStockThreshold', (threshold: number) => {
+      this.applyLowStockThreshold(threshold);
     });
 
     // Surface transient connection state so consuming UI can fail closed while the
@@ -132,6 +168,25 @@ export class StockService {
   /** Convenience flag mirroring the underlying hub connection's live state. */
   get isConnected(): boolean {
     return this.hubConnection.state === HubConnectionState.Connected;
+  }
+
+  /**
+   * Snapshot of the current backend low-stock threshold (default 5 until the hub
+   * delivers the authoritative value). Templates that cannot use the async pipe read
+   * this synchronously to decide when to render the "Only N left!" badge.
+   */
+  get lowStockThreshold(): number {
+    return this.lowStockThresholdSubject.value;
+  }
+
+  /**
+   * Returns the latest known stock for a product, or `undefined` if no valid stock
+   * has been observed yet. Synchronous, non-reactive read for callers that cannot
+   * subscribe (e.g. the checkout `StockGuard`, which must decide in `canActivate`).
+   * `undefined` denotes UNKNOWN and MUST be treated as fail-closed by callers.
+   */
+  getCurrentStock(productId: number): number | undefined {
+    return this.lastKnownStock.get(productId);
   }
 
   /**
@@ -236,6 +291,9 @@ export class StockService {
     // Last consumer released: evict all client-side state for this product.
     this.subscriptionCounts.delete(productId);
     this.trackedProductIds.delete(productId);
+    // Drop the synchronous snapshot too, so getCurrentStock() cannot return a stale
+    // value for a product no longer tracked (the guard treats absence as unknown).
+    this.lastKnownStock.delete(productId);
 
     const subject = this.stockSubjects.get(productId);
     if (subject) {
@@ -341,7 +399,29 @@ export class StockService {
       return;
     }
 
-    this.getOrCreateSubject(productId).next(currentStock);
+    // Integer-guard the stock (QA INF-1): the authoritative Products.StockQuantity is
+    // an integer, but coerce defensively so a fractional value can never render as
+    // "Only 2.7 left!". Flooring is fail-safe — it never rounds UP into advertising
+    // stock that is not there (2.7 -> 2, 0.4 -> 0 -> "Out of stock").
+    const normalizedStock = Math.floor(currentStock);
+
+    // Mirror synchronously so getCurrentStock() (used by the checkout StockGuard) can
+    // read the latest value without subscribing.
+    this.lastKnownStock.set(productId, normalizedStock);
+
+    this.getOrCreateSubject(productId).next(normalizedStock);
+  }
+
+  /**
+   * Validates and applies a backend low-stock threshold pushed over the hub. Accepts
+   * only a positive integer (mirroring the server-side clamp of Max(1, value)); any
+   * other payload (NaN, non-finite, <= 0, non-integer) is ignored so the badge
+   * threshold cannot be corrupted by a malformed or rogue frame.
+   */
+  private applyLowStockThreshold(threshold: number): void {
+    if (typeof threshold === 'number' && Number.isInteger(threshold) && threshold >= 1) {
+      this.lowStockThresholdSubject.next(threshold);
+    }
   }
 
   /** A product id is valid when it is a positive integer. */

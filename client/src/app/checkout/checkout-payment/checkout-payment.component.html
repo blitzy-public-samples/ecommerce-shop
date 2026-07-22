@@ -25,7 +25,7 @@
     <i class="fa fa-angle-left"></i> Back to Review
   </button>
   <button [disabled]="loading
-    || stockBlocked
+    || disableForStock
     || checkoutForm.get('paymentForm').invalid
     || !cardNumberValid
     || !cardExpiryValid

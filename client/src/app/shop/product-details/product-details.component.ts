@@ -5,6 +5,7 @@ import {ActivatedRoute} from "@angular/router";
 import {BreadcrumbService} from "xng-breadcrumb";
 import {BasketService} from "../../basket/basket.service";
 import {Subscription} from 'rxjs';
+import {HubConnectionState} from '@microsoft/signalr';
 import {StockService} from '../../core/services/stock.service';
 
 @Component({
@@ -16,8 +17,14 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   product: IProduct;
   quantity = 1;
   stock: number;
+  // QA F6: server-authoritative low-stock threshold (seeded with the AAP default 5).
+  lowStockThreshold = 5;
+  // QA F4/F12: live-stock hub link health; drives fail-closed gating + indicator.
+  stockConnected = false;
   private stockSub: Subscription;
   private routeSub: Subscription;
+  private thresholdSub: Subscription;
+  private connectionSub: Subscription;
   private subscribedProductId: number;
 
   constructor(private shopService: ShopService, private activateRoute: ActivatedRoute,
@@ -27,6 +34,12 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
+    // Seed the threshold synchronously, then track hub updates (QA F6) and the
+    // live-link state (QA F4/F12) for the lifetime of the view.
+    this.lowStockThreshold = this.stockService.lowStockThreshold;
+    this.thresholdSub = this.stockService.lowStockThreshold$.subscribe(t => this.lowStockThreshold = t);
+    this.connectionSub = this.stockService.connectionState$.subscribe(
+      state => this.stockConnected = state === HubConnectionState.Connected);
     // Resolve the id from the paramMap OBSERVABLE (not a one-shot snapshot) so a
     // same-component route reuse — navigating between products without leaving the
     // details view — rebinds live-stock tracking to the new product (QA R2).
@@ -35,13 +48,19 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
     });
   }
   addItemToBasket() {
-    // Defense-in-depth guard (QA H2): refuse a programmatic add at zero stock and
-    // never enqueue more than the currently-known available stock. The template
-    // already disables the button at zero; authoritative oversell prevention still
-    // lives on the server (reservation + row lock).
-    if (this.stock === 0) { return; }
+    // Defense-in-depth guard (QA H2 + F4): refuse a programmatic add when stock is
+    // zero/unknown or the live link is down, and never enqueue more than the
+    // currently-known available stock. The template also disables the button;
+    // authoritative oversell prevention still lives on the server (row lock).
+    if (this.addToCartDisabled) { return; }
     const quantityToAdd = this.stock !== undefined ? Math.min(this.quantity, this.stock) : this.quantity;
     this.basketService.addItemToBasket(this.product, quantityToAdd);
+  }
+
+  // QA F4 (fail-closed): enable "Add to Cart" only when the live link is up AND
+  // stock is known-positive; a dropped connection or unknown stock disables it.
+  get addToCartDisabled(): boolean {
+    return !this.stockConnected || this.stock === undefined || this.stock === 0;
   }
   incrementQuantity() {
     // Do not let the requested quantity exceed the known available stock (QA H2).
@@ -66,7 +85,16 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
       this.bcService.set('@productDetails', product.name);
       this.subscribedProductId = product.id;
       this.stockService.subscribeToProduct(product.id);
-      this.stockSub = this.stockService.getStock$(product.id).subscribe(s => this.stock = s);
+      this.stockSub = this.stockService.getStock$(product.id).subscribe(s => {
+        this.stock = s;
+        // QA INF-2: if live stock drops below the currently-selected quantity,
+        // clamp the displayed quantity down so the shopper never sees a request
+        // quantity that exceeds availability. Never clamp below 1, and leave the
+        // quantity untouched while stock is unknown (undefined).
+        if (this.stock !== undefined && this.stock > 0 && this.quantity > this.stock) {
+          this.quantity = this.stock;
+        }
+      });
     }, error => {
       console.log(error);
     });
@@ -85,6 +113,12 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     if (this.routeSub) {
       this.routeSub.unsubscribe();
+    }
+    if (this.thresholdSub) {
+      this.thresholdSub.unsubscribe();
+    }
+    if (this.connectionSub) {
+      this.connectionSub.unsubscribe();
     }
     this.releaseStockSubscription();
   }

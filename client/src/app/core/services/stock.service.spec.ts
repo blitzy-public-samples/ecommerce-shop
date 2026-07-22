@@ -27,6 +27,7 @@ describe('StockService', () => {
   let withUrlSpy: jasmine.Spy;
   let withReconnectSpy: jasmine.Spy;
   let stockChangedCb: (productId: number, currentStock: number) => void;
+  let lowStockThresholdCb: (threshold: number) => void;
   let reconnectedCb: () => Promise<void>;
   let closeCb: () => void;
 
@@ -43,9 +44,12 @@ describe('StockService', () => {
       return Promise.resolve();
     });
     hubSpy.invoke.and.returnValue(Promise.resolve(7));
-    hubSpy.on.and.callFake((method: string, cb: (productId: number, currentStock: number) => void) => {
+    hubSpy.on.and.callFake((method: string, cb: (...args: any[]) => void) => {
       if (method === 'StockChanged') {
-        stockChangedCb = cb;
+        stockChangedCb = cb as (productId: number, currentStock: number) => void;
+      }
+      if (method === 'LowStockThreshold') {
+        lowStockThresholdCb = cb as (threshold: number) => void;
       }
     });
     hubSpy.onreconnected.and.callFake((cb: () => Promise<void>) => {
@@ -331,5 +335,80 @@ describe('StockService', () => {
 
     expect(states[0]).toBe(HubConnectionState.Disconnected);
     expect(states).toContain(HubConnectionState.Connected);
+  });
+
+  // ---------------------------------------------------------------------------
+  // F6: backend-managed low-stock threshold. The hub pushes a `LowStockThreshold`
+  // message on subscribe; the service must capture it so badges use a single source
+  // of truth instead of a hardcoded client 5.
+  // ---------------------------------------------------------------------------
+
+  it('defaults lowStockThreshold to 5 (AAP default) before the hub delivers one', () => {
+    expect(service.lowStockThreshold).toBe(5);
+    let emitted: number;
+    service.lowStockThreshold$.subscribe(v => (emitted = v));
+    expect(emitted).toBe(5);
+  });
+
+  it('captures the LowStockThreshold hub message and exposes it on lowStockThreshold$', () => {
+    const emitted: number[] = [];
+    service.lowStockThreshold$.subscribe(v => emitted.push(v));
+
+    lowStockThresholdCb(3);
+
+    expect(service.lowStockThreshold).toBe(3);
+    expect(emitted[emitted.length - 1]).toBe(3);
+  });
+
+  it('ignores a malformed LowStockThreshold value (<=0, non-integer, non-finite)', () => {
+    lowStockThresholdCb(0);
+    lowStockThresholdCb(-2);
+    lowStockThresholdCb(2.5);
+    lowStockThresholdCb(NaN);
+    lowStockThresholdCb(Infinity);
+    lowStockThresholdCb('7' as any);
+
+    // Unchanged from the default; no malformed value corrupted the threshold.
+    expect(service.lowStockThreshold).toBe(5);
+
+    // A subsequent VALID value is still accepted.
+    lowStockThresholdCb(8);
+    expect(service.lowStockThreshold).toBe(8);
+  });
+
+  // ---------------------------------------------------------------------------
+  // INF-1: a fractional stock must never render as "Only 2.7 left!"; the service
+  // floors it (fail-safe: never rounds up into advertising absent stock).
+  // ---------------------------------------------------------------------------
+
+  it('floors a fractional stock value to an integer before emitting (INF-1)', () => {
+    let emitted: number;
+    service.getStock$(1).subscribe(stock => (emitted = stock));
+
+    stockChangedCb(1, 2.7);
+    expect(emitted).toBe(2);
+
+    stockChangedCb(1, 0.4);
+    expect(emitted).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // getCurrentStock: synchronous snapshot used by the checkout StockGuard.
+  // ---------------------------------------------------------------------------
+
+  it('getCurrentStock returns undefined for an unknown product, the value after a broadcast, and undefined after eviction', () => {
+    expect(service.getCurrentStock(1)).toBeUndefined();
+
+    service.subscribeToProduct(1);
+    stockChangedCb(1, 4);
+    expect(service.getCurrentStock(1)).toBe(4);
+
+    // A floored value is mirrored too.
+    stockChangedCb(1, 3.9);
+    expect(service.getCurrentStock(1)).toBe(3);
+
+    // Last consumer releases -> snapshot is dropped (unknown again, fail-closed).
+    service.unsubscribeFromProduct(1);
+    expect(service.getCurrentStock(1)).toBeUndefined();
   });
 });

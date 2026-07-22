@@ -4,6 +4,8 @@
 > **Branch:** `blitzy-bc9729c4-3c5b-4c15-a797-e9d49001ce13` · **HEAD:** `738df1d` · **Baseline:** `a0630f1`
 > **Brand colors:** Completed / AI Work = **Dark Blue `#5B39F3`** · Remaining = **White `#FFFFFF`** · Headings = Violet-Black `#B23AF2` · Highlight = Mint `#A8FDD9`
 
+> ⚠️ **SUPERSEDED — historical snapshot.** This guide was generated for the prior **"Add Testing"** engagement, as of commit `738df1d` on branch `blitzy-bc9729c4-3c5b-4c15-a797-e9d49001ce13`. The codebase has since gained the **Real-Time Inventory & Flash-Sale System** (authoritative `Products.StockQuantity`; `Reservations` / `FlashSales` tables; `IInventoryService`; the `/hubs/stock` SignalR hub; and a background stock-reconciliation service). Consequently, the point-in-time status figures below — **92.8% completion**, the **321 backend / 412 in-scope / 91 frontend** test counts, and the compliance-scorecard row **"No inventory/flash-sale scope … Absent"** — describe that earlier snapshot and are **no longer current** (the inventory feature is now implemented and shipping, and the backend test suite has grown accordingly). The **setup, build, run, verification, and port/version/environment sections (§9–§10) remain accurate** and are the authoritative local-setup reference for the current codebase.
+
 ---
 
 ## 1. Executive Summary
@@ -159,7 +161,7 @@ All tests below originate from Blitzy's autonomous validation logs and were inde
 | Minimal annotated production change | Only where strictly required, with comment | ✅ Pass | Single `PaymentService` seam, fully annotated, default unchanged |
 | Preserve `app.component.spec.ts` | Verbatim, no edits | ✅ Pass | Unmodified since 2021-08-05 |
 | Leave Protractor / TSLint untouched | Out of scope | ✅ Pass | No changes |
-| No inventory/flash-sale scope | Must not be introduced | ✅ Pass | Absent |
+| No inventory/flash-sale scope | Must not be introduced *(that prior engagement only)* | ✅ Pass *(as of `738df1d`)* | ~~Absent~~ — **superseded:** the Real-Time Inventory & Flash-Sale System is now implemented and shipping (see banner at top) |
 | Naming convention | `MethodName_StateUnderTest_ExpectedBehavior` | ✅ Pass | Applied across backend |
 | Test code isolation | 4 test projects or colocated `*.spec.ts` | ✅ Pass | No leakage into production projects |
 | Determinism | Zero flakiness, no fixed sleeps | ✅ Pass | 3 consecutive clean runs; `WaitStrategy` |
@@ -327,9 +329,11 @@ cd client && npm start                     # http://localhost:4200
 ### 9.7 Verification
 
 ```bash
-curl -s http://localhost:5000/api/products | head -c 200      # 200, 18 products
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:5000/api/products/99999   # 404 (structured ApiResponse)
-curl -s -X POST http://localhost:5000/api/account/login \
+# The API enforces HTTPS redirection (UseHttpsRedirection), so plain http://localhost:5000
+# requests return 307; call the HTTPS endpoint. -k trusts the local dev certificate.
+curl -sk https://localhost:5001/api/products | head -c 200      # 200, 18 products
+curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:5001/api/products/99999   # 404 (structured ApiResponse)
+curl -sk -X POST https://localhost:5001/api/account/login \
   -H "Content-Type: application/json" \
   -d '{"email":"bob@test.com","password":"Pa$$w0rd"}'          # 200 + JWT
 ```

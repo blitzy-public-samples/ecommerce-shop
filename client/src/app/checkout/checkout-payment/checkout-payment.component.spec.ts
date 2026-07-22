@@ -1,155 +1,250 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { Component, Input, forwardRef } from '@angular/core';
+import { CommonModule } from '@angular/common';
 import {
-  ReactiveFormsModule, FormGroup, FormControl, Validators,
-  ControlValueAccessor, NG_VALUE_ACCESSOR
+  ControlValueAccessor,
+  FormBuilder,
+  FormControl,
+  FormGroup,
+  NG_VALUE_ACCESSOR,
+  ReactiveFormsModule,
+  Validators
 } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 import { of } from 'rxjs';
-import { ToastrService } from 'ngx-toastr';
 
 import { CheckoutPaymentComponent } from './checkout-payment.component';
 import { BasketService } from 'src/app/basket/basket.service';
 import { CheckoutService } from '../checkout.service';
+import { ToastrService } from 'ngx-toastr';
 
 /**
- * Coverage for the P4-07 checkout submit gate on CheckoutPaymentComponent — the component that actually
- * owns the "Submit Order" button and submitOrder(). Before the fix the parent CheckoutComponent computed
- * the zero-stock gate but only rendered an alert; the payment child never received it, so a shopper could
- * still finalize an order containing an out-of-stock line. The fix adds an @Input() stockBlocked that both
- * disables the Submit button ([disabled]="... || stockBlocked") and short-circuits submitOrder().
+ * Real-DOM specs for the C-3 fix: the checkout "Submit Order" button must be disabled — and
+ * submitOrder() must short-circuit — when the parent CheckoutComponent flags an out-of-stock basket
+ * product via [disableForStock]="submitDisabledForStock" (AAP §0.5.3). Before the fix the payment step had
+ * no gating input, so the button stayed enabled and no test asserted its disabled state at zero stock.
+ *
+ * The component's real template is exercised (not overridden) so the assertions bind to the ACTUAL
+ * Submit Order button. Two lightweight test doubles keep the suite hermetic:
+ *  - a global `Stripe` stub so ngAfterViewInit (which mounts Stripe Elements) runs without Stripe.js;
+ *  - a `StubTextInputComponent` that provides NG_VALUE_ACCESSOR so the template's
+ *    `<app-text-input formControlName="nameOnCard">` binds without importing the real control.
  */
 
-// Builds a fully-valid checkout form (address + delivery + payment) so the ONLY driver of the Submit
-// button's disabled state under test is the stockBlocked flag (card-validity flags are set by the tests).
-function buildValidCheckoutForm(): FormGroup {
-  return new FormGroup({
-    addressForm: new FormGroup({
-      street: new FormControl('1 Test St'), city: new FormControl('Town'),
-      state: new FormControl('ST'), zipcode: new FormControl('00000')
-    }),
-    deliveryForm: new FormGroup({ deliveryMethod: new FormControl('1') }),
-    paymentForm: new FormGroup({ nameOnCard: new FormControl('Jane Cardholder', Validators.required) })
-  });
-}
-
-describe('CheckoutPaymentComponent submitOrder() gate (P4-07)', () => {
-  let component: CheckoutPaymentComponent;
-  let basketService: jasmine.SpyObj<BasketService>;
-  let checkoutService: jasmine.SpyObj<CheckoutService>;
-  let toastr: jasmine.SpyObj<ToastrService>;
-  let router: jasmine.SpyObj<any>;
-
-  beforeEach(() => {
-    // Direct instantiation (no TestBed/ngAfterViewInit) keeps this a pure unit test of the guard.
-    basketService = jasmine.createSpyObj<BasketService>('BasketService',
-      ['getCurrentBasketValue', 'deleteLocalBasket']);
-    checkoutService = jasmine.createSpyObj<CheckoutService>('CheckoutService', ['createOrder']);
-    toastr = jasmine.createSpyObj<ToastrService>('ToastrService', ['error']);
-    router = jasmine.createSpyObj('Router', ['navigate']);
-
-    component = new CheckoutPaymentComponent(basketService, checkoutService, toastr, router);
-  });
-
-  it('does NOT submit and does NOT start loading when stockBlocked is true', async () => {
-    component.stockBlocked = true;
-
-    await component.submitOrder();
-
-    // The guard returns before touching the basket, the order API, or the loading flag.
-    expect(basketService.getCurrentBasketValue).not.toHaveBeenCalled();
-    expect(checkoutService.createOrder).not.toHaveBeenCalled();
-    expect(component.loading).toBeFalse();
-  });
-
-  it('proceeds to create the order when stockBlocked is false', async () => {
-    component.stockBlocked = false;
-    component.checkoutForm = buildValidCheckoutForm();
-    // Stand in for the Stripe SDK object normally created in ngAfterViewInit (not run here): report a
-    // successful payment so the happy path completes cleanly through to the success navigation.
-    (component as any).stripe = { confirmCardPayment: async () => ({ paymentIntent: { id: 'pi_1' } }) };
-    basketService.getCurrentBasketValue.and.returnValue({ id: 'b1', clientSecret: 'cs_1' } as any);
-    checkoutService.createOrder.and.returnValue(of({ id: 1 } as any));
-
-    await component.submitOrder();
-
-    // The guard let the submission through: the order API was invoked and the local basket cleared.
-    expect(checkoutService.createOrder).toHaveBeenCalled();
-    expect(basketService.deleteLocalBasket).toHaveBeenCalledWith('b1');
-    expect(router.navigate).toHaveBeenCalled();
-  });
-});
-
-// Minimal ControlValueAccessor stub for <app-text-input> so the real checkout-payment template renders
-// its reactive-form control without pulling in the real text-input component.
+// Minimal ControlValueAccessor stub for the app-text-input the payment template renders, so the
+// reactive `formControlName` directive resolves a value accessor and the real template compiles.
 @Component({
   selector: 'app-text-input',
   template: '',
   providers: [
-    { provide: NG_VALUE_ACCESSOR, useExisting: forwardRef(() => StubTextInputComponent), multi: true }
+    {
+      provide: NG_VALUE_ACCESSOR,
+      useExisting: forwardRef(() => StubTextInputComponent),
+      multi: true
+    }
   ]
 })
 class StubTextInputComponent implements ControlValueAccessor {
   @Input() label: string;
-  writeValue(): void { }
-  registerOnChange(): void { }
-  registerOnTouched(): void { }
+  @Input() type: string;
+  writeValue(): void {}
+  registerOnChange(): void {}
+  registerOnTouched(): void {}
+  setDisabledState(): void {}
 }
 
-describe('CheckoutPaymentComponent Submit button disabled state (P4-07)', () => {
+// Installs a minimal global Stripe stub. Each created "element" exposes the mount/addEventListener/
+// destroy the component calls; the instance exposes confirmCardPayment for the submit path.
+function installStripeStub(): void {
+  const cardElement = {
+    mount: () => {},
+    addEventListener: () => {},
+    destroy: () => {}
+  };
+  (window as any).Stripe = () => ({
+    elements: () => ({ create: () => cardElement }),
+    confirmCardPayment: () =>
+      Promise.resolve({ paymentIntent: null, error: { message: 'stubbed' } })
+  });
+}
+
+// Locates the real "Submit Order" button (as opposed to the "Back to Review" button) in the DOM.
+function submitButton(
+  fixture: ComponentFixture<CheckoutPaymentComponent>
+): HTMLButtonElement {
+  const buttons = Array.from(
+    fixture.nativeElement.querySelectorAll('button')
+  ) as HTMLButtonElement[];
+  return buttons.find(b => (b.textContent || '').includes('Submit Order'));
+}
+
+describe('CheckoutPaymentComponent (out-of-stock submit gating — C-3)', () => {
   let component: CheckoutPaymentComponent;
   let fixture: ComponentFixture<CheckoutPaymentComponent>;
-  let originalStripe: any;
+  let checkoutServiceSpy: { createOrder: jasmine.Spy };
+  let basketServiceStub: any;
+  let toastrStub: { error: jasmine.Spy };
 
   beforeEach(async () => {
-    // Provide a global Stripe stub so the real template's ngAfterViewInit (which mounts Stripe card
-    // elements) runs without a network/SDK dependency.
-    originalStripe = (window as any).Stripe;
-    (window as any).Stripe = () => ({
-      elements: () => ({
-        create: () => ({ mount: () => { }, addEventListener: () => { }, destroy: () => { } })
-      })
-    });
+    installStripeStub();
+
+    checkoutServiceSpy = {
+      createOrder: jasmine.createSpy('createOrder').and.returnValue(of({ id: 1 }))
+    };
+    basketServiceStub = {
+      getCurrentBasketValue: () => ({
+        id: 'basket-1',
+        clientSecret: 'cs_test',
+        deliveryMethodId: 1
+      }),
+      deleteLocalBasket: jasmine.createSpy('deleteLocalBasket')
+    };
+    toastrStub = { error: jasmine.createSpy('error') };
 
     await TestBed.configureTestingModule({
       declarations: [CheckoutPaymentComponent, StubTextInputComponent],
-      imports: [ReactiveFormsModule, RouterTestingModule],
+      imports: [CommonModule, ReactiveFormsModule, RouterTestingModule],
       providers: [
-        { provide: BasketService, useValue: jasmine.createSpyObj('BasketService', ['getCurrentBasketValue']) },
-        { provide: CheckoutService, useValue: jasmine.createSpyObj('CheckoutService', ['createOrder']) },
-        { provide: ToastrService, useValue: jasmine.createSpyObj('ToastrService', ['error']) }
+        { provide: BasketService, useValue: basketServiceStub },
+        { provide: CheckoutService, useValue: checkoutServiceSpy },
+        { provide: ToastrService, useValue: toastrStub }
       ]
     }).compileComponents();
 
     fixture = TestBed.createComponent(CheckoutPaymentComponent);
     component = fixture.componentInstance;
-    component.checkoutForm = buildValidCheckoutForm();
-    // Satisfy every OTHER disabled condition so stockBlocked is the sole remaining driver.
-    component.loading = false;
+
+    // A checkout form whose paymentForm is valid so the Submit button's [disabled] expression depends
+    // only on the out-of-stock gate once the card fields are marked valid below.
+    component.checkoutForm = new FormGroup({
+      addressForm: new FormGroup({ firstName: new FormControl('Bob') }),
+      deliveryForm: new FormGroup({ deliveryMethod: new FormControl('1') }),
+      paymentForm: new FormGroup({
+        nameOnCard: new FormControl('Bob Tester', Validators.required)
+      })
+    });
+
+    fixture.detectChanges(); // triggers ngAfterViewInit (Stripe stub) + first render
+
+    // Mark the Stripe card fields valid and not loading so they do not independently disable submit;
+    // the only remaining term controlling the button is the out-of-stock gate (disableForStock).
     component.cardNumberValid = true;
     component.cardExpiryValid = true;
     component.cardCvcValid = true;
+    component.loading = false;
   });
 
-  afterEach(() => {
-    (window as any).Stripe = originalStripe;
-  });
-
-  function submitButton(): HTMLButtonElement {
-    // The Submit Order button is the one wired to (click)="submitOrder()"; select it by its label text.
-    const buttons = Array.from(fixture.nativeElement.querySelectorAll('button')) as HTMLButtonElement[];
-    return buttons.find(b => b.textContent && b.textContent.includes('Submit Order'));
-  }
-
-  it('enables the Submit button when stockBlocked is false and the form/card state is valid', () => {
-    component.stockBlocked = false;
+  it('enables the Submit Order button when not gated and the card fields are valid', () => {
+    component.disableForStock = false;
     fixture.detectChanges();
-    expect(submitButton().disabled).toBeFalse();
+
+    const btn = submitButton(fixture);
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBeFalse();
   });
 
-  it('disables the Submit button when stockBlocked is true (all else valid)', () => {
-    component.stockBlocked = true;
+  it('disables the Submit Order button when disableForStock is true (out-of-stock gate)', () => {
+    component.disableForStock = true;
     fixture.detectChanges();
-    expect(submitButton().disabled).toBeTrue();
+
+    const btn = submitButton(fixture);
+    expect(btn).toBeTruthy();
+    expect(btn.disabled).toBeTrue();
+  });
+
+  it('submitOrder() short-circuits (creates no order, never sets loading) when gated', async () => {
+    component.disableForStock = true;
+
+    await component.submitOrder();
+
+    expect(checkoutServiceSpy.createOrder).not.toHaveBeenCalled();
+    // The guard returns before `this.loading = true`, so the spinner is never shown.
+    expect(component.loading).toBeFalse();
+  });
+
+  it('submitOrder() proceeds to create the order when NOT gated', async () => {
+    component.disableForStock = false;
+
+    await component.submitOrder();
+
+    expect(checkoutServiceSpy.createOrder).toHaveBeenCalledTimes(1);
   });
 });
+
+
+/**
+ * Focused unit tests for the stock submission gate added to CheckoutPaymentComponent
+ * (QA H-B/F3): order submission must be blocked when the parent CheckoutComponent
+ * reports that stock cannot be honoured (out of stock / insufficient / hub not
+ * connected) via the `disableForStock` @Input.
+ *
+ * The component is constructed directly with mocked collaborators rather than through
+ * TestBed so the Stripe-dependent `ngAfterViewInit` / `ngOnDestroy` lifecycle hooks
+ * (which require the external Stripe.js library) never run. This keeps the suite
+ * hermetic and asserts exactly the new gating behaviour in `submitOrder()`.
+ */
+describe('CheckoutPaymentComponent (stock submission gate — H-B/F3)', () => {
+  let component: CheckoutPaymentComponent;
+  let basketService: any;
+  let checkoutService: any;
+  let toastr: any;
+  let router: any;
+
+  beforeEach(() => {
+    basketService = {
+      getCurrentBasketValue: jasmine.createSpy('getCurrentBasketValue')
+        .and.returnValue({ id: 'basket-1', clientSecret: 'cs_123', deliveryMethodId: 1 }),
+      deleteLocalBasket: jasmine.createSpy('deleteLocalBasket')
+    };
+    checkoutService = {
+      createOrder: jasmine.createSpy('createOrder')
+        .and.returnValue({ toPromise: () => Promise.resolve({ id: 999 }) })
+    };
+    toastr = { error: jasmine.createSpy('error') };
+    router = { navigate: jasmine.createSpy('navigate') };
+
+    component = new CheckoutPaymentComponent(basketService, checkoutService, toastr, router);
+
+    const fb = new FormBuilder();
+    component.checkoutForm = fb.group({
+      addressForm: fb.group({
+        firstName: ['a'], lastName: ['b'], street: ['s'], city: ['c'], state: ['st'], zipCode: ['z']
+      }),
+      deliveryForm: fb.group({ deliveryMethod: ['1'] }),
+      paymentForm: fb.group({ nameOnCard: ['John Doe'] })
+    });
+  });
+
+  it('blocks order submission when disableForStock is true (no order, no payment, no navigation)', async () => {
+    component.disableForStock = true;
+
+    await component.submitOrder();
+
+    expect(checkoutService.createOrder).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(basketService.deleteLocalBasket).not.toHaveBeenCalled();
+    expect(toastr.error).toHaveBeenCalled();
+    // The gate returns BEFORE the loading spinner is engaged.
+    expect(component.loading).toBeFalse();
+  });
+
+  it('allows order submission when disableForStock is false (creates order, confirms payment, navigates)', async () => {
+    component.disableForStock = false;
+    // Minimal Stripe stub so the confirm-payment step resolves successfully without
+    // the real Stripe.js library (never loaded in the test environment).
+    component.cardNumber = {};
+    component.stripe = {
+      confirmCardPayment: jasmine.createSpy('confirmCardPayment')
+        .and.returnValue(Promise.resolve({ paymentIntent: { id: 'pi_1' } }))
+    };
+
+    await component.submitOrder();
+
+    expect(checkoutService.createOrder).toHaveBeenCalled();
+    expect(component.stripe.confirmCardPayment).toHaveBeenCalled();
+    expect(basketService.deleteLocalBasket).toHaveBeenCalledWith('basket-1');
+    expect(router.navigate).toHaveBeenCalledWith(['checkout/success'], jasmine.any(Object));
+    expect(component.loading).toBeFalse();
+  });
+});
+

@@ -39,19 +39,34 @@
         </td>
         <td class="align-middle">
           <div class="d-flex align-items center" [class.justify-content-center]="!isBasket">
-            <i *ngIf="isBasket" (click)="decrementItemQuantity(item)" class="fa fa-minus-circle text-warning mr-2"
-               style="cursor: pointer; font-size: 2em"></i>
+            <!-- QA F7: real <button>s (keyboard-operable + accessible name) replace
+                 the mouse-only, tabindex-excluded <i> icons. The icon is decorative
+                 (aria-hidden); the button carries the accessible name. -->
+            <button *ngIf="isBasket" type="button" (click)="decrementItemQuantity(item)"
+                    class="btn btn-link p-0 border-0 text-warning mr-2 quantity-control"
+                    aria-label="Decrease quantity">
+              <i class="fa fa-minus-circle" style="font-size: 2em" aria-hidden="true"></i>
+            </button>
             <span class="font-weight-bold" style="font-size: 1.5em;">{{item.quantity}}</span>
-            <i *ngIf="isBasket" (click)="incrementItemQuantity(item)" class="fa fa-plus-circle text-warning mx-2"
-               style="cursor: pointer; font-size: 2em"></i>
+            <button *ngIf="isBasket" type="button" (click)="incrementItemQuantity(item)"
+                    class="btn btn-link p-0 border-0 text-warning mx-2 quantity-control"
+                    aria-label="Increase quantity">
+              <i class="fa fa-plus-circle" style="font-size: 2em" aria-hidden="true"></i>
+            </button>
           </div>
         </td>
         <td class="align-middle"><strong>{{item.price * item.quantity | currency}}</strong>
         </td>
         <td class="align-middle text-center">
-          <a *ngIf="isBasket" class="text-danger">
-            <i (click)="removeBasketItem(item)" class="fa fa-trash" style="font-size: 2em; cursor: pointer;"></i>
-          </a>
+          <!-- QA F7: the remove control is the documented gate-recovery path, so it
+               MUST be keyboard-operable. A real <button> with a descriptive
+               accessible name replaces the mouse-only <i> inside a non-actionable
+               <a>. -->
+          <button *ngIf="isBasket" type="button" (click)="removeBasketItem(item)"
+                  class="btn btn-link p-0 border-0 text-danger quantity-control"
+                  [attr.aria-label]="'Remove ' + item.productName + ' from basket'">
+            <i class="fa fa-trash" style="font-size: 2em" aria-hidden="true"></i>
+          </button>
         </td>
       </tr>
       </tbody>

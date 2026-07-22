@@ -4,6 +4,7 @@ import { RouterTestingModule } from '@angular/router/testing';
 import { ActivatedRoute, convertToParamMap, ParamMap } from '@angular/router';
 import { BreadcrumbService } from 'xng-breadcrumb';
 import { of, BehaviorSubject } from 'rxjs';
+import { HubConnectionState } from '@microsoft/signalr';
 
 import { ProductDetailsComponent } from './product-details.component';
 import { StockService } from '../../core/services/stock.service';
@@ -13,7 +14,16 @@ import { BasketService } from '../../basket/basket.service';
 describe('ProductDetailsComponent', () => {
   let component: ProductDetailsComponent;
   let fixture: ComponentFixture<ProductDetailsComponent>;
-  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy; unsubscribeFromProduct: jasmine.Spy };
+  let stockServiceStub: {
+    subscribeToProduct: jasmine.Spy;
+    getStock$: jasmine.Spy;
+    unsubscribeFromProduct: jasmine.Spy;
+    connectionState$: any;
+    lowStockThreshold$: any;
+    lowStockThreshold: number;
+  };
+  let connectionState$: BehaviorSubject<HubConnectionState>;
+  let lowStockThreshold$: BehaviorSubject<number>;
   let shopServiceStub: { getProduct: jasmine.Spy };
   let bcServiceStub: { set: jasmine.Spy };
   let basketServiceStub: { addItemToBasket: jasmine.Spy };
@@ -25,12 +35,17 @@ describe('ProductDetailsComponent', () => {
 
   beforeEach(async () => {
     // Stubs via useValue so the real HttpClient / SignalR / Router deps are never constructed.
+    connectionState$ = new BehaviorSubject<HubConnectionState>(HubConnectionState.Connected);
+    lowStockThreshold$ = new BehaviorSubject<number>(5);
     stockServiceStub = {
       subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
       getStock$: jasmine.createSpy('getStock$').and.returnValue(of(3)),
       // The component releases the previous product's hub subscription when the
       // route rebinds to a different product or on destroy (QA R2).
-      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct')
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct'),
+      connectionState$: connectionState$.asObservable(),
+      lowStockThreshold$: lowStockThreshold$.asObservable(),
+      lowStockThreshold: 5
     };
     shopServiceStub = {
       // Return a product whose id matches the requested id so route-rebind tests can
@@ -100,12 +115,16 @@ describe('ProductDetailsComponent', () => {
   // Boundary matrix (QA Issue #3 coverage gap).
   // ---------------------------------------------------------------------------
 
-  it('renders NO badge and does NOT disable Add to Cart while stock is unknown (undefined)', () => {
+  // QA F4 (MAJOR): unknown stock is fail-CLOSED. Previously this asserted the button
+  // stayed ENABLED with no badge (the defect); per D1 it is updated to fail-closed.
+  it('fails closed while stock is unknown (undefined): disables Add to Cart and shows "Checking availability" (QA F4)', () => {
     stockServiceStub.getStock$.and.returnValue(of(undefined));
     fixture.detectChanges();
-    expect(fixture.nativeElement.querySelector('.badge')).toBeNull();
+    expect(fixture.nativeElement.querySelector('.badge-warning')).toBeNull();
+    expect(fixture.nativeElement.querySelector('.badge-danger')).toBeNull();
+    expect(fixture.nativeElement.textContent).toContain('Checking availability');
     const addButton = fixture.nativeElement.querySelector('.btn-outline-primary');
-    expect(addButton.disabled).toBe(false);
+    expect(addButton.disabled).toBe(true);
   });
 
   it('renders "Only 1 left!" at the lower low-stock boundary (stock 1)', () => {
@@ -210,5 +229,103 @@ describe('ProductDetailsComponent', () => {
     expect(stockServiceStub.subscribeToProduct).toHaveBeenCalledWith(2);
     // The previous product's per-product hub subscription is released.
     expect(stockServiceStub.unsubscribeFromProduct).toHaveBeenCalledWith(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F12/F4 (MAJOR): connection-state awareness + fail-closed gating.
+  // ---------------------------------------------------------------------------
+
+  it('fails closed when the hub link is not Connected: disables Add to Cart and shows "Live stock unavailable" (QA F12/F4)', () => {
+    connectionState$.next(HubConnectionState.Disconnected);
+    stockServiceStub.getStock$.and.returnValue(of(3));
+    fixture.detectChanges();
+    expect(fixture.nativeElement.textContent).toContain('Live stock unavailable');
+    expect(fixture.nativeElement.querySelector('.badge-warning')).toBeNull();
+    const addButton = fixture.nativeElement.querySelector('.btn-outline-primary');
+    expect(addButton.disabled).toBe(true);
+  });
+
+  it('addItemToBasket is a no-op while the hub link is not Connected (QA F4)', () => {
+    connectionState$.next(HubConnectionState.Disconnected);
+    stockServiceStub.getStock$.and.returnValue(of(3));
+    fixture.detectChanges();
+    component.addItemToBasket();
+    expect(basketServiceStub.addItemToBasket).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F6 (MINOR): threshold follows the server-broadcast value, not hardcoded 5.
+  // ---------------------------------------------------------------------------
+
+  it('uses the server-provided low-stock threshold rather than a hardcoded 5 (QA F6)', () => {
+    const stock$ = new BehaviorSubject<number>(3);
+    stockServiceStub.getStock$.and.returnValue(stock$.asObservable());
+    lowStockThreshold$.next(2);
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('.badge-warning')).toBeNull(); // 3 > 2
+
+    stock$.next(2);
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('.badge-warning').textContent).toContain('Only 2 left!');
+  });
+
+  // QA Issue #4 (w-010 coverage): the badge boundary is the SERVER-pushed threshold, not a
+  // hard-coded literal. Above the default the badge shows at a HIGHER stock; below the default
+  // it hides at a stock the old literal 5 would have shown.
+  it('shows the low-stock badge using a server-driven threshold ABOVE the default (threshold 8, stock 7)', () => {
+    lowStockThreshold$.next(8);
+    stockServiceStub.getStock$.and.returnValue(of(7));
+    fixture.detectChanges();
+    const badge = fixture.nativeElement.querySelector('.badge-warning');
+    expect(badge).toBeTruthy();
+    expect(badge.textContent).toContain('Only 7 left!');
+  });
+
+  it('hides the low-stock badge when stock exceeds a server-driven threshold BELOW the default (threshold 3, stock 4)', () => {
+    lowStockThreshold$.next(3);
+    stockServiceStub.getStock$.and.returnValue(of(4));
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('.badge')).toBeNull();
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA INF-2 (INFO): a live stock drop below the selected quantity clamps the
+  // displayed quantity down (never below the available stock, never while unknown).
+  // ---------------------------------------------------------------------------
+
+  it('clamps the displayed quantity down when live stock drops below it (QA INF-2)', () => {
+    const stock$ = new BehaviorSubject<number>(5);
+    stockServiceStub.getStock$.and.returnValue(stock$.asObservable());
+    fixture.detectChanges();      // stock 5, quantity resets to 1
+    component.quantity = 4;       // shopper selects 4 (<= 5, allowed)
+    stock$.next(2);               // live stock drops to 2
+    fixture.detectChanges();
+    expect(component.quantity).toBe(2); // clamped down to available stock
+
+    stock$.next(0);               // out of stock
+    fixture.detectChanges();
+    expect(component.quantity).toBe(2); // clamp never drives quantity below the last value
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F7 (MINOR): keyboard-operable quantity steppers with accessible names.
+  // ---------------------------------------------------------------------------
+
+  it('renders the quantity steppers as real buttons with accessible names (QA F7)', () => {
+    fixture.detectChanges();
+    const buttons: HTMLButtonElement[] = Array.from(fixture.nativeElement.querySelectorAll('button.quantity-control'));
+    expect(buttons.length).toBe(2);
+    const labels = buttons.map(b => b.getAttribute('aria-label'));
+    expect(labels).toContain('Decrease quantity');
+    expect(labels).toContain('Increase quantity');
+  });
+
+  it('increments quantity when the increase stepper button is activated (QA F7)', () => {
+    stockServiceStub.getStock$.and.returnValue(of(5));
+    fixture.detectChanges();
+    const increase: HTMLButtonElement =
+      fixture.nativeElement.querySelector('button.quantity-control[aria-label="Increase quantity"]');
+    increase.click(); // a native <button> is activated by Enter/Space AND click
+    expect(component.quantity).toBe(2);
   });
 });

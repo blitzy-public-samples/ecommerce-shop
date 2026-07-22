@@ -60,18 +60,51 @@ namespace API.Controllers
                 .Distinct()
                 .ToList() ?? new List<int>();
 
+            // Also capture the quantity the PRIOR persisted basket claimed per product. If this update has
+            // to be rejected (a line is unreservable), we use these to restore the holds this call granted
+            // back to exactly the prior basket's claim (F6-D1 compensation below). Duplicate prior lines are
+            // summed defensively so the prior claim is the true per-product total.
+            var priorQuantities = (priorBasket?.Items ?? new List<BasketItem>())
+                .GroupBy(i => i.Id)
+                .ToDictionary(g => g.Key, g => g.Sum(x => x.Quantity));
+
             // Reserve-BEFORE-persist: attempt to hold the requested total for every line first. Each call takes
             // a PostgreSQL row lock on the product and returns whether the full requested quantity was granted.
             // We never persist a basket that claims stock we could not safely reserve (F2).
             var unreservable = new List<int>();
+            var grantedProductIds = new List<int>();
             foreach (var item in aggregatedItems)
             {
                 var granted = await _inventoryService.ExtendReservationAsync(customerBasket.Id, item.Id, item.Quantity);
-                if (!granted) unreservable.Add(item.Id);
+                if (granted) grantedProductIds.Add(item.Id);
+                else unreservable.Add(item.Id);
             }
 
             if (unreservable.Count > 0)
             {
+                // F6-D1: each ExtendReservationAsync above is self-committing (it opens and commits its own
+                // transaction), so a partial failure — earlier lines granted, a later line short — would
+                // otherwise leave the granted lines as ORPHANED Active holds (with their Redis counters
+                // decremented) while this update is rejected and the basket is NOT persisted. That silently
+                // violates the basket<->reservation consistency invariant and can transiently make otherwise
+                // available stock unpurchasable for other shoppers. To keep the reserve step atomic at the
+                // basket level, compensate by restoring every hold this call granted back to exactly what the
+                // PRIOR persisted basket claimed (which remains the persisted state, since we reject below):
+                //   - product present in the prior basket  -> shrink/grow the hold back to that prior total;
+                //   - product absent from the prior basket -> release the freshly-created hold entirely.
+                // All compensation flows through IInventoryService, the sole permitted stock writer.
+                foreach (var productId in grantedProductIds)
+                {
+                    if (priorQuantities.TryGetValue(productId, out var priorQuantity) && priorQuantity > 0)
+                    {
+                        await _inventoryService.ExtendReservationAsync(customerBasket.Id, productId, priorQuantity);
+                    }
+                    else
+                    {
+                        await _inventoryService.ReleaseReservationAsync(customerBasket.Id, productId);
+                    }
+                }
+
                 // At least one line could not be fully reserved: reject the whole update (treat the basket
                 // atomically) and leave the previously-persisted basket untouched. The client learns exactly
                 // which product(s) are short so it can adjust quantities.

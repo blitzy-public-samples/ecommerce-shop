@@ -31,6 +31,23 @@ export class ErrorInterceptor implements HttpInterceptor {
           if (error.status === 401) {
             this.toastr.error(error.error.message,error.error.statusCode);
           }
+          // Real-Time Inventory & Flash-Sale System: the basket reserve path
+          // (BasketController.UpdateBasket -> IInventoryService) returns HTTP 409 Conflict
+          // when the requested quantity exceeds available stock. Surface the server's
+          // ApiResponse envelope message to the shopper via a toast (with a safe fallback
+          // when the response body is absent or shaped unexpectedly) instead of silently
+          // swallowing it. The error is still re-thrown below so BasketService.setBasket()'s
+          // error handler can revert the optimistic (by-reference) quantity mutation to
+          // server truth, preventing a phantom basket quantity.
+          if (error.status === 409) {
+            const conflictMessage = (error.error && error.error.message)
+              ? error.error.message
+              : 'Insufficient stock - your basket was not updated.';
+            const conflictTitle = (error.error && error.error.statusCode)
+              ? error.error.statusCode
+              : error.status;
+            this.toastr.error(conflictMessage, conflictTitle);
+          }
           if (error.status === 404) {
             this.router.navigateByUrl('/not-found');
           }

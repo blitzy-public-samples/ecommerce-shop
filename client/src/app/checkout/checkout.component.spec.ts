@@ -5,6 +5,7 @@ import { CommonModule } from '@angular/common';
 import { ReactiveFormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 import { of, BehaviorSubject, Observable, Subject } from 'rxjs';
+import { HubConnectionState } from '@microsoft/signalr';
 
 import { CheckoutComponent } from './checkout.component';
 import { AccountService } from '../account/account.service';
@@ -53,10 +54,8 @@ class StubCheckoutReviewComponent {
 @Component({ selector: 'app-checkout-payment', template: '' })
 class StubCheckoutPaymentComponent {
   @Input() checkoutForm: any;
-  // The checkout shell binds [stockBlocked]="hasOutOfStockItem" on <app-checkout-payment> so the payment
-  // step disables its Submit button when a basket line goes to zero. The stub must declare the input or the
-  // real template would fail to compile (no error-suppressing schema is used by this suite).
-  @Input() stockBlocked: boolean;
+  // The shell now binds the fail-closed stock gate into the payment step (H-B/F3).
+  @Input() disableForStock: any;
 }
 
 @Component({ selector: 'app-order-totals', template: '' })
@@ -78,8 +77,9 @@ describe('CheckoutComponent (template gating)', () => {
   let basketServiceStub: any;
   let stockServiceStub: {
     subscribeToProduct: jasmine.Spy;
-    getStock$: jasmine.Spy;
     unsubscribeFromProduct: jasmine.Spy;
+    getStock$: jasmine.Spy;
+    connectionState$: BehaviorSubject<HubConnectionState>;
   };
 
   beforeEach(async () => {
@@ -105,10 +105,11 @@ describe('CheckoutComponent (template gating)', () => {
     };
     stockServiceStub = {
       subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct'),
       getStock$: jasmine.createSpy('getStock$').and.returnValue(of(5)),
-      // ngOnDestroy releases tracked hub ids on teardown (P4-12); the auto-destroy
-      // between specs invokes it, so the stub must expose it.
-      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct')
+      // Seed the connection as Connected so the fail-closed gate (F12) is open and
+      // the existing positive-stock assertions hold.
+      connectionState$: new BehaviorSubject<HubConnectionState>(HubConnectionState.Connected)
     };
 
     await TestBed.configureTestingModule({
@@ -170,14 +171,14 @@ describe('CheckoutComponent (template gating)', () => {
     expect(component.hasOutOfStockItem).toBeTrue();
   });
 
-  it('should propagate the gate to the payment step via [stockBlocked] (P4-07)', () => {
+  it('should propagate the gate to the payment step via [disableForStock] (P4-07)', () => {
     // With positive stock the payment step must NOT be blocked.
     stockServiceStub.getStock$.and.returnValue(of(5));
     fixture.detectChanges();
     const payment = fixture.debugElement
       .query(By.directive(StubCheckoutPaymentComponent)).componentInstance as StubCheckoutPaymentComponent;
     expect(component.hasOutOfStockItem).toBeFalse();
-    expect(payment.stockBlocked).toBeFalse();
+    expect(payment.disableForStock).toBeFalse();
   });
 
   it('should block the payment step submit when a tracked product is at zero (P4-07)', () => {
@@ -189,7 +190,7 @@ describe('CheckoutComponent (template gating)', () => {
     const payment = fixture.debugElement
       .query(By.directive(StubCheckoutPaymentComponent)).componentInstance as StubCheckoutPaymentComponent;
     expect(component.hasOutOfStockItem).toBeTrue();
-    expect(payment.stockBlocked).toBeTrue();
+    expect(payment.disableForStock).toBeTrue();
   });
 });
 
@@ -221,6 +222,9 @@ describe('CheckoutComponent (stock tracking logic)', () => {
     // Mirror the real StockService surface: the component releases a product's hub
     // tracking when it leaves the basket (QA R1 / prune-on-removal).
     unsubscribeFromProduct = jasmine.createSpy('unsubscribeFromProduct');
+    // Live hub connection state; seeded Connected so the fail-closed gate (F12) is
+    // open by default. Tests flip this to assert the disconnected behaviour.
+    connectionState$ = new BehaviorSubject<HubConnectionState>(HubConnectionState.Connected);
     private subjects = new Map<number, Subject<number>>();
 
     getStock$(productId: number): Observable<number> {
@@ -407,6 +411,75 @@ describe('CheckoutComponent (stock tracking logic)', () => {
 
     // Leaving checkout with items still in the basket must release BOTH products'
     // per-product hub tracking so the server groups are left (P4-12).
+    expect(stockService.unsubscribeFromProduct).toHaveBeenCalledWith(1);
+    expect(stockService.unsubscribeFromProduct).toHaveBeenCalledWith(2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F9 (MINOR→MAJOR) — insufficient stock: available > 0 but < requested qty.
+  // The submit gate must close, distinctly from the zero (out-of-stock) case.
+  // ---------------------------------------------------------------------------
+  it('F9: flags insufficient stock (and closes the submit gate) when available < requested quantity', () => {
+    fixture.detectChanges();
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1, quantity: 2 }] });
+
+    stockService.push(1, 1); // 1 available, 2 requested
+    expect(component.hasInsufficientStockItem).toBeTrue();
+    expect(component.hasOutOfStockItem).toBeFalse();
+    expect(component.submitDisabledForStock).toBeTrue();
+  });
+
+  it('F9: does NOT flag insufficient when available equals the requested quantity', () => {
+    fixture.detectChanges();
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1, quantity: 2 }] });
+
+    stockService.push(1, 2); // exactly enough
+    expect(component.hasInsufficientStockItem).toBeFalse();
+    expect(component.hasOutOfStockItem).toBeFalse();
+    expect(component.submitDisabledForStock).toBeFalse();
+  });
+
+  it('F9: insufficient flag clears when the requested quantity is reduced to what is available', () => {
+    fixture.detectChanges();
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1, quantity: 3 }] });
+    stockService.push(1, 2);
+    expect(component.hasInsufficientStockItem).toBeTrue();
+
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1, quantity: 2 }] });
+    expect(component.hasInsufficientStockItem).toBeFalse();
+    expect(component.submitDisabledForStock).toBeFalse();
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F12 (MAJOR) — fail-closed on lost hub connection, even with healthy stock.
+  // ---------------------------------------------------------------------------
+  it('F12: the submit gate is fail-closed while the hub is not connected, and reopens on reconnect', () => {
+    fixture.detectChanges();
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1, quantity: 1 }] });
+    stockService.push(1, 5); // healthy stock
+    expect(component.stockConnected).toBeTrue();
+    expect(component.submitDisabledForStock).toBeFalse();
+
+    // Connection drops -> gate closes despite healthy stock.
+    stockService.connectionState$.next(HubConnectionState.Reconnecting);
+    expect(component.stockConnected).toBeFalse();
+    expect(component.submitDisabledForStock).toBeTrue();
+
+    // Reconnect -> gate reopens.
+    stockService.connectionState$.next(HubConnectionState.Connected);
+    expect(component.stockConnected).toBeTrue();
+    expect(component.submitDisabledForStock).toBeFalse();
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F5 (MAJOR) — release every tracked product on destroy (no ref-count leak).
+  // ---------------------------------------------------------------------------
+  it('F5: releases every still-tracked product hub subscription on destroy', () => {
+    fixture.detectChanges();
+    basketService.basket$.next({ id: 'basket-1', items: [{ id: 1, quantity: 1 }, { id: 2, quantity: 1 }] });
+
+    component.ngOnDestroy();
+
     expect(stockService.unsubscribeFromProduct).toHaveBeenCalledWith(1);
     expect(stockService.unsubscribeFromProduct).toHaveBeenCalledWith(2);
   });

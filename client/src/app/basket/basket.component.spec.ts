@@ -3,6 +3,8 @@ import { Component, EventEmitter, Input, Output, NO_ERRORS_SCHEMA } from '@angul
 import { CommonModule } from '@angular/common';
 import { RouterTestingModule } from '@angular/router/testing';
 import { of, BehaviorSubject, Observable, ReplaySubject } from 'rxjs';
+import { HubConnectionState } from '@microsoft/signalr';
+import { Router } from '@angular/router';
 
 import { BasketComponent } from './basket.component';
 import { BasketService } from './basket.service';
@@ -44,7 +46,7 @@ describe('BasketComponent (template gating)', () => {
   let component: BasketComponent;
   let fixture: ComponentFixture<BasketComponent>;
   let basketServiceStub: { basket$: any; basketTotal$: any };
-  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy; unsubscribeFromProduct: jasmine.Spy };
+  let stockServiceStub: { subscribeToProduct: jasmine.Spy; getStock$: jasmine.Spy; unsubscribeFromProduct: jasmine.Spy; connectionState$: any };
 
   // A basket item's id IS the product id, so stock is tracked on item.id. Two items
   // (ids 1 and 2) make the per-item subscribe assertions and the "ANY item at zero"
@@ -76,7 +78,11 @@ describe('BasketComponent (template gating)', () => {
       getStock$: jasmine.createSpy('getStock$').and.returnValue(of(5)),
       // Mirror the real StockService surface: the component releases a product's
       // hub subscription when it leaves the basket (QA R1 / prune-on-removal).
-      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct')
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct'),
+      // QA F12: the component subscribes to the live connection state to fail
+      // closed while the hub is not Connected. Default Connected so the gating
+      // tests below isolate the stock conditions.
+      connectionState$: new BehaviorSubject<HubConnectionState>(HubConnectionState.Connected)
     };
 
     await TestBed.configureTestingModule({
@@ -125,11 +131,13 @@ describe('BasketComponent (template gating)', () => {
     expect(component.hasOutOfStockItem).toBe(true);
     // The out-of-stock alert is rendered by the real template's *ngIf.
     expect(fixture.nativeElement.querySelector('.alert.alert-danger')).toBeTruthy();
-    // The proceed-to-checkout anchor is gated with the Bootstrap disabled class.
-    const proceed = fixture.nativeElement.querySelector('a.btn-outline-primary');
-    expect(proceed.classList.contains('disabled')).toBe(true);
-    // ...and exposes the accessible disabled state for assistive technology.
-    expect(proceed.getAttribute('aria-disabled')).toBe('true');
+    // QA H-C: the proceed control is now a real <button> that is truly disabled —
+    // inert to mouse, touch AND keyboard, unlike the previous aria-disabled anchor.
+    const proceed = fixture.nativeElement.querySelector('button.btn-outline-primary');
+    expect(proceed).toBeTruthy();
+    expect(proceed.disabled).toBe(true);
+    // There is no keyboard-activatable anchor left to bypass the gate.
+    expect(fixture.nativeElement.querySelector('a.btn-outline-primary')).toBeNull();
   });
 
   it('does not gate checkout and hides the alert when all items are in stock', () => {
@@ -140,8 +148,42 @@ describe('BasketComponent (template gating)', () => {
 
     expect(component.hasOutOfStockItem).toBe(false);
     expect(fixture.nativeElement.querySelector('.alert.alert-danger')).toBeNull();
-    const proceed = fixture.nativeElement.querySelector('a.btn-outline-primary');
-    expect(proceed.classList.contains('disabled')).toBe(false);
+    const proceed = fixture.nativeElement.querySelector('button.btn-outline-primary');
+    expect(proceed.disabled).toBe(false);
+  });
+
+  it('QA F9: gates and renders the insufficient-stock alert when a line has fewer units than requested', () => {
+    // mockBasket item 2 has quantity 2; drive its live stock to 1 (positive but
+    // below the requested quantity). Item 1 stays fully in stock.
+    stockServiceStub.getStock$.and.callFake((id: number) => of(id === 2 ? 1 : 5));
+
+    fixture.detectChanges();
+
+    expect(component.hasOutOfStockItem).toBe(false);
+    expect(component.hasInsufficientStockItem).toBe(true);
+    // The distinct insufficient-stock alert renders (there is no zero-stock item).
+    const alert = fixture.nativeElement.querySelector('.alert.alert-danger');
+    expect(alert).toBeTruthy();
+    expect(alert.textContent).toContain('fewer units available');
+    const proceed = fixture.nativeElement.querySelector('button.btn-outline-primary');
+    expect(proceed.disabled).toBe(true);
+  });
+
+  it('QA F12: announces unavailability and fail-closes proceed while the hub is not Connected', () => {
+    // All stock is sufficient, but the hub is disconnected.
+    stockServiceStub.getStock$.and.returnValue(of(5));
+    stockServiceStub.connectionState$.next(HubConnectionState.Disconnected);
+
+    fixture.detectChanges();
+
+    expect(component.stockConnected).toBe(false);
+    // The non-blocking "live stock unavailable" advisory renders.
+    const warn = fixture.nativeElement.querySelector('.alert.alert-warning');
+    expect(warn).toBeTruthy();
+    expect(warn.textContent).toContain('Live stock is currently unavailable');
+    // Proceed is fail-closed even though stock is sufficient.
+    const proceed = fixture.nativeElement.querySelector('button.btn-outline-primary');
+    expect(proceed.disabled).toBe(true);
   });
 });
 
@@ -176,15 +218,18 @@ describe('BasketComponent (stock tracking logic)', () => {
     subscribeToProduct: jasmine.Spy;
     getStock$: jasmine.Spy;
     unsubscribeFromProduct: jasmine.Spy;
+    connectionState$: BehaviorSubject<HubConnectionState>;
   };
+  let connectionStateSubject: BehaviorSubject<HubConnectionState>;
 
   // Arrange helper: build a basket item matching the IBasketItem contract. A
-  // basket item's id IS the product id, which is what stock is keyed on.
-  const makeItem = (id: number): IBasketItem => ({
+  // basket item's id IS the product id, which is what stock is keyed on. The
+  // optional quantity drives the QA F9 insufficient-stock check.
+  const makeItem = (id: number, quantity = 1): IBasketItem => ({
     id,
     productName: 'Product ' + id,
     price: 10,
-    quantity: 1,
+    quantity,
     pictureUrl: 'img/' + id + '.png',
     brand: 'BrandName',
     type: 'TypeName'
@@ -217,6 +262,7 @@ describe('BasketComponent (stock tracking logic)', () => {
       decrementItemQuantity: jasmine.createSpy('decrementItemQuantity')
     };
 
+    connectionStateSubject = new BehaviorSubject<HubConnectionState>(HubConnectionState.Connected);
     stockServiceMock = {
       subscribeToProduct: jasmine.createSpy('subscribeToProduct'),
       getStock$: jasmine
@@ -224,7 +270,10 @@ describe('BasketComponent (stock tracking logic)', () => {
         .and.callFake((id: number) => stockStream(id).asObservable()),
       // The component calls this when a product leaves the basket so the service
       // can release its per-product hub tracking (QA R1 / prune-on-removal).
-      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct')
+      unsubscribeFromProduct: jasmine.createSpy('unsubscribeFromProduct'),
+      // QA F12: live connection state. Default Connected so stock-condition tests
+      // are isolated; F12 tests drive it to Disconnected.
+      connectionState$: connectionStateSubject
     };
 
     await TestBed.configureTestingModule({
@@ -360,6 +409,108 @@ describe('BasketComponent (stock tracking logic)', () => {
     // ...and a new basket must NOT begin tracking (basket sub torn down).
     basketSubject.next(makeBasket([makeItem(2)]));
     expect(stockServiceMock.subscribeToProduct).not.toHaveBeenCalledWith(2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F9 (MINOR–MAJOR) — insufficient stock (positive but below the requested
+  // quantity) must also gate/warn, not just an exact zero.
+  // ---------------------------------------------------------------------------
+
+  it('F9: gates when a tracked product stock is positive but below the requested quantity', () => {
+    basketSubject.next(makeBasket([makeItem(1, 2)])); // quantity 2
+
+    stockStream(1).next(1); // only 1 available for a requested 2
+    expect(component.hasOutOfStockItem).toBe(false);
+    expect(component.hasInsufficientStockItem).toBe(true);
+    expect(component.proceedDisabled).toBe(true);
+  });
+
+  it('F9: does not gate when known stock equals the requested quantity', () => {
+    basketSubject.next(makeBasket([makeItem(1, 2)]));
+
+    stockStream(1).next(2); // exactly enough
+    expect(component.hasInsufficientStockItem).toBe(false);
+    expect(component.proceedDisabled).toBe(false);
+  });
+
+  it('F9: clears the insufficient flag when the quantity is reduced to what is available', () => {
+    basketSubject.next(makeBasket([makeItem(1, 2)]));
+    stockStream(1).next(1);
+    expect(component.hasInsufficientStockItem).toBe(true);
+
+    // The shopper reduces the quantity to 1; basket$ re-emits and the gate clears.
+    basketSubject.next(makeBasket([makeItem(1, 1)]));
+    expect(component.hasInsufficientStockItem).toBe(false);
+    expect(component.proceedDisabled).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F12 (MAJOR) — the UI must reflect the live connection state and fail
+  // closed (proceed disabled) while the hub is not Connected.
+  // ---------------------------------------------------------------------------
+
+  it('F12: stockConnected reflects the live hub connection state', () => {
+    expect(component.stockConnected).toBe(true); // seeded Connected
+
+    connectionStateSubject.next(HubConnectionState.Reconnecting);
+    expect(component.stockConnected).toBe(false);
+
+    connectionStateSubject.next(HubConnectionState.Connected);
+    expect(component.stockConnected).toBe(true);
+  });
+
+  it('F12: proceed is fail-closed while disconnected even when all stock is sufficient', () => {
+    basketSubject.next(makeBasket([makeItem(1)]));
+    stockStream(1).next(5);
+    expect(component.proceedDisabled).toBe(false);
+
+    connectionStateSubject.next(HubConnectionState.Disconnected);
+    expect(component.proceedDisabled).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA F5 (MAJOR) — every still-tracked product's hub subscription must be
+  // released on destroy so the reference count is decremented (eviction).
+  // ---------------------------------------------------------------------------
+
+  it('F5: releases every still-tracked product hub subscription on destroy', () => {
+    basketSubject.next(makeBasket([makeItem(1), makeItem(2)]));
+    stockStream(1).next(5);
+    stockStream(2).next(5);
+
+    fixture.destroy();
+
+    expect(stockServiceMock.unsubscribeFromProduct).toHaveBeenCalledWith(1);
+    expect(stockServiceMock.unsubscribeFromProduct).toHaveBeenCalledWith(2);
+  });
+
+  // ---------------------------------------------------------------------------
+  // QA H-C (CRITICAL) — proceed navigation is enforced in code, not only via the
+  // disabled attribute, so a programmatic/keyboard trigger cannot bypass the gate.
+  // ---------------------------------------------------------------------------
+
+  it('H-C: proceedToCheckout navigates to /checkout only when the gate is open', () => {
+    const router = TestBed.inject(Router);
+    const navigateSpy = spyOn(router, 'navigate').and.stub();
+
+    basketSubject.next(makeBasket([makeItem(1)]));
+    stockStream(1).next(5); // in stock + connected => gate open
+    expect(component.proceedDisabled).toBe(false);
+
+    component.proceedToCheckout();
+    expect(navigateSpy).toHaveBeenCalledWith(['/checkout']);
+  });
+
+  it('H-C: proceedToCheckout is a no-op when the gate is closed (out of stock)', () => {
+    const router = TestBed.inject(Router);
+    const navigateSpy = spyOn(router, 'navigate').and.stub();
+
+    basketSubject.next(makeBasket([makeItem(1)]));
+    stockStream(1).next(0); // out of stock => gate closed
+    expect(component.proceedDisabled).toBe(true);
+
+    component.proceedToCheckout();
+    expect(navigateSpy).not.toHaveBeenCalled();
   });
 
   it('delegates the three basket handlers to BasketService unchanged', () => {

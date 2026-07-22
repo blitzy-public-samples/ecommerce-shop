@@ -481,6 +481,13 @@ namespace Infrastructure.Tests.Services
                 Times.Once);
             _mockDb.Verify(d => d.StringIncrementAsync(
                 It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+            // F-REDIS-1: the hold-key value must be written as the NEW held quantity (3), not a literal 0,
+            // via a conditional (When.Exists) SET so an expired hold is not recreated.
+            _mockDb.Verify(d => d.StringSetAsync(
+                It.Is<RedisKey>(k => k == $"reservation:basket-grow:{productId}"),
+                It.Is<RedisValue>(v => v == 3L),
+                It.IsAny<TimeSpan?>(), When.Exists, It.IsAny<CommandFlags>()),
+                Times.Once);
         }
 
         // 16. Extend SHRINKS an existing hold: INCR the counter back by the released amount.
@@ -531,9 +538,11 @@ namespace Infrastructure.Tests.Services
                 It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
             _mockDb.Verify(d => d.StringIncrementAsync(
                 It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+            // F-REDIS-1: even on a delta=0 TTL-only refresh, the hold-key value must be the held
+            // quantity (3), never a literal 0.
             _mockDb.Verify(d => d.StringSetAsync(
                 It.Is<RedisKey>(k => k == $"reservation:basket-same:{productId}"),
-                It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), When.Exists, It.IsAny<CommandFlags>()),
+                It.Is<RedisValue>(v => v == 3L), It.IsAny<TimeSpan?>(), When.Exists, It.IsAny<CommandFlags>()),
                 Times.Once);
             _mockSub.Verify(s => s.PublishAsync(
                 It.Is<RedisChannel>(c => c == "stock-updates"), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
@@ -1047,6 +1056,54 @@ namespace Infrastructure.Tests.Services
             _mockDb.Verify(d => d.KeyDeleteAsync(
                 It.Is<RedisKey>(k => k == $"reservation:basket-active:{productId}"), It.IsAny<CommandFlags>()),
                 Times.Never);
+        }
+
+        // 28. REGRESSION (QA Issue #4): a DECR against an ABSENT stock:product:{id} key returns a
+        //     NEGATIVE value — Redis materializes the missing key as 0 and then decrements below zero,
+        //     which previously surfaced a spurious negative available stock on the hub-driven badges.
+        //     The reserve path must SELF-HEAL the counter to the authoritative PostgreSQL-computed
+        //     available (capacity minus Active reservations) and publish that non-negative truth, never
+        //     the transient negative — while the reservation itself still succeeds, because the DB row
+        //     lock (not the Redis counter) is the sole authority that gates the grant.
+        [Fact]
+        public async Task CreateReservationAsync_WhenCounterKeyAbsentAndDecrementGoesNegative_RepairsCounterToDbTruthAndPublishesNonNegative()
+        {
+            // Arrange — capacity 10, no prior holds; simulate a cache-miss DECR landing below zero.
+            var products = await TestStoreContextFactory.SeedProductsAsync(_context, count: 1, stockQuantity: 10);
+            var productId = products[0].Id;
+            _mockDb.Setup(d => d.StringDecrementAsync(
+                    It.Is<RedisKey>(k => k == $"stock:product:{productId}"), It.IsAny<long>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(-2L); // absent key: Redis treats as 0, then 0 - 2 => -2
+
+            RedisValue publishedPayload = default;
+            _mockSub.Setup(s => s.PublishAsync(
+                    It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+                .Callback<RedisChannel, RedisValue, CommandFlags>((ch, val, flags) => publishedPayload = val)
+                .ReturnsAsync(0L);
+
+            // Act — reserve 2 of 10; the reservation persists first, then the Redis mirror is decremented.
+            var result = await _sut.CreateReservationAsync("basket-repair", productId, 2);
+
+            // Assert — the reservation still succeeds (the row lock is the authority, not the counter).
+            result.Should().BeTrue();
+            var reservation = await _context.Reservations
+                .FirstOrDefaultAsync(r => r.BasketId == "basket-repair");
+            reservation.Should().NotBeNull();
+            reservation.Quantity.Should().Be(2);
+            reservation.Status.Should().Be(ReservationStatus.Active);
+
+            // The negative DECR triggered a reseed of the SAME stock counter key to the DB-authoritative
+            // available (capacity 10 - the 2 just reserved = 8), via an idempotent SET.
+            _mockDb.Verify(d => d.StringSetAsync(
+                It.Is<RedisKey>(k => k == $"stock:product:{productId}"),
+                It.Is<RedisValue>(v => (long)v == 8),
+                It.IsAny<TimeSpan?>(), It.IsAny<When>(), It.IsAny<CommandFlags>()),
+                Times.Once);
+
+            // The published value is the repaired, non-negative truth (8) — never the transient -2.
+            publishedPayload.HasValue.Should().BeTrue();
+            using var doc = JsonDocument.Parse(publishedPayload.ToString());
+            doc.RootElement.GetProperty("currentStock").GetInt64().Should().Be(8);
         }
 
     }
