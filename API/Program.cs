@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using Core.Entities.Identity;
+using Core.Interfaces;
 using Infrastructure.Data;
 using Infrastructure.Identity;
 using Microsoft.AspNetCore.Hosting;
@@ -26,6 +27,27 @@ namespace API
                     var context = services.GetRequiredService<StoreContext>();
                     await context.Database.MigrateAsync();
                     await StoreContextSeed.SeedAsync(context,loggerFactory);
+
+                    // Seed Redis stock counters from committed PostgreSQL stock so counters are warm
+                    // before the first request. This is isolated in its OWN try/catch: a Redis outage
+                    // at startup must NOT abort the remaining critical initialization (the identity
+                    // database migration and user seeding below), otherwise login would break whenever
+                    // Redis is unavailable. Fail-closed: if the counters cannot be warmed, the
+                    // reservation hot path falls back to the PostgreSQL SELECT ... FOR UPDATE check and
+                    // the reconciliation service reseeds the counters once Redis becomes reachable.
+                    try
+                    {
+                        var inventoryService = services.GetRequiredService<IInventoryService>();
+                        await inventoryService.SeedStockCountersAsync();
+                    }
+                    catch (Exception redisEx)
+                    {
+                        var redisLogger = loggerFactory.CreateLogger<Program>();
+                        redisLogger.LogWarning(redisEx,
+                            "Redis stock-counter seeding was skipped at startup (Redis unavailable). " +
+                            "Identity initialization will continue; counters will be reseeded by the " +
+                            "reconciliation service once Redis is reachable.");
+                    }
 
                     var userManager = services.GetRequiredService<UserManager<AppUser>>();
                     var identityContext = services.GetRequiredService<AppIdentityDbContext>();

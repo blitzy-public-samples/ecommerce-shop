@@ -27,9 +27,29 @@
               [total]="(basketTotals$ | async).total">
 
             </app-order-totals>
-            <a routerLink="/checkout" class="btn btn-outline-primary py-2 btn-block">
+            <!-- QA F12: announce that authoritative live stock is unavailable while
+                 the hub is down/reconnecting; proceed is fail-closed in this state. -->
+            <div *ngIf="!stockConnected" class="alert alert-warning" role="alert">
+              Live stock is currently unavailable. Checkout is paused until the connection is restored.
+            </div>
+            <!-- Zero-stock gate message. -->
+            <div *ngIf="hasOutOfStockItem" class="alert alert-danger" role="alert">
+              One or more products in your basket are out of stock. Please remove them before checking out.
+            </div>
+            <!-- QA F9: a line has positive stock but fewer units than requested. -->
+            <div *ngIf="hasInsufficientStockItem && !hasOutOfStockItem" class="alert alert-danger" role="alert">
+              One or more products in your basket have fewer units available than you requested.
+              Please reduce the quantity before checking out.
+            </div>
+            <!-- QA H-C: a real disabled <button> is inert to mouse, touch AND
+                 keyboard (an aria-disabled anchor stayed keyboard-activatable — the
+                 original bypass). Direct URL / back-forward navigation is blocked by
+                 the /checkout StockGuard. -->
+            <button type="button" class="btn btn-outline-primary py-2 btn-block"
+                    [disabled]="proceedDisabled"
+                    (click)="proceedToCheckout()">
               Proceed to checkout
-            </a>
+            </button>
           </div>
         </div>
       </div>

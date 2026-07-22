@@ -15,6 +15,9 @@ Before you can run the project, you will need to install the following software:
 - [.NET 5.0 SDK](https://dotnet.microsoft.com/download/dotnet/5.0)
 - [Node.js](https://nodejs.org/) (which includes npm for Angular)
 - [Angular CLI](https://angular.io/cli) (version 11)
+- [Docker](https://www.docker.com/) with Docker Compose — used to run the required PostgreSQL and Redis services locally
+
+> **Note:** On Node.js 17 or newer, the Angular 11 build/serve toolchain requires the legacy OpenSSL provider. Export `NODE_OPTIONS=--openssl-legacy-provider` before running `npm install` / `ng serve` / `ng build` (or use Node.js 14/16).
 
 1. **Clone the repository**
 
@@ -34,13 +37,18 @@ Before you can run the project, you will need to install the following software:
     npm install
     ```
 
-4. **Start the backend server.**
+4. **Start the required infrastructure (PostgreSQL + Redis).**
     ```bash
     cd ..
-    dotnet run
+    docker compose up -d
     ```
 
-5. **Start the Angular application in separate terminal session.**
+5. **Start the backend server.**
+    ```bash
+    dotnet run --project API
+    ```
+
+6. **Start the Angular application in separate terminal session.**
     ```bash
     cd client
     ng serve
@@ -51,6 +59,7 @@ Before you can run the project, you will need to install the following software:
 - Product browsing
 - Shopping cart functionalities
 - Order checkout and payment processing (demo)
+- Real-time inventory and flash-sale system with reservation-based oversell prevention and live low-stock updates over SignalR
 - Dockerized for easy hosting
 
 

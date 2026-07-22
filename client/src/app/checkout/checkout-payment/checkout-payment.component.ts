@@ -16,6 +16,11 @@ declare var Stripe;
 })
 export class CheckoutPaymentComponent implements AfterViewInit, OnDestroy {
   @Input() checkoutForm: FormGroup;
+  // Fail-closed submission gate driven by the parent CheckoutComponent: true when
+  // any basket line is out of stock / insufficient, or the live-stock hub is not
+  // connected (QA H-B/F3 + F9 + F12). Disables the Submit Order button and short-circuits
+  // submitOrder() so a shopper can never finalize an order that cannot be honoured.
+  @Input() disableForStock = false;
   @ViewChild('cardNumber', { static: true }) cardNumberElement: ElementRef;
   @ViewChild('cardExpiry', { static: true }) cardExpiryElement: ElementRef;
   @ViewChild('cardCvc', { static: true }) cardCvcElement: ElementRef;
@@ -76,6 +81,14 @@ export class CheckoutPaymentComponent implements AfterViewInit, OnDestroy {
   }
 
   async submitOrder() {
+    // Defence-in-depth for the stock gate (QA H-B/F3 + F9 + F12): the Submit Order button
+    // is disabled while `disableForStock` is true, but a programmatic or stale click must
+    // never create an order or attempt payment when stock cannot be honoured.
+    if (this.disableForStock) {
+      this.toastr.error(
+        'Some items are unavailable or live stock cannot be confirmed. Please review your basket before submitting your order.');
+      return;
+    }
     this.loading = true;
     const basket = this.basketService.getCurrentBasketValue();
     try {

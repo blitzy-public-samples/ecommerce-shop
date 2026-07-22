@@ -85,6 +85,26 @@ describe('ErrorInterceptor', () => {
     expect(toastrSpy.error as any).toHaveBeenCalledWith('unauthorized', 401);
   }));
 
+  it('should show a toast for a 409 reservation-conflict response', fakeAsync(() => {
+    // The inventory service returns 409 with an ApiException body when a reservation
+    // cannot be honoured (insufficient stock / lost concurrency race). The interceptor
+    // must surface this to the shopper via a toast rather than failing silently (F8).
+    const body = { message: 'Only 3 units of that product remain', statusCode: 409 };
+
+    httpClient.get('/test').subscribe({
+      next: () => {},
+      error: () => {}
+    });
+
+    httpMock.expectOne('/test').flush(body, { status: 409, statusText: 'Conflict' });
+    tick(100);
+
+    // ToastrService.error types `title` as string, but the interceptor forwards the
+    // numeric statusCode; cast the spy to bypass the compile-time param-type check
+    // while asserting the exact runtime call (message + numeric statusCode).
+    expect(toastrSpy.error as any).toHaveBeenCalledWith('Only 3 units of that product remain', 409);
+  }));
+
   it('should navigate to /not-found for a 404 response', fakeAsync(() => {
     const body = { message: 'not found', statusCode: 404 };
 

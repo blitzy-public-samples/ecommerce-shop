@@ -21,6 +21,8 @@ namespace Infrastructure.Data
         public DbSet<Order> Orders { get; set; }
         public DbSet<OrderItem> OrderItems { get; set; }
         public DbSet<DeliveryMethod> DeliveryMethods { get; set; }
+        public DbSet<Reservation> Reservations { get; set; }
+        public DbSet<FlashSale> FlashSales { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {

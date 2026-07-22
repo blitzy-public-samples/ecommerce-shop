@@ -55,7 +55,21 @@ export class BasketService {
       this.basketSource.next(response);
       this.calculateTotals();
     }, error => {
+      // Real-Time Inventory & Flash-Sale System: a failed basket POST (notably HTTP 409
+      // Conflict raised by the stock-reservation path) must NOT leave the optimistic,
+      // by-reference quantity mutation applied by addItemToBasket/incrementItemQuantity
+      // visible on screen (a "phantom" quantity the server rejected). Re-fetch the
+      // authoritative basket from the server so the BehaviorSubject re-emits server truth
+      // and totals are recomputed, reverting any optimistic change. The user-facing
+      // message is raised by the ErrorInterceptor's 409 branch. The refetch's own error
+      // is guarded so a revert failure never surfaces as an unhandled rejection.
       console.log(error);
+      if (basket && basket.id) {
+        this.getBasket(basket.id).subscribe(
+          () => {},
+          refetchError => console.log(refetchError)
+        );
+      }
     });
   }
 

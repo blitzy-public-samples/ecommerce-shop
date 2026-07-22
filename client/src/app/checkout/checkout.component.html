@@ -1,4 +1,13 @@
 <div class="container mt-4">
+  <div *ngIf="!stockConnected" class="alert alert-warning" role="alert">
+    Live stock is currently unavailable. Checkout is paused until the connection is restored.
+  </div>
+  <div *ngIf="hasOutOfStockItem" class="alert alert-danger" role="alert">
+    A product in your order is out of stock. Please return to your basket and remove it before completing checkout.
+  </div>
+  <div *ngIf="hasInsufficientStockItem && !hasOutOfStockItem" class="alert alert-danger" role="alert">
+    One or more products in your order have fewer units available than you requested. Please return to your basket and reduce the quantity before completing checkout.
+  </div>
   <div class="row">
     <div class="col-8">
       <app-stepper [linearModeSelected]="true" #appStepper>stepper works
@@ -12,7 +21,7 @@
           <app-checkout-review [appStepper]="appStepper"></app-checkout-review>
         </cdk-step>
         <cdk-step [label]="'Payment'">
-          <app-checkout-payment [checkoutForm]="checkoutForm"></app-checkout-payment>
+          <app-checkout-payment [checkoutForm]="checkoutForm" [disableForStock]="submitDisabledForStock"></app-checkout-payment>
         </cdk-step>
       </app-stepper>
     </div>

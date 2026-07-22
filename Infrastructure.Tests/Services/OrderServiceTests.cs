@@ -18,6 +18,7 @@ namespace Infrastructure.Tests.Services
         private readonly Mock<IBasketRepository> _basketRepo = new Mock<IBasketRepository>();
         private readonly Mock<IUnitOfWork> _unitOfWork = new Mock<IUnitOfWork>();
         private readonly Mock<IPaymentService> _paymentService = new Mock<IPaymentService>();
+        private readonly Mock<IInventoryService> _inventoryService = new Mock<IInventoryService>();
         private readonly Mock<IGenericRepository<Product>> _productRepo = new Mock<IGenericRepository<Product>>();
         private readonly Mock<IGenericRepository<DeliveryMethod>> _deliveryRepo = new Mock<IGenericRepository<DeliveryMethod>>();
         private readonly Mock<IGenericRepository<Order>> _orderRepo = new Mock<IGenericRepository<Order>>();
@@ -28,7 +29,7 @@ namespace Infrastructure.Tests.Services
             _unitOfWork.Setup(u => u.Repository<Product>()).Returns(_productRepo.Object);
             _unitOfWork.Setup(u => u.Repository<DeliveryMethod>()).Returns(_deliveryRepo.Object);
             _unitOfWork.Setup(u => u.Repository<Order>()).Returns(_orderRepo.Object);
-            _sut = new OrderService(_basketRepo.Object, _unitOfWork.Object, _paymentService.Object);
+            _sut = new OrderService(_basketRepo.Object, _unitOfWork.Object, _paymentService.Object, _inventoryService.Object);
         }
 
         private static Address SampleAddress() =>
@@ -114,6 +115,54 @@ namespace Infrastructure.Tests.Services
             _unitOfWork.Verify(u => u.Complete(), Times.Once);
         }
 
+        // (F4) On a successful flush, the order path must STAGE the reservation commit BEFORE Complete() and
+        // FINALIZE (delete) the Redis holds only AFTER Complete() — never before — so a rollback can never orphan
+        // the hold key. This asserts the exact call order: commit -> complete -> finalize.
+        [Fact]
+        public async Task CreateOrderAsync_WhenCompleteSucceeds_StagesCommitBeforeFlushAndFinalizesHoldsAfterFlush()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket);
+            var calls = new List<string>();
+            _inventoryService.Setup(i => i.CommitReservationAsync("basket-1"))
+                .Callback(() => calls.Add("commit")).Returns(Task.CompletedTask);
+            _unitOfWork.Setup(u => u.Complete())
+                .Callback(() => calls.Add("complete")).ReturnsAsync(1);
+            _inventoryService.Setup(i => i.FinalizeCommittedHoldsAsync("basket-1"))
+                .Callback(() => calls.Add("finalize")).Returns(Task.CompletedTask);
+
+            // Act
+            var result = await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — order created, and the invocation order is exactly commit -> complete -> finalize.
+            result.Should().NotBeNull();
+            _inventoryService.Verify(i => i.CommitReservationAsync("basket-1"), Times.Once);
+            _unitOfWork.Verify(u => u.Complete(), Times.Once);
+            _inventoryService.Verify(i => i.FinalizeCommittedHoldsAsync("basket-1"), Times.Once);
+            calls.Should().Equal("commit", "complete", "finalize");
+        }
+
+        // (F4) When the flush fails (Complete() <= 0 => rollback), the holds must NOT be finalized/deleted, so the
+        // rolled-back (still-Active) reservation stays consistent with its surviving Redis hold key. Commit staging
+        // still occurs (it is purely in-memory on the shared context and reverts with the rollback).
+        [Fact]
+        public async Task CreateOrderAsync_WhenCompleteReturnsZero_StagesCommitButDoesNotFinalizeHolds()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket, completeResult: 0);
+
+            // Act
+            var result = await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — flush failed => null; commit was staged and flush attempted, but hold finalization never ran.
+            result.Should().BeNull();
+            _inventoryService.Verify(i => i.CommitReservationAsync("basket-1"), Times.Once);
+            _unitOfWork.Verify(u => u.Complete(), Times.Once);
+            _inventoryService.Verify(i => i.FinalizeCommittedHoldsAsync(It.IsAny<string>()), Times.Never);
+        }
+
         [Fact]
         public async Task CreateOrderAsync_WhenExistingOrderWithSamePaymentIntent_DeletesItAndUpdatesPaymentIntent()
         {
@@ -129,6 +178,41 @@ namespace Infrastructure.Tests.Services
             _orderRepo.Verify(r => r.Delete(existingOrder), Times.Once);
             _paymentService.Verify(p => p.CreateOrUpdatePaymentIntent("pi_123"), Times.Once);
             result.Should().NotBeNull();
+        }
+
+        [Fact]
+        public async Task CreateOrderAsync_WhenBasketValid_InvokesCommitReservationBetweenAddingOrderAndCompleting()
+        {
+            // Arrange
+            var basket = BasketWithBogusClientPrice();
+            ArrangeValidCreateOrderDependencies(basket);
+
+            // Record the relative invocation order of the three finalization steps that OrderService
+            // orchestrates, so we can assert the sequencing this unit test is actually able to prove.
+            var callOrder = new List<string>();
+            _orderRepo.Setup(r => r.Add(It.IsAny<Order>()))
+                .Callback(() => callOrder.Add("Add"));
+            _inventoryService.Setup(i => i.CommitReservationAsync("basket-1"))
+                .Callback(() => callOrder.Add("CommitReservationAsync"))
+                .Returns(Task.CompletedTask);
+            _unitOfWork.Setup(u => u.Complete())
+                .Callback(() => callOrder.Add("Complete"))
+                .ReturnsAsync(1);
+
+            // Act
+            await _sut.CreateOrderAsync("bob@test.com", 1, "basket-1", SampleAddress());
+
+            // Assert — this is a UNIT-LEVEL orchestration/sequencing guarantee proven with mocks:
+            // OrderService stages the basket's reservation commit exactly once, AFTER Add(order) and
+            // BEFORE the single Complete(), so the commit is staged for the same SaveChanges as the order.
+            //
+            // This test deliberately does NOT — and with mocks CANNOT — prove a real database
+            // transaction, a Products "SELECT ... FOR UPDATE" row lock, rollback on failure, or the
+            // ordering of Redis hold-key cleanup relative to durable commit. Those durability/atomicity
+            // guarantees belong to the PostgreSQL-backed integration tests (API.IntegrationTests), not
+            // to this in-memory unit test.
+            _inventoryService.Verify(i => i.CommitReservationAsync("basket-1"), Times.Once);
+            callOrder.Should().Equal(new[] { "Add", "CommitReservationAsync", "Complete" });
         }
 
         [Fact]
