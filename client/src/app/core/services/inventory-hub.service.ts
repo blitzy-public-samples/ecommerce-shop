@@ -29,6 +29,10 @@ const INITIAL_START_RETRY_DELAY_MS = 2000;
 export class InventoryHubService {
   private hubConnection: signalR.HubConnection =
     new signalR.HubConnectionBuilder()
+      // QA Issue #2 / Info: silence SignalR's chatty default Information-level lifecycle logging (which also
+      // prints the access_token-bearing WebSocket URL to the console). Warning still surfaces genuine
+      // warnings/errors but removes the per-connection console noise, supporting console cleanliness.
+      .configureLogging(signalR.LogLevel.Warning)
       .withUrl(environment.hubUrl, { accessTokenFactory: () => localStorage.getItem('token') || '' })
       .withAutomaticReconnect()
       .build();

@@ -111,6 +111,29 @@ namespace API.IntegrationTests.Contract
         }
 
         /// <summary>
+        /// QA finding F3 (contract-hardening, INFO area-of-concern): asserts that <paramref name="element"/> is a
+        /// JSON object whose set of property names is <b>EXACTLY</b> <paramref name="expectedPropertyNames"/> — no
+        /// missing property AND no extra property (order-independent set equality). This is a strict superset of
+        /// <see cref="ShouldExposeCamelCaseProperties"/> (presence-only) and of the targeted absence guards
+        /// (e.g. the <c>version</c>/<c>total</c> <c>TryGetProperty(...).Should().BeFalse()</c> checks): it fails not
+        /// only when a known field is renamed/removed, but ALSO when ANY unexpected property is added to an
+        /// immutable payload — including a future accidental field that no targeted-absence assertion anticipates.
+        /// It is applied to the <c>/api/products</c> and <c>/api/orders</c> backward-compatibility guards so the
+        /// AAP §0.5.2 "request/response shapes MUST NOT change" contract is locked as an exact wire set.
+        /// </summary>
+        /// <param name="element">The JSON element expected to be an object.</param>
+        /// <param name="expectedPropertyNames">The complete, exact set of camelCase property names required.</param>
+        private static void ShouldExposeExactlyCamelCaseProperties(JsonElement element, params string[] expectedPropertyNames)
+        {
+            element.ValueKind.Should().Be(JsonValueKind.Object, "the response body must be a JSON object");
+            var actualPropertyNames = element.EnumerateObject().Select(p => p.Name).ToArray();
+            actualPropertyNames.Should().BeEquivalentTo(
+                expectedPropertyNames,
+                "the serialized wire contract must expose EXACTLY these camelCase properties (no missing, no extra) — "
+                + "guarding the immutable /api/products and /api/orders payloads against ANY accidental addition (AAP §0.5.2)");
+        }
+
+        /// <summary>
         /// Seeds a real single-item <c>CustomerBasket</c> in Redis so that
         /// <c>OrderService.CreateOrderAsync</c> can build a genuine order server-side (MJ-12). A genuinely
         /// seeded product is discovered via <c>GET api/products</c> (ids are DB-assigned, so never
@@ -1014,6 +1037,11 @@ namespace API.IntegrationTests.Contract
                 response.StatusCode.Should().Be(HttpStatusCode.OK);
                 var root = await ReadRootAsync(response);
                 ShouldExposeCamelCaseProperties(
+                    root, "id", "buyerEmail", "orderDate", "shipToAddress", "deliveryMethod",
+                    "shippingPrice", "orderItems", "subtotal", "total", "status");
+                // QA finding F3: lock the EXACT OrderToReturnDto wire set (no missing, no extra) for the
+                // immutable GET /api/orders/{id} detail contract (AAP §0.5.2).
+                ShouldExposeExactlyCamelCaseProperties(
                     root, "id", "buyerEmail", "orderDate", "shipToAddress", "deliveryMethod",
                     "shippingPrice", "orderItems", "subtotal", "total", "status");
                 root.GetProperty("id").GetInt32().Should().Be(orderId);
@@ -1967,6 +1995,10 @@ namespace API.IntegrationTests.Contract
                     item, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
                 item.TryGetProperty("version", out _).Should()
                     .BeFalse("ProductToReturnDto must NOT expose the new Products.Version concurrency token (AAP §0.5.2)");
+                // QA finding F3: lock the EXACT ProductToReturnDto wire set so that NO unexpected property (not
+                // merely the concurrency 'version') can ever be added to the immutable /api/products item contract.
+                ShouldExposeExactlyCamelCaseProperties(
+                    item, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
             }
         }
 
@@ -1994,6 +2026,9 @@ namespace API.IntegrationTests.Contract
             byIdRoot.GetProperty("id").GetInt32().Should().Be(existingId);
             byIdRoot.TryGetProperty("version", out _).Should()
                 .BeFalse("ProductToReturnDto must NOT expose 'version' (AAP §0.5.2)");
+            // QA finding F3: lock the EXACT single-product ProductToReturnDto wire set (no missing, no extra).
+            ShouldExposeExactlyCamelCaseProperties(
+                byIdRoot, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
 
             // Act + Assert — nonexistent id: 404 ApiResponse.
             using var missing = await client.GetAsync("api/products/9999");
@@ -2053,6 +2088,11 @@ namespace API.IntegrationTests.Contract
                 // The reservation-consume hook must NOT alter the /api/orders contract (AAP §0.5.2):
                 root.TryGetProperty("total", out _).Should()
                     .BeFalse("the raw Order entity still serialises no 'total' (GetTotal() is a method)");
+                // QA finding F3: lock the EXACT raw Order-entity wire set so the reservation-consume hook (or any
+                // future change) can never add an unexpected property to the immutable POST /api/orders payload.
+                ShouldExposeExactlyCamelCaseProperties(
+                    root, "id", "buyerEmail", "orderDate", "shipToAddress", "deliveryMethod",
+                    "orderItems", "subtotal", "status", "paymentId");
             }
             finally
             {

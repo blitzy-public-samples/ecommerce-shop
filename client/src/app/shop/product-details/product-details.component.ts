@@ -158,11 +158,20 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   initInventoryHub(): void {
     // M13: acquire reference-counted shared ownership instead of calling start() directly, so this
     // component can never stop the shared root-singleton connection out from under another consumer.
-    // acquire() now surfaces a start failure (M13), so we catch it here - a dead hub must never break
+    // acquire() surfaces a start failure (M13), so we catch it here - a dead hub must never break
     // product-details; the widgets still render from the initial REST fetch.
-    this.inventoryHubService.acquire()
-      .then(() => this.inventoryHubService.joinProductGroup(this.productId))
-      .catch(err => console.error('InventoryHub acquire failed', err));
+    // QA Issue #2: the InventoryHub is [Authorize]; a WebSocket cannot answer an auth challenge, so an
+    // anonymous negotiate returns 401 and emits a retry-storm of console errors + a final rejection. Only
+    // acquire the hub when a JWT is present (the SAME 'token' localStorage key used by jwt.interceptor.ts
+    // and the hub accessTokenFactory). Anonymous shoppers still see the sale, countdown, and initial stock
+    // via the public GET /api/flash-sales/active call; only LIVE hub updates require an authenticated
+    // connection. release() in ngOnDestroy is ref-count-guarded, so an anonymous session that never
+    // acquired is a safe no-op there.
+    if (localStorage.getItem('token')) {
+      this.inventoryHubService.acquire()
+        .then(() => this.inventoryHubService.joinProductGroup(this.productId))
+        .catch(err => console.error('InventoryHub acquire failed', err));
+    }
     this.hubSubscriptions.add(
       this.inventoryHubService.inventoryUpdated$.subscribe((update: IInventoryUpdate) => {
         if (update && update.productId === this.productId) {

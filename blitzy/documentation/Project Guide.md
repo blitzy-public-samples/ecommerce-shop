@@ -1,5 +1,9 @@
 # Blitzy Project Guide — E-Commerce Shop Automated Test Suite
 
+> ⚠️ **Historical snapshot (dated).** This guide documents the earlier **"Add Testing"** engagement on branch `blitzy-bc9729c4-…` (HEAD `738df1d`) and **predates the Real-Time Inventory & Flash Sale feature** that has since been added to this codebase. Consequently:
+> - Its scope statements, the test counts below (e.g. "321 backend / 91 frontend / 412 in-scope"), and the §D/§E reference tables are a **point-in-time snapshot** of that engagement and no longer reflect the current test suite or full configuration surface.
+> - For the current feature — the four REST endpoints, the SignalR hub/events, reservation/rate-limit/TTL behavior, error contracts, config keys, and limitations — see the **"Real-Time Inventory & Flash Sale"** section in `README.md` and the feature entry at the end of `CHANGES.md`. The current operator environment-variable reference is augmented in §E below.
+
 > **Engagement type:** Add Testing (unit + integration/load) · **Stack:** .NET 5.0 backend + Angular 11 SPA
 > **Branch:** `blitzy-bc9729c4-3c5b-4c15-a797-e9d49001ce13` · **HEAD:** `738df1d` · **Baseline:** `a0630f1`
 > **Brand colors:** Completed / AI Work = **Dark Blue `#5B39F3`** · Remaining = **White `#FFFFFF`** · Headings = Violet-Black `#B23AF2` · Highlight = Mint `#A8FDD9`
@@ -159,7 +163,7 @@ All tests below originate from Blitzy's autonomous validation logs and were inde
 | Minimal annotated production change | Only where strictly required, with comment | ✅ Pass | Single `PaymentService` seam, fully annotated, default unchanged |
 | Preserve `app.component.spec.ts` | Verbatim, no edits | ✅ Pass | Unmodified since 2021-08-05 |
 | Leave Protractor / TSLint untouched | Out of scope | ✅ Pass | No changes |
-| No inventory/flash-sale scope | Must not be introduced | ✅ Pass | Absent |
+| No inventory/flash-sale scope | Must not be introduced *by this test-only engagement* | ✅ Pass | Not added by this engagement (the Real-Time Inventory & Flash Sale feature was introduced later — see `README.md`) |
 | Naming convention | `MethodName_StateUnderTest_ExpectedBehavior` | ✅ Pass | Applied across backend |
 | Test code isolation | 4 test projects or colocated `*.spec.ts` | ✅ Pass | No leakage into production projects |
 | Determinism | Zero flakiness, no fixed sleeps | ✅ Pass | 3 consecutive clean runs; `WaitStrategy` |
@@ -327,9 +331,10 @@ cd client && npm start                     # http://localhost:4200
 ### 9.7 Verification
 
 ```bash
-curl -s http://localhost:5000/api/products | head -c 200      # 200, 18 products
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:5000/api/products/99999   # 404 (structured ApiResponse)
-curl -s -X POST http://localhost:5000/api/account/login \
+# Use HTTPS with -k (self-signed dev cert); plain http://localhost:5000 only 307-redirects to https and returns no body
+curl -sk https://localhost:5001/api/products | head -c 200      # 200, 18 products
+curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:5001/api/products/99999   # 404 (structured ApiResponse)
+curl -sk -X POST https://localhost:5001/api/account/login \
   -H "Content-Type: application/json" \
   -d '{"email":"bob@test.com","password":"Pa$$w0rd"}'          # 200 + JWT
 ```
@@ -420,6 +425,9 @@ curl -s -X POST http://localhost:5000/api/account/login \
 | `ConnectionStrings__IdentityConnection` | `...;Database=identity` | Identity DB (overridden in integration tests) |
 | `ConnectionStrings__Redis` | `localhost` | Redis (overridden in integration tests) |
 | `StripeSettings__SecretKey` | *(test-mode key)* | Stripe test key — never a live secret; no live calls |
+| `SIGNALR_HUB_PATH` | `/hubs/inventory` | Real-Time Inventory & Flash Sale — SignalR hub route; both the server hub mapping and the JWT query-string `access_token` check resolve through this value |
+| `RESERVATION_TTL_SECONDS` | `300` | Real-Time Inventory & Flash Sale — how long a stock reservation is held before automatic expiry/release |
+| `FLASH_SALE_POLL_INTERVAL_MS` | `5000` | Real-Time Inventory & Flash Sale — cadence of the background reservation-expiry sweep |
 
 ### F. Developer Tools Guide
 

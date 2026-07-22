@@ -5,8 +5,11 @@ using API.Helpers;
 using AutoMapper;
 using Core.Entities;
 using Core.Interfaces;
-// Microsoft.AspNetCore.Http was previously imported only for StatusCodes.Status403Forbidden, which was removed
-// when the ReleaseReservation 403 arm was folded into a uniform 404 (QA Issue #1); the using is dropped with it.
+// Microsoft.AspNetCore.Http is imported for StatusCodes, used by the [ProducesResponseType] Swagger annotations
+// below (QA documentation finding — the reserve/release error contracts were previously undiscoverable in Swagger,
+// which advertised only HTTP 200). These attributes are OpenAPI documentation metadata only and change no runtime
+// behavior; the exact error bodies are documented in README.md ("Real-Time Inventory & Flash Sale").
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 
 namespace API.Controllers
@@ -45,6 +48,17 @@ namespace API.Controllers
         [SessionRateLimitFilter]
         // Relative template combines with the inherited api/[controller] prefix -> /api/inventory/reserve.
         [HttpPost("reserve")]
+        // QA documentation finding: advertise the FULL response contract to Swagger/OpenAPI (previously only 200 was
+        // discoverable). 200 returns ReservationToReturnDto; the 400/409/429 arms return small anonymous JSON error
+        // bodies — 400 {"error":"INVALID_SESSION"} (or the standard model-validation body), 409
+        // {"error":"INSUFFICIENT_STOCK","available":N} / {"error":"RESERVATION_CONFLICT"}, and 429
+        // {"error":"RATE_LIMIT_EXCEEDED"} (from SessionRateLimitFilter) — all documented in README.md. They are
+        // annotated by status code only (no typed schema) so Swagger does not misrepresent the anonymous wire shape.
+        // Attributes are metadata only; runtime behavior is unchanged.
+        [ProducesResponseType(typeof(ReservationToReturnDto), StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status409Conflict)]
+        [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
         public async Task<ActionResult<ReservationToReturnDto>> Reserve(ReserveInventoryDto dto)
         {
             // ReserveInventoryDto is validated automatically by [ApiController] (Range/Required/UUID data
@@ -93,6 +107,14 @@ namespace API.Controllers
         // template exactly /api/inventory/reserve/{id} (matching the Angular client DELETE) while carrying the
         // ownership token, and is trivially produced by HttpClient.delete(url, { params }).
         [HttpDelete("reserve/{id}")]
+        // QA documentation finding: advertise the release contract to Swagger. 204 on success (no body); the
+        // 400 (missing sessionId), 404 (not found / non-owner — unified to block the existence oracle) and 409
+        // (owned but no longer active) arms all return the shared ApiResponse error shape. Metadata only —
+        // runtime behavior is unchanged.
+        [ProducesResponseType(StatusCodes.Status204NoContent)]
+        [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status404NotFound)]
+        [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status409Conflict)]
         public async Task<ActionResult> ReleaseReservation(int id, [FromQuery] string sessionId)
         {
             // Guard: the ownership token is mandatory. Without it the release can never be authorized, so fail fast

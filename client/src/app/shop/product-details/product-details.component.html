@@ -1,12 +1,17 @@
 <div class="container mt-5">
   <div class="row" *ngIf="product">
-    <!-- M20: stack the image and details columns on small (phone) breakpoints (col-12) and place them
-         side-by-side from md up (col-md-6), instead of a fixed 50% split that clamps on narrow widths. -->
+    <!-- M20 / QA Issue #3 (responsive): stack the image and details columns full-width on small (phone)
+         breakpoints (col-12) so there is no horizontal overflow / Add-to-Cart clipping at 320-575px, and
+         place them side-by-side from md up (col-md-6), instead of a fixed 50% split that clamps on narrow
+         widths. -->
     <div class="col-12 col-md-6">
       <img src="{{product.pictureUrl}}" alt="{{product.name}}" class="img-fluid w-100">
     </div>
     <div class="col-12 col-md-6">
-      <h3>{{product.name}}</h3>
+      <!-- QA Issue #6 (heading order): the section-header renders the product name as the page <h1>, so the
+           product-details headings must continue as <h2> (product name) then <h3> (Description) to give a
+           contiguous h1 -> h2 -> h3 sequence with no skipped level. -->
+      <h2>{{product.name}}</h2>
       <p style="font-size: 1.7em">{{product.price | currency}}</p>
       <!-- Real-Time Inventory & Flash Sale - promotional banner (only while a sale is active) -->
       <app-flash-sale-banner *ngIf="activeFlashSale" [flashSale]="activeFlashSale" [basePrice]="product.price"></app-flash-sale-banner>
@@ -20,9 +25,22 @@
         <app-live-stock-indicator [quantityAvailable]="quantityAvailable"></app-live-stock-indicator>
       </div>
       <div class="d-flex justify-content-start align-items-center">
-        <i (click)="decrementQuantity()" class="fa fa-minus-circle text-warning mr-2"  style="cursor: pointer; font-size: 2em"></i>
+        <!-- QA Issue #4 (accessibility): keyboard-operable, screen-reader-named quantity steppers with a
+             >=44x44 hit area. Native <button>s are focusable and Enter/Space-activatable; the fa icon is
+             decorative (aria-hidden) so only the button's aria-label is announced. -->
+        <button type="button" (click)="decrementQuantity()" aria-label="Decrease quantity"
+                class="btn btn-link p-1 mr-2 d-inline-flex align-items-center justify-content-center"
+                style="text-decoration: none; min-width: 44px; min-height: 44px;">
+          <i class="fa fa-minus-circle text-warning" aria-hidden="true" style="font-size: 2em"></i>
+        </button>
         <span class="font-weight-bold" style="font-size: 1.5em;">{{quantity}}</span>
-        <i (click)="incrementQuantity()" class="fa fa-plus-circle text-warning mx-2" style="cursor: pointer; font-size: 2em"></i>
+        <!-- QA Issue #4 (accessibility): keyboard-operable, screen-reader-named increment stepper matching
+             the decrement button above (>=44x44 hit area, decorative aria-hidden icon). -->
+        <button type="button" (click)="incrementQuantity()" aria-label="Increase quantity"
+                class="btn btn-link p-1 mx-2 d-inline-flex align-items-center justify-content-center"
+                style="text-decoration: none; min-width: 44px; min-height: 44px;">
+          <i class="fa fa-plus-circle text-warning" aria-hidden="true" style="font-size: 2em"></i>
+        </button>
         <!-- C2-fe: disabled while a reserve is in flight (reserving) or when the active sale is sold
              out (isSaleOutOfStock); label reflects the in-flight reserve. -->
         <button (click)="addItemToBasket()" [disabled]="reserving || isSaleOutOfStock"
@@ -34,8 +52,10 @@
     </div>
     <div class="row mt-5">
       <div class="col-12">
-        <h4>Description:</h4>
-        <p>{{product.description}}</p>
+        <!-- QA Issue #6 (heading order): <h3> (not <h4>) so the sequence is h1 -> h2 -> h3 with no skipped level. -->
+        <h3>Description:</h3>
+        <!-- QA edge #9: wrap long unbroken tokens so a pathological description cannot force horizontal overflow. -->
+        <p style="overflow-wrap: break-word;">{{product.description}}</p>
       </div>
     </div>
   </div>

@@ -7,6 +7,11 @@ using AutoMapper;
 using Core.Entities;
 using Core.Interfaces;
 using Microsoft.AspNetCore.Authorization;
+// Microsoft.AspNetCore.Http is imported for StatusCodes, used by the [ProducesResponseType] Swagger annotations
+// below (QA documentation finding — the flash-sale response/error contracts were previously undiscoverable in
+// Swagger, which advertised only HTTP 200). These attributes are OpenAPI documentation metadata only and change
+// no runtime behavior; the endpoints are also documented in README.md ("Real-Time Inventory & Flash Sale").
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 
 namespace API.Controllers
@@ -49,6 +54,15 @@ namespace API.Controllers
         // otherwise yield 'api/flashsales' (no hyphen). An absolute action route bypasses the controller
         // prefix deterministically.
         [HttpPost("/api/flash-sales")]
+        // QA documentation finding: advertise the FULL response contract to Swagger/OpenAPI (previously only 200 was
+        // discoverable). 200 returns FlashSaleDto; 400/404/409 return the shared ApiResponse error shape (invalid
+        // window/allocation/price, product not found, overlapping sale respectively); 401 is the JWT challenge for an
+        // unauthenticated caller ([Authorize]). Attributes are metadata only; runtime behavior is unchanged.
+        [ProducesResponseType(typeof(FlashSaleDto), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+        [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status404NotFound)]
+        [ProducesResponseType(typeof(ApiResponse), StatusCodes.Status409Conflict)]
         public async Task<ActionResult<FlashSaleDto>> CreateFlashSale(CreateFlashSaleDto dto)
         {
             // Data-annotation + IValidatableObject rules on CreateFlashSaleDto are auto-enforced by the
@@ -116,6 +130,9 @@ namespace API.Controllers
         // active-list behaviour. A Cache-Control: no-store response header is also emitted so no shared or
         // browser cache retains this real-time payload (defence-in-depth alongside the absence of [Cached]).
         [HttpGet("/api/flash-sales/active")]
+        // QA documentation finding: advertise the 200 response schema (list of FlashSaleDto with live
+        // quantityAvailable). Metadata only; runtime behavior is unchanged.
+        [ProducesResponseType(typeof(IReadOnlyList<FlashSaleDto>), StatusCodes.Status200OK)]
         public async Task<ActionResult<IReadOnlyList<FlashSaleDto>>> GetActiveSales([FromQuery] int? productId = null)
         {
             // N1: explicitly forbid any caching layer from retaining this real-time response.

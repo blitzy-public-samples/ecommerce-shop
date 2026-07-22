@@ -15,7 +15,7 @@ namespace API.Hubs
     public class InventoryHub : Hub
     {
         // Flash-Sale feature (review finding F07): the SINGLE canonical hub path. It is the fallback used by
-        // JWT query-token extraction (IdentityServiceExtensions) AND by the future endpoints.MapHub<InventoryHub>
+        // JWT query-token extraction (IdentityServiceExtensions) AND by the endpoints.MapHub<InventoryHub>
         // registration in Startup, so both sides agree on the path even if the SIGNALR_HUB_PATH config key is
         // absent. Keep this in sync with the SIGNALR_HUB_PATH value in appsettings.json.
         public const string HubPath = "/hubs/inventory";
@@ -29,8 +29,28 @@ namespace API.Hubs
         // could target different URLs. Centralizing here removes that divergence: null/empty/whitespace falls
         // back to HubPath, and any configured value is trimmed so incidental surrounding whitespace cannot
         // desynchronize the two call sites.
+        //
+        // Flash-Sale feature (QA finding F1, MINOR): additionally NORMALIZE a missing leading slash. Both call
+        // sites REQUIRE a rooted path: Startup.MapHub<InventoryHub>(path) registers a route, and
+        // IdentityServiceExtensions.OnMessageReceived converts the resolved value to a
+        // Microsoft.AspNetCore.Http.PathString (via HttpRequest.Path.StartsWithSegments). The implicit
+        // string->PathString conversion THROWS ArgumentException ("The path in 'value' must start with '/'") for
+        // any non-empty value lacking a leading '/'. Consequently a no-leading-slash SIGNALR_HUB_PATH (e.g.
+        // "hubs/custom") previously 500'd EVERY hub negotiate AND every request carrying a "?access_token="
+        // query — silent, total breakage of the real-time feature while the app otherwise appeared healthy.
+        // Prefixing the missing slash here — in the single shared resolver — guarantees the MapHub route and the
+        // JWT PathString guard stay in agreement for ALL inputs and that the resolved value is always a valid
+        // PathString, so the malformed-config value can never desynchronize the two call sites or throw.
         public static string ResolveHubPath(string configuredPath)
-            => string.IsNullOrWhiteSpace(configuredPath) ? HubPath : configuredPath.Trim();
+        {
+            if (string.IsNullOrWhiteSpace(configuredPath))
+            {
+                return HubPath;
+            }
+
+            var trimmed = configuredPath.Trim();
+            return trimmed.StartsWith("/") ? trimmed : "/" + trimmed;
+        }
 
         // Flash-Sale feature (review finding F08): per-connection key under which we remember the ONE product
         // group a connection is currently subscribed to, so a new join replaces the previous subscription.
