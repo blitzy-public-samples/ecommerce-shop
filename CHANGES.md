@@ -14,6 +14,10 @@ Goal: To track progress I embedded all of the development process(code edits, fi
 
 ### Contributors: Emin Kočan
 
+> **Note (historical log):** This file is the original 2021 development-process tracker for the course project and is preserved as-is. Two clarifications for current readers:
+> - **Datastore:** the running application uses **PostgreSQL** (via `Npgsql.EntityFrameworkCore.PostgreSQL`), not SQLite; the "SQLite" reference in the stack line above reflects an early stage of the 2021 course and is historical.
+> - **Later feature:** the **Real-Time Inventory & Flash Sale** capability was added after this log was last edited (19.8.2021) — see the dated entry at the end of this file and the "Real-Time Inventory & Flash Sale" section in `README.md`.
+
 # API:
 
 ## 1. API Basics:
@@ -3729,3 +3733,40 @@ CreateMap<OrderItem, OrderItemDto>()
                 .ForMember(d => d.PictureUrl, o => o.MapFrom(s => s.ItemOrdered.PictureUrl))
                 .ForMember(d => d.PictureUrl, o => o.MapFrom<OrderItemUrlResolver>());
 ```
+
+---
+
+# Real-Time Inventory & Flash Sale (Feature Addition)
+
+> Added after the historical log above. This entry summarizes the change; the authoritative operator/integrator reference is the **"Real-Time Inventory & Flash Sale"** section in `README.md`.
+
+## Summary
+
+Introduces live, per-product stock counts and time-boxed flash-sale pricing pushed to the browser in real time over SignalR, plus reservation-based oversell prevention.
+
+## Backend (.NET 5 / ASP.NET Core)
+
+- New entities `FlashSale` and `InventoryReservation` (plus a `Version` optimistic-concurrency token on `Product`), configured via `IEntityTypeConfiguration<T>` classes and registered on `StoreContext`.
+- Additive EF Core migration `AddFlashSaleAndInventoryReservation` creates the `FlashSales` and `InventoryReservations` tables (auto-applied on startup). The `Products` price write path is unchanged.
+- New services: `FlashSaleService`, `InventoryReservationService` (optimistic-concurrency reserve/release, retried exactly once), and a `ReservationExpirySweepService` background worker that auto-expires reservations and returns stock.
+- New REST endpoints:
+  - `POST /api/flash-sales` (authenticated) — schedule a flash sale.
+  - `GET /api/flash-sales/active` — active sales with live availability (deliberately NOT cached).
+  - `POST /api/inventory/reserve` — reserve stock (rate-limited to 10 req/min/session).
+  - `DELETE /api/inventory/reserve/{id}` — release a reservation.
+- Error contracts: `409 {"error":"INSUFFICIENT_STOCK","available":N}`, `409 {"error":"RESERVATION_CONFLICT"}`, `429 {"error":"RATE_LIMIT_EXCEEDED"}`, `400 {"error":"INVALID_SESSION"}`.
+- SignalR `InventoryHub` at `/hubs/inventory` (server-to-client): events `InventoryUpdated`, `FlashSaleStarted`, `FlashSaleEnded`. Reuses the existing JWT scheme via a query-string `access_token`; `Microsoft.AspNetCore.Hosting` logging is pinned to `Warning` so tokens are not written to request-URL logs.
+- Checkout consumes the session's reservations after a successful order write; order totals still derive from the product base `price` (the sale price is display-only).
+
+## Frontend (Angular 11)
+
+- New dependency `@microsoft/signalr` (`^8.0.0`).
+- New `inventory-hub.service` (SignalR client using `accessTokenFactory`), `flash-sale.service`, and product-page widgets (flash-sale banner, countdown timer, live stock indicator). The Angular routing structure and the `/api/products` / `/api/orders` contracts are unchanged.
+
+## Configuration
+
+- `SIGNALR_HUB_PATH` (default `/hubs/inventory`), `RESERVATION_TTL_SECONDS` (default `300`), `FLASH_SALE_POLL_INTERVAL_MS` (default `5000`). Environment-overridable.
+
+## Limitations (by design)
+
+- Single-instance, in-memory hub — no Redis backplane, no distributed lock (the zero-oversell guarantee relies on the database concurrency token), and no horizontal SignalR scaling.

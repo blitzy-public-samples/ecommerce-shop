@@ -1,0 +1,26 @@
+.flash-sale-banner {
+  // M20: a small row-gap keeps the badge/prices legible when they wrap onto multiple lines at narrow
+  // widths (Bootstrap 4.6 has no gap utility). Pairs with .flex-wrap on the container in the template.
+  row-gap: 0.25rem;
+
+  // N7: WCAG 2.1 AA contrast fix for the "Flash Sale" badge. Bootstrap `.text-danger` (#dc3545) on the
+  // `.badge-light` background (#f8f9fa) measures 4.295:1 - below the 4.5:1 minimum for this 75%-size
+  // badge text. #b02a37 on #f8f9fa measures 6.16:1, comfortably accessible, while preserving the red
+  // "sale" cue. `.text-danger` was removed from the template in favour of this scoped colour.
+  .flash-sale-badge {
+    color: #b02a37;
+  }
+
+  .sale-price {
+    font-size: 1.25rem;
+  }
+
+  // Flash-Sale feature (review finding F13): the struck-through base price must remain legible.
+  // The previous `opacity: 0.75` dropped the effective contrast of the del text below the WCAG 2.1 AA
+  // 4.5:1 threshold for normal text. Render it at the alert's NORMAL foreground colour at full opacity
+  // (inherit, opacity: 1) instead of a dimmed/muted tone — do NOT use `.text-muted` on this element.
+  del {
+    color: inherit;
+    opacity: 1;
+  }
+}

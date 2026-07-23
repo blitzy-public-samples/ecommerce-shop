@@ -1,22 +1,69 @@
 <div class="container mt-5">
   <div class="row" *ngIf="product">
-    <div class="col-6">
+    <!-- M20 / QA Issue #3 (responsive): stack the image and details columns full-width on small (phone)
+         breakpoints (col-12) so there is no horizontal overflow / Add-to-Cart clipping at 320-575px, and
+         place them side-by-side from md up (col-md-6), instead of a fixed 50% split that clamps on narrow
+         widths. -->
+    <div class="col-12 col-md-6">
       <img src="{{product.pictureUrl}}" alt="{{product.name}}" class="img-fluid w-100">
     </div>
-    <div class="col-6">
-      <h3>{{product.name}}</h3>
+    <div class="col-12 col-md-6">
+      <!-- QA Issue #6 (heading order): the section-header renders the product name as the page <h1>, so the
+           product-details headings must continue as <h2> (product name) then <h3> (Description) to give a
+           contiguous h1 -> h2 -> h3 sequence with no skipped level. -->
+      <h2>{{product.name}}</h2>
       <p style="font-size: 1.7em">{{product.price | currency}}</p>
-      <div class="d-flex justify-content-start align-items-center">
-        <i (click)="decrementQuantity()" class="fa fa-minus-circle text-warning mr-2"  style="cursor: pointer; font-size: 2em"></i>
-        <span class="font-weight-bold" style="font-size: 1.5em;">{{quantity}}</span>
-        <i (click)="incrementQuantity()" class="fa fa-plus-circle text-warning mx-2" style="cursor: pointer; font-size: 2em"></i>
-        <button (click)="addItemToBasket()" class="btn btn-outline-primary btn-lg ml-4">Add to Cart</button>
+      <!-- Real-Time Inventory & Flash Sale - promotional banner (only while a sale is active) -->
+      <app-flash-sale-banner *ngIf="activeFlashSale" [flashSale]="activeFlashSale" [basePrice]="product.price"></app-flash-sale-banner>
+      <!-- N8: group the countdown + live-stock so they are not cramped together and wrap on narrow
+           widths (column-gap/row-gap). M14: bind (expired) so the widgets clear + refetch at the
+           deadline; N8: pass a contextual "Flash sale ends in" label to the countdown. -->
+      <div *ngIf="activeFlashSale" class="d-flex flex-wrap align-items-center mt-2 mb-2"
+           style="column-gap: 1rem; row-gap: 0.25rem;">
+        <app-countdown-timer [endAt]="activeFlashSale.endAt" label="Flash sale ends in"
+                             (expired)="onFlashSaleExpired()"></app-countdown-timer>
+        <app-live-stock-indicator [quantityAvailable]="quantityAvailable"></app-live-stock-indicator>
       </div>
+      <!-- QA P6-J: when the authenticated live-update connection drops (offline / reconnecting) the
+           stock figure above can no longer refresh in real time. Tell the shopper it may be stale.
+           Gated by showStaleIndicator (active sale + signed-in shopper + connection not 'connected')
+           so anonymous or no-sale views never show it. role="status" + aria-live="polite" announces
+           the change to assistive tech without stealing focus. -->
+      <div *ngIf="showStaleIndicator" class="text-muted small mt-1" role="status" aria-live="polite">
+        Live updates paused — stock may be out of date.
+      </div>
+      <div class="d-flex justify-content-start align-items-center">
+        <!-- QA Issue #4 (accessibility): keyboard-operable, screen-reader-named quantity steppers with a
+             >=44x44 hit area. Native <button>s are focusable and Enter/Space-activatable; the fa icon is
+             decorative (aria-hidden) so only the button's aria-label is announced. -->
+        <button type="button" (click)="decrementQuantity()" aria-label="Decrease quantity"
+                class="btn btn-link p-1 mr-2 d-inline-flex align-items-center justify-content-center"
+                style="text-decoration: none; min-width: 44px; min-height: 44px;">
+          <i class="fa fa-minus-circle text-warning" aria-hidden="true" style="font-size: 2em"></i>
+        </button>
+        <span class="font-weight-bold" style="font-size: 1.5em;">{{quantity}}</span>
+        <!-- QA Issue #4 (accessibility): keyboard-operable, screen-reader-named increment stepper matching
+             the decrement button above (>=44x44 hit area, decorative aria-hidden icon). -->
+        <button type="button" (click)="incrementQuantity()" aria-label="Increase quantity"
+                class="btn btn-link p-1 mx-2 d-inline-flex align-items-center justify-content-center"
+                style="text-decoration: none; min-width: 44px; min-height: 44px;">
+          <i class="fa fa-plus-circle text-warning" aria-hidden="true" style="font-size: 2em"></i>
+        </button>
+        <!-- C2-fe: disabled while a reserve is in flight (reserving) or when the active sale is sold
+             out (isSaleOutOfStock); label reflects the in-flight reserve. -->
+        <button (click)="addItemToBasket()" [disabled]="reserving || isSaleOutOfStock"
+                class="btn btn-outline-primary btn-lg ml-4">{{ reserving ? 'Reserving...' : 'Add to Cart' }}</button>
+      </div>
+      <!-- C2-fe: surface the reservation failure contracts (409 INSUFFICIENT_STOCK /
+           RESERVATION_CONFLICT, 429 rate-limit) to the shopper; the basket is not mutated on failure. -->
+      <div *ngIf="reservationError" class="alert alert-warning mt-2 mb-0" role="alert">{{ reservationError }}</div>
     </div>
     <div class="row mt-5">
       <div class="col-12">
-        <h4>Description:</h4>
-        <p>{{product.description}}</p>
+        <!-- QA Issue #6 (heading order): <h3> (not <h4>) so the sequence is h1 -> h2 -> h3 with no skipped level. -->
+        <h3>Description:</h3>
+        <!-- QA edge #9: wrap long unbroken tokens so a pathological description cannot force horizontal overflow. -->
+        <p style="overflow-wrap: break-word;">{{product.description}}</p>
       </div>
     </div>
   </div>

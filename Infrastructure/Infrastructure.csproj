@@ -7,13 +7,22 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Identity" Version="2.2.0" />
+    <!-- Flash-Sale feature (review finding M22): ReservationExpirySweepService derives from BackgroundService,
+         which lives in Microsoft.Extensions.Hosting.Abstractions. Declare it EXPLICITLY at the net5.0-aligned
+         version (5.0.0) so the type no longer resolves through an accidental transitive 2.2.0 reference. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="5.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="5.0.8" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="5.0.8" />
-    <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="6.12.0" />
+    <!-- Flash-Sale feature (review finding M18): align the IdentityModel/JWT stack with API.csproj at the patched
+         6.35.0 (GHSA-59j7-ghrg-fj52: oversized compressed tokens -> excessive CPU/memory). Previously this
+         manifest declared 6.12.0 while API pinned 6.35.0, so the two projects resolved DIFFERENT IdentityModel
+         versions; unifying on 6.35.0 removes that mismatch and ensures Infrastructure's TokenService is built
+         against the same DoS-hardened parser. -->
+    <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="6.35.0" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="5.0.7" />
     <PackageReference Include="StackExchange.Redis" Version="2.2.62" />
     <PackageReference Include="Stripe.net" Version="39.66.0" />
-    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="6.12.0" />
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="6.35.0" />
   </ItemGroup>
 
   <ItemGroup>

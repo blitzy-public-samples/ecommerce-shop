@@ -63,6 +63,20 @@ export class BasketService {
     return this.basketSource.value;
   }
 
+  // M15-fe: Shared "ensure a basket UUID exists" path. Returns the basket UUID persisted in
+  // localStorage['basket_id'], creating (and persisting) a fresh one via the SAME createBasket()
+  // path used by addItemToBasket() when none exists yet. This is the single source of truth for the
+  // reuse-the-basket-UUID session identity (sessionId = basket UUID), so a first-time shopper who
+  // reserves a flash-sale item BEFORE adding anything to the basket still sends a valid canonical
+  // UUID v4 rather than null. No new identity concept is introduced (AAP R8 / §0.6).
+  getOrCreateBasketId(): string {
+    const existing = localStorage.getItem('basket_id');
+    if (existing) {
+      return existing;
+    }
+    return this.createBasket().id;
+  }
+
   addItemToBasket(item: IProduct, quantity = 1) {
     const itemToAdd: IBasketItem = this.mapProductItemToBasketItem(item, quantity);
     const basket = this.getCurrentBasketValue() ?? this.createBasket();
@@ -85,6 +99,18 @@ export class BasketService {
   private createBasket(): IBasket {
     const basket = new Basket();
     localStorage.setItem('basket_id', basket.id);
+    // QA finding F2 (CRITICAL) fix: seed the BehaviorSubject with the just-created basket so that
+    // getCurrentBasketValue() immediately returns it. Previously createBasket() only persisted the
+    // UUID to localStorage without seeding basketSource, so a first-time shopper who reserved a
+    // flash-sale item via getOrCreateBasketId() (which mints UUID_A) would then hit
+    // addItemToBasket()'s `getCurrentBasketValue() ?? createBasket()`; because the subject was still
+    // null this minted a SECOND basket (UUID_B) and overwrote localStorage['basket_id'], diverging
+    // the order's basket UUID from the reservation's session_id. Checkout then consumed no
+    // reservation and the orphaned hold lapsed at TTL, re-releasing already-sold stock (oversell).
+    // Seeding here keeps reservation session_id == basket UUID == order basket UUID end-to-end,
+    // preserving the zero-oversell invariant (AAP R3) and the basket-UUID-as-session-id rule
+    // (AAP R8/R5). No new identity concept is introduced.
+    this.basketSource.next(basket);
     return basket;
   }
 

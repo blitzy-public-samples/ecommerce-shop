@@ -1,0 +1,21 @@
+/* Live stock indicator.
+   Emphasis is driven by Bootstrap text utility classes (.text-danger) for the danger states and by
+   the accessible classes below. This component-scoped stylesheet is intentionally minimal. */
+:host {
+  display: inline-block;
+}
+
+/* M03: WCAG-AA accessible success colour. Bootstrap .text-success (#28a745) measures ~3.13:1 on
+   white, below the 4.5:1 normal-text threshold; #157347 measures ~5.87:1 and satisfies WCAG 2.1 AA.
+   The bolder weight further improves legibility of the healthy-stock message. */
+.stock-in {
+  color: #157347;
+  font-weight: 600;
+}
+
+/* m04: explicit unavailable state — visually muted and clearly distinct from a healthy in-stock
+   message so a missing/invalid quantity is never mistaken for available stock. */
+.stock-unavailable {
+  color: #6c757d;
+  font-style: italic;
+}

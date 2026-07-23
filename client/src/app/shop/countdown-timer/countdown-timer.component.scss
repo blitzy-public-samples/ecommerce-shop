@@ -1,0 +1,15 @@
+:host {
+  display: inline-block;
+}
+
+// N8: separate the contextual "Ends in" label from the ticking time so they are not cramped together
+// (and, in the host, not cramped against the inline stock indicator).
+.countdown-label {
+  margin-right: 0.375rem;
+  font-weight: 600;
+}
+
+.countdown-timer {
+  // Tabular figures stop the digits from shifting width as they tick, avoiding layout jitter.
+  font-variant-numeric: tabular-nums;
+}

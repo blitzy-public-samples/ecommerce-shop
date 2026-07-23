@@ -70,11 +70,14 @@ namespace API.IntegrationTests.Infrastructure
         public const string DefaultTestUserPassword = "Pa$$w0rd";
 
         /// <summary>
-        /// JWT signing key injected as <c>Token:Key</c>. It is long enough to satisfy the HMAC-SHA512
-        /// signing that <c>TokenService</c> performs, and mirrors the source <c>appsettings</c> value so
-        /// tokens minted in-process validate against the same key the app configures.
+        /// JWT signing key injected as <c>Token:Key</c>. Review finding M24: the patched
+        /// Microsoft.IdentityModel.Tokens (6.35.0) enforces that an HMAC-SHA512 key be at least 512 bits, so
+        /// this value is 552 bits (69 UTF-8 bytes) — long enough to satisfy the HMAC-SHA512 signing that
+        /// <c>TokenService</c> performs. The factory injects this same key for both issuance and validation
+        /// in-process (overriding the ambient <c>appsettings</c> value), so tokens minted in a test validate
+        /// against the identical key.
         /// </summary>
-        public const string TestTokenKey = "super secret key";
+        public const string TestTokenKey = "blitzy-integration-test-jwt-signing-key-hmac-sha512-long-enough-value";
 
         /// <summary>JWT issuer injected as <c>Token:Issuer</c> (used for both issuance and validation).</summary>
         public const string TestTokenIssuer = "https://localhost:5001";

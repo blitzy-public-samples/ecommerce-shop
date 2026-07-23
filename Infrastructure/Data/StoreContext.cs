@@ -21,6 +21,9 @@ namespace Infrastructure.Data
         public DbSet<Order> Orders { get; set; }
         public DbSet<OrderItem> OrderItems { get; set; }
         public DbSet<DeliveryMethod> DeliveryMethods { get; set; }
+        // Flash-Sale feature: new aggregate sets (EF configs auto-discovered via ApplyConfigurationsFromAssembly)
+        public DbSet<FlashSale> FlashSales { get; set; }
+        public DbSet<InventoryReservation> InventoryReservations { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {

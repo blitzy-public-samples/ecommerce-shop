@@ -123,7 +123,10 @@ namespace API.IntegrationTests.Resilience
             startInfo.Environment["ConnectionStrings__DefaultConnection"] = UnreachableConnectionString;
             startInfo.Environment["ConnectionStrings__IdentityConnection"] = UnreachableConnectionString;
             startInfo.Environment["ConnectionStrings__Redis"] = "127.0.0.1:1";                  // not resolved at startup; unused by the migrate block
-            startInfo.Environment["Token__Key"] = "super secret key which is long enough for offline startup only";
+            // Review finding M24: patched Microsoft.IdentityModel.Tokens enforces a >=512-bit HMAC-SHA512 key.
+            // This value is 552 bits (69 UTF-8 bytes); the prior 496-bit string would trip IDX10720 if the
+            // isolated process ever minted a token (it does not here, but the key is kept valid regardless).
+            startInfo.Environment["Token__Key"] = "blitzy-startup-isolation-test-jwt-signing-key-hmac-sha512-long-enough";
             startInfo.Environment["Token__Issuer"] = "https://localhost:5001";
             startInfo.Environment["ApiUrl"] = "https://localhost:5001/content/";
             startInfo.Environment["HOME"] = homeDir;                                            // isolate Data Protection key ring under the temp tree

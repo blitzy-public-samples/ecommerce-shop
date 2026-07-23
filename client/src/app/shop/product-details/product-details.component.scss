@@ -1,0 +1,26 @@
+/* Real-Time Inventory & Flash Sale — product-details styles.
+
+   QA Issue #13 (MINOR, WCAG 2.1.1 Keyboard / 2.4.7 Focus Visible / 4.1.2 Name-Role-Value):
+   the +/- quantity steppers are now real <button> elements (keyboard-operable and labelled) but
+   must keep the original bare warning-coloured icon appearance. Strip the default button chrome,
+   keep the pointer affordance, provide a clearly visible focus ring, and dim the disabled state. */
+.qty-stepper {
+  background: none;
+  border: none;
+  padding: 0;
+  line-height: 1;
+  cursor: pointer;
+
+  &:focus,
+  &:focus-visible {
+    outline: 2px solid #ffc107; /* Bootstrap warning tone — clearly visible focus indicator */
+    outline-offset: 2px;
+  }
+
+  /* QA Issue #3 (MAJOR): disabled state (min quantity / availability cap / expired sale) is visually
+     distinct and non-interactive. */
+  &:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+}

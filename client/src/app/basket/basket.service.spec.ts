@@ -381,4 +381,76 @@ describe('BasketService', () => {
       expect(totals).toEqual({ shipping: 10, subtotal: 20, total: 30 });
     });
   });
+
+  // 15. getOrCreateBasketId (M15-fe: shared ensure-basket-ID path; no HTTP)
+  describe('getOrCreateBasketId', () => {
+    it('should return the existing basket_id without creating a new one', () => {
+      // Arrange — a basket UUID already exists in localStorage.
+      spyOn(localStorage, 'getItem').and.returnValue('existing-basket-uuid');
+      const setItem = spyOn(localStorage, 'setItem');
+
+      // Act — purely local; afterEach verify() guarantees no HTTP was issued.
+      const id = service.getOrCreateBasketId();
+
+      // Assert — the persisted id is returned verbatim and no new basket is created/persisted.
+      expect(id).toBe('existing-basket-uuid');
+      expect(localStorage.getItem).toHaveBeenCalledWith('basket_id');
+      expect(setItem).not.toHaveBeenCalled();
+    });
+
+    it('should create and persist a new basket UUID when none exists', () => {
+      // Arrange — no basket UUID yet.
+      spyOn(localStorage, 'getItem').and.returnValue(null);
+      const setItem = spyOn(localStorage, 'setItem');
+
+      // Act
+      const id = service.getOrCreateBasketId();
+
+      // Assert — a fresh UUID is generated, persisted under basket_id and returned (same
+      // createBasket() path used by addItemToBasket). No HTTP is issued.
+      expect(id).toBeTruthy();
+      expect(setItem).toHaveBeenCalledWith('basket_id', id);
+    });
+  });
+
+  // 16. F2 regression (CRITICAL): reserve-then-add must reuse ONE basket UUID.
+  // A first-time shopper reserves a flash-sale item via getOrCreateBasketId() (which mints and
+  // seeds a basket) and THEN adds it via addItemToBasket(). Both must operate on the SAME basket
+  // UUID so the reservation session_id equals the order's basket UUID (AAP R8/R5) and no orphaned
+  // hold can re-release sold stock (zero-oversell, AAP R3). Guards QA finding F2: before the fix,
+  // createBasket() did not seed basketSource, so addItemToBasket()'s
+  // `getCurrentBasketValue() ?? createBasket()` minted a SECOND UUID and overwrote basket_id.
+  describe('F2 reserve-then-add session identity', () => {
+    it('should reuse the same basket UUID for getOrCreateBasketId() then addItemToBasket()', () => {
+      // Arrange — first-time shopper: no basket_id persisted yet.
+      spyOn(localStorage, 'getItem').and.returnValue(null);
+      const setItem = spyOn(localStorage, 'setItem');
+
+      // Act (step 1) — the reserve path resolves/mints the session id (the basket UUID).
+      const sessionId = service.getOrCreateBasketId();
+
+      // The just-minted basket must be the current basket immediately (the fix seeds basketSource),
+      // otherwise the subsequent add would mint a divergent UUID.
+      expect(sessionId).toBeTruthy();
+      expect(service.getCurrentBasketValue()).toBeTruthy();
+      expect(service.getCurrentBasketValue().id).toBe(sessionId);
+
+      // Act (step 2) — add the item, exactly as product-details does after a successful reserve.
+      service.addItemToBasket(makeProduct(1, 15), 2);
+      const req = httpMock.expectOne(apiUrl + 'basket');
+      expect(req.request.method).toBe('POST');
+      const sent = req.request.body as IBasket;
+
+      // Assert — the POSTed basket carries the SAME UUID returned to the reserve call (no divergence).
+      expect(sent.id).toBe(sessionId);
+      expect(sent.items.length).toBe(1);
+      expect(sent.items[0].id).toBe(1);
+      req.flush(sent);
+
+      // Assert — basket_id was persisted exactly once and never overwritten with a different UUID.
+      const basketIdWrites = setItem.calls.allArgs().filter(args => args[0] === 'basket_id');
+      expect(basketIdWrites.length).toBe(1);
+      expect(basketIdWrites[0][1]).toBe(sessionId);
+    });
+  });
 });
