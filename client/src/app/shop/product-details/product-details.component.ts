@@ -1,4 +1,6 @@
-import { Component, OnDestroy, OnInit } from '@angular/core';
+// QA P6-J-1: NgZone is injected so the live-connection-state handler can re-enter Angular's zone and
+// trigger change detection (the SignalR onclose/reconnect emissions arrive outside the zone).
+import { Component, NgZone, OnDestroy, OnInit } from '@angular/core';
 import {IProduct} from '../../shared/models/product';
 import {ShopService} from "../shop.service";
 import {ActivatedRoute} from "@angular/router";
@@ -43,7 +45,10 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   constructor(private shopService: ShopService, private activateRoute: ActivatedRoute,
               private bcService: BreadcrumbService, private basketService: BasketService,
               // Real-Time Inventory & Flash Sale - new services (existing DI preserved)
-              private inventoryHubService: InventoryHubService, private flashSaleService: FlashSaleService) {
+              private inventoryHubService: InventoryHubService, private flashSaleService: FlashSaleService,
+              // QA P6-J-1 - Angular zone used to marshal out-of-zone hub connection-state emissions back
+              // into the zone so the "live updates paused" indicator actually renders (existing DI preserved).
+              private ngZone: NgZone) {
     this.bcService.set('@productDetails', ' ');
   }
 
@@ -244,7 +249,16 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
       // showStaleIndicator) on there being an active sale and a signed-in shopper who could ever have
       // a live connection, so anonymous or no-sale views never show a spurious "paused" notice.
       this.inventoryHubService.connectionState$.subscribe(state => {
-        this.liveUpdatesStale = state !== 'connected';
+        // QA P6-J-1 FIX: connectionState$ emits from the SignalR onclose/self-managed reconnect() path,
+        // which runs OUTSIDE Angular's zone (verified at runtime: zone.js reports these as "Zone: <root>").
+        // With this component's DEFAULT change detection, mutating liveUpdatesStale out-of-zone never
+        // triggers a CD pass, so the *ngIf="showStaleIndicator" notice stayed hidden on a genuine hub drop.
+        // Re-entering the Angular zone here schedules a CD tick so the "live updates paused" indicator
+        // renders (and clears) as the connection state changes. ngZone.run is a no-op re-entry when the
+        // emission is already in-zone (e.g. the initial 'connected' from acquire()), so it is always safe.
+        this.ngZone.run(() => {
+          this.liveUpdatesStale = state !== 'connected';
+        });
       })
     );
     this.hubSubscriptions.add(

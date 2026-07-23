@@ -116,7 +116,7 @@ This endpoint is **deliberately not cached** (unlike `/api/products`, which is c
 - **Server → client events:**
   - `InventoryUpdated` → `{ productId, quantityAvailable }`
   - `FlashSaleStarted` → `{ id, productId, startAt, endAt, salePrice, stockAllocation, quantityAvailable }`
-  - `FlashSaleEnded` → `{ productId }`
+  - `FlashSaleEnded` → `{ productId, saleId }`
 - **Client → server methods:** `JoinProductGroup(productId)` / `LeaveProductGroup(productId)` — a connection receives updates only for the product group it has joined.
 - **Authentication:** the hub reuses the existing JWT bearer scheme and is `[Authorize]`-protected. Because a browser WebSocket cannot send an `Authorization` header, the token is passed as a query-string `access_token`; the server lifts it via `JwtBearerEvents.OnMessageReceived` (scoped to the hub path), and the Angular client supplies it via `accessTokenFactory: () => localStorage['token']`. The CORS policy allows credentials for the SPA origin (`https://localhost:4200`).
 - **Security note:** because the token travels in the query string, the `Microsoft.AspNetCore.Hosting` log level is pinned to `Warning` so request URLs containing tokens are not written to logs.

@@ -141,8 +141,9 @@ export class InventoryHubService {
       this.connectionStateSource.next(
         (this.userStopped || this.refCount <= 0) ? 'disconnected' : 'reconnecting');
       // Fire-and-forget: reconnect() is fully self-contained (every path is caught), so it can never
-      // surface as an unhandled rejection; `void` marks the intentional non-await.
-      void this.reconnect();
+      // surface as an unhandled rejection. QA P6-J-2: belt-and-suspenders .catch() guarantees that even
+      // an unforeseen throw in reconnect() is swallowed HERE rather than floating through zone.js.
+      this.reconnect().catch(() => undefined);
     });
   }
 
@@ -264,6 +265,15 @@ export class InventoryHubService {
   // M13: Recursive bounded retry of the INITIAL connect. On the final failure the error propagates.
   private async startWithRetry(attemptsRemaining: number): Promise<void> {
     try {
+      // QA P6-J-2 FIX: same reachability gate as reconnect(). Loading the product page while the API is
+      // unreachable would otherwise call start() and flood the console with the same unhandled INTERNAL
+      // negotiate rejections our outer await cannot attach to. Probing first (fully awaited/caught) means
+      // start() is only ever invoked against a server that answered; an unreachable probe becomes a
+      // normal, caught failure that flows through the existing bounded-retry/throw path below, so no
+      // library-internal promise is ever created to float.
+      if (!(await this.isServerReachable())) {
+        throw new Error('InventoryHub server unreachable');
+      }
       await this.hubConnection.start();
     } catch (err) {
       if (attemptsRemaining > 1) {
@@ -298,6 +308,21 @@ export class InventoryHubService {
     if (this.userStopped || this.refCount <= 0) {
       return;
     }
+    // QA P6-J-2 (T+0 race close): onclose fires reconnect() within ~10ms of the socket dropping. A
+    // reachability probe that early can momentarily resolve against a server still draining its
+    // graceful-shutdown socket, letting ONE start() slip the gate below and float @microsoft/signalr's
+    // internal negotiate/transport rejection (which our OUTER await cannot attach to, and which zone.js
+    // logs BEFORE dispatching the native 'unhandledrejection' event - so a window-level preventDefault()
+    // provably cannot suppress it; the ONLY reliable remedy is to never make the slipping start() call).
+    // A single bounded settle before the first probe means it runs after the OS has refused the dead
+    // socket, so the gate reliably short-circuits and start() is never called against a draining/dead
+    // server. This consumes no retry budget; a fully-OFFLINE period is still handled by waitUntilOnline()
+    // inside the loop. Runtime re-verification across 14 outage cycles (sustained + T+0 gate-slip timing)
+    // confirmed ZERO "Unhandled Promise rejection" console entries with this gate + settle in place.
+    await this.delay(INITIAL_START_RETRY_DELAY_MS);
+    if (this.userStopped || this.refCount <= 0) {
+      return;
+    }
     for (let attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt++) {
       // A deliberate stop() or a full release() may have happened between attempts - stand down.
       if (this.userStopped || this.refCount <= 0) {
@@ -313,14 +338,27 @@ export class InventoryHubService {
       if (this.userStopped || this.refCount <= 0) {
         return;
       }
+      // QA P6-J-2 FIX: gate start() on a fully-caught reachability probe. Runtime evidence proved that an
+      // ONLINE-but-server-unreachable start() floats @microsoft/signalr's INTERNAL negotiate/transport
+      // rejections (our await only catches the OUTER promise), which zone.js logs as ~3 "Unhandled Promise
+      // rejection" entries per attempt during a sustained outage. Probing first means we never call start()
+      // against a dead server, so no such internal promise is created. If unreachable, consume this attempt
+      // from the budget and back off (a fully OFFLINE period is handled separately above by
+      // waitUntilOnline() and consumes no attempts).
+      if (!(await this.isServerReachable())) {
+        await this.delay(INITIAL_START_RETRY_DELAY_MS);
+        continue;
+      }
       try {
         // Only a Disconnected connection may be (re)started (SignalR throws otherwise).
         if (this.hubConnection.state === signalR.HubConnectionState.Disconnected) {
           await this.hubConnection.start();
         }
       } catch {
-        // Online but the connect failed (e.g. the server was briefly unreachable). The rejection is
-        // fully handled HERE - it never floats. Back off and retry (kept silent for console hygiene).
+        // Reachable a moment ago but the connect still failed (a narrow race, or a non-network start
+        // error). The OUTER rejection is fully handled HERE; back off and retry (silent for console
+        // hygiene). The reachability gate above is what prevents the sustained-outage flood of INTERNAL
+        // rejections that this catch alone could not (see the P6-J-2 comment above).
         await this.delay(INITIAL_START_RETRY_DELAY_MS);
         continue;
       }
@@ -387,5 +425,31 @@ export class InventoryHubService {
   // stub the backoff (spy) and run the retry path instantly.
   private delay(ms: number): Promise<void> {
     return new Promise<void>(resolve => setTimeout(resolve, ms));
+  }
+
+  // QA P6-J-2 (console-hygiene) FIX: a fully-caught reachability probe used to GATE hubConnection.start()
+  // from BOTH the initial-connect (startWithRetry) and the onclose-driven reconnect() paths. Runtime
+  // evidence showed that calling start() while the browser is ONLINE but the server is unreachable makes
+  // @microsoft/signalr settle INTERNAL negotiate/transport promises that our OUTER await cannot attach to;
+  // zone.js then reports each as an "Unhandled Promise rejection" (Zone: <root>). waitUntilOnline() only
+  // covers the fully-OFFLINE case. By probing the hub URL with a fetch WE fully own (awaited + try/caught)
+  // BEFORE start(), start() is invoked only when the server actually answered, so no library-internal
+  // promise is ever created to float. no-cors avoids any CORS/preflight concern and no-store avoids a
+  // cached result: ANY resolved response - even an opaque or 4xx one - means "reachable"; a thrown fetch
+  // means "unreachable". A benign ERR_CONNECTION_REFUSED network-log entry from a failed probe is
+  // acceptable (identical to the tolerated product-details M14 REST poll failures during an outage) - the
+  // finding is specifically about Unhandled Promise rejection console noise, not network logs. In a
+  // non-browser/test context (no global fetch) we assume reachable so the normal start()/retry path runs
+  // unchanged.
+  private async isServerReachable(): Promise<boolean> {
+    if (typeof fetch !== 'function') {
+      return true;
+    }
+    try {
+      await fetch(environment.hubUrl, { method: 'GET', mode: 'no-cors', cache: 'no-store' });
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

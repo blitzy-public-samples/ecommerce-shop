@@ -58,6 +58,9 @@ describe('InventoryHubService', () => {
     it('should start once for the first acquire and stop only on the last release', async () => {
       const conn = connectionOf(service);
       setState(conn, signalR.HubConnectionState.Disconnected);
+      // QA P6-J-2: a server-reachability gate now precedes hubConnection.start(); stub it reachable so
+      // these established lifecycle assertions (start/stop cardinality) exercise the connected path.
+      spyOn<any>(service, 'isServerReachable').and.returnValue(Promise.resolve(true));
       // Starting flips the simulated state to Connected so a second acquire() is a no-op start.
       const startSpy = spyOn(conn, 'start').and.callFake(() => {
         setState(conn, signalR.HubConnectionState.Connected);
@@ -84,6 +87,9 @@ describe('InventoryHubService', () => {
     it('should surface the connection failure instead of swallowing it into a fulfilled promise', async () => {
       const conn = connectionOf(service);
       setState(conn, signalR.HubConnectionState.Disconnected);
+      // QA P6-J-2: stub the reachability gate reachable so the failure under test is the REAL start()
+      // rejection ('connect failed'), not the gate's own unreachable short-circuit.
+      spyOn<any>(service, 'isServerReachable').and.returnValue(Promise.resolve(true));
       spyOn(conn, 'start').and.returnValue(Promise.reject(new Error('connect failed')));
       // Skip the retry backoff so the bounded retries run instantly.
       spyOn<any>(service, 'delay').and.returnValue(Promise.resolve());
@@ -171,6 +177,13 @@ describe('InventoryHubService', () => {
         return Promise.resolve();
       });
       spyOn(conn, 'invoke').and.returnValue(Promise.resolve());
+      // QA P6-J-2: once connectivity returns, reconnect() also passes the server-reachability gate before
+      // start(); stub it reachable so this OFFLINE-then-online test still self-heals via a real start().
+      spyOn<any>(service, 'isServerReachable').and.returnValue(Promise.resolve(true));
+      // QA P6-J-2: neutralise the bounded pre-loop settle delay (real setTimeout) reconnect() now performs
+      // before its first probe, so this test still parks on waitUntilOnline() instantly (same technique the
+      // sibling reconnect specs use). The offline-park + no-start-while-offline behaviour is unchanged.
+      spyOn<any>(service, 'delay').and.returnValue(Promise.resolve());
       // Simulate the browser being offline; reconnect() must park on the 'online' event and NOT call
       // hubConnection.start() (calling a failing start() while offline is what floats the library
       // negotiate-rejection that zone.js logs as "Unhandled Promise rejection").
@@ -196,6 +209,12 @@ describe('InventoryHubService', () => {
       (service as any).userStopped = false;
       (service as any).joinedGroups.add(6);
       setState(conn, signalR.HubConnectionState.Disconnected);
+      // QA P6-J-2: stub the reachability gate reachable so the reconnect success path reaches start().
+      spyOn<any>(service, 'isServerReachable').and.returnValue(Promise.resolve(true));
+      // QA P6-J-2: neutralise the bounded pre-loop settle delay reconnect() now performs before its first
+      // probe (real setTimeout) so this success-path test stays fast; the rejoin + reconnected$ contract
+      // it asserts is unaffected.
+      spyOn<any>(service, 'delay').and.returnValue(Promise.resolve());
       // The self-managed loop awaits hubConnection.start() directly; the first attempt succeeds and
       // flips the simulated state to Connected so the rejoin + reconnected$ contract runs.
       const startSpy = spyOn(conn, 'start').and.callFake(() => {
@@ -243,6 +262,9 @@ describe('InventoryHubService', () => {
       (service as any).refCount = 1;
       (service as any).userStopped = false;
       setState(conn, signalR.HubConnectionState.Disconnected);
+      // QA P6-J-2: stub the reachability gate reachable so each attempt reaches the REAL start() and this
+      // test exercises the start-failure swallow path (not the gate's unreachable short-circuit).
+      spyOn<any>(service, 'isServerReachable').and.returnValue(Promise.resolve(true));
       // Every start() attempt fails (offline) WITHOUT floating - the loop awaits each inside try/catch.
       spyOn(conn, 'start').and.returnValue(Promise.reject(new Error('offline')));
       // Skip the backoff so the bounded budget is exhausted instantly.
@@ -271,6 +293,8 @@ describe('InventoryHubService', () => {
     it('acquire() clears the deliberate-stop flag so a later drop can reconnect', async () => {
       const conn = connectionOf(service);
       setState(conn, signalR.HubConnectionState.Disconnected);
+      // QA P6-J-2: stub the reachability gate reachable so acquire()'s start() succeeds and resolves.
+      spyOn<any>(service, 'isServerReachable').and.returnValue(Promise.resolve(true));
       spyOn(conn, 'start').and.callFake(() => {
         setState(conn, signalR.HubConnectionState.Connected);
         return Promise.resolve();
@@ -280,6 +304,41 @@ describe('InventoryHubService', () => {
       await service.acquire();
 
       expect((service as any).userStopped).toBeFalse();
+    });
+  });
+
+  // QA P6-J-2 (console-hygiene): server-reachability gate. Runtime evidence showed that calling
+  // hubConnection.start() while the browser is ONLINE but the server is unreachable makes @microsoft/signalr
+  // settle INTERNAL negotiate promises our outer await cannot attach to, which zone.js logs as an
+  // "Unhandled Promise rejection". isServerReachable() gates start() on a fully-caught fetch probe so start()
+  // is never invoked against a dead server (so no library-internal promise is ever created to float).
+  describe('server-reachability gate (P6-J-2)', () => {
+    it('isServerReachable() resolves true when the probe fetch resolves and false when it rejects', async () => {
+      const fetchSpy = spyOn(window, 'fetch');
+      // A resolved response (even a 4xx/opaque) means the server answered -> reachable.
+      fetchSpy.and.callFake(() => Promise.resolve(new Response(null, { status: 404 })));
+      await expectAsync((service as any).isServerReachable()).toBeResolvedTo(true);
+      // A thrown fetch (server down) means unreachable; the probe swallows it and reports false.
+      fetchSpy.and.callFake(() => Promise.reject(new TypeError('Failed to fetch')));
+      await expectAsync((service as any).isServerReachable()).toBeResolvedTo(false);
+    });
+
+    it('reconnect() does NOT call start() while the server is unreachable and still resolves (no float)', async () => {
+      const conn = connectionOf(service);
+      (service as any).refCount = 1;
+      (service as any).userStopped = false;
+      setState(conn, signalR.HubConnectionState.Disconnected);
+      // Server unreachable for the whole bounded budget: the gate must short-circuit BEFORE start().
+      spyOn<any>(service, 'isServerReachable').and.returnValue(Promise.resolve(false));
+      const startSpy = spyOn(conn, 'start').and.returnValue(Promise.resolve());
+      // Skip the backoff so the bounded budget is exhausted instantly.
+      spyOn<any>(service, 'delay').and.returnValue(Promise.resolve());
+      spyOn(console, 'warn');
+
+      // MUST resolve (never reject): the gate + try/catch own the outage so zone.js sees no float.
+      await expectAsync((service as any).reconnect()).toBeResolved();
+      // start() is never invoked against the unreachable server - the crux of the P6-J-2 fix.
+      expect(startSpy).not.toHaveBeenCalled();
     });
   });
 });
