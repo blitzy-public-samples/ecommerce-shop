@@ -48,9 +48,12 @@ describe('ProductDetailsComponent (reserve flow)', () => {
     flashSaleService.releaseReservation.and.returnValue(of(null));
 
     // Hub mock: streams as Subjects, lifecycle as resolved promises.
+    // QA P6-J: connectionState$ is an additive stream the component subscribes to in initInventoryHub
+    // to drive the "live updates paused" indicator; expose it here so hub-wired tests can emit states.
     hubService = {
       inventoryUpdated$: new Subject(), flashSaleStarted$: new Subject(),
       flashSaleEnded$: new Subject(), reconnected$: new Subject(),
+      connectionState$: new Subject(),
       acquire: jasmine.createSpy('acquire').and.returnValue(Promise.resolve()),
       joinProductGroup: jasmine.createSpy('joinProductGroup').and.returnValue(Promise.resolve()),
       leaveProductGroup: jasmine.createSpy('leaveProductGroup').and.returnValue(Promise.resolve()),
@@ -164,14 +167,99 @@ describe('ProductDetailsComponent (reserve flow)', () => {
     expect(flashSaleService.getActiveFlashSale).toHaveBeenCalledWith(1);
   });
 
-  it('releases tracked reservations with the owning sessionId on destroy (C2-fe/M6-fe)', () => {
+  // QA R8-A (CRITICAL): route destruction must NOT release this session's holds. A hold backs a line
+  // the shopper ADDED TO THE BASKET; navigating away (e.g. product-details -> basket) is not an intent
+  // to cancel it. The previous behaviour released the stock while the basket line stayed checkout-ready,
+  // re-exposing sold-through units (oversell). Per AAP 0.4.3 destroy only leaves the hub group + releases
+  // the shared hub ownership; the hold's terminal lifecycle is the TTL sweep (R4) or checkout consume (R5).
+  it('does NOT release tracked reservations on destroy, but leaves the hub group and releases the hub (QA R8-A)', () => {
     spyOn(localStorage, 'getItem').and.returnValue('basket-uuid');
     (component as any).reservationIds = [55, 56];
 
     component.ngOnDestroy();
 
-    expect(flashSaleService.releaseReservation).toHaveBeenCalledWith(55, 'basket-uuid');
-    expect(flashSaleService.releaseReservation).toHaveBeenCalledWith(56, 'basket-uuid');
-    expect((component as any).reservationIds).toEqual([]);
+    // The holds are RETAINED - never released as a side effect of navigation.
+    expect(flashSaleService.releaseReservation).not.toHaveBeenCalled();
+    expect((component as any).reservationIds).toEqual([55, 56]);
+    // Hub cleanup still happens: leave THIS product's group and release shared ownership.
+    expect(hubService.leaveProductGroup).toHaveBeenCalledWith(1);
+    expect(hubService.release).toHaveBeenCalled();
+  });
+
+  // QA P7-G (MINOR): a slower/older REST poll response must never move the displayed stock backward over
+  // a newer LIVE hub push. The component stamps lastInventoryUpdateAt when a hub value lands and, in the
+  // poll's subscribe callback, only adopts the REST quantityAvailable when no newer hub value arrived
+  // after the poll was issued.
+  it('does NOT let a stale poll response overwrite a newer live hub stock value (QA P7-G)', () => {
+    // Newest live value already applied; its timestamp is "now".
+    component.activeFlashSale = sale;
+    component.quantityAvailable = 113;
+    (component as any).lastInventoryUpdateAt = Date.now() + 10000; // simulate a very recent live push
+
+    // A poll that resolves with an OLDER snapshot (quantityAvailable 115) must be ignored for stock.
+    flashSaleService.getActiveFlashSale.and.returnValue(of({ ...sale, quantityAvailable: 115 }));
+
+    component.loadActiveFlashSale();
+
+    // Stock stays at the fresher live value; the sale object still reconciles.
+    expect(component.quantityAvailable).toBe(113);
+    expect(component.activeFlashSale).toBeTruthy();
+  });
+
+  it('DOES adopt the poll stock value when no newer live push has arrived (QA P7-G)', () => {
+    component.activeFlashSale = sale;
+    component.quantityAvailable = 113;
+    (component as any).lastInventoryUpdateAt = 0; // no live push has ever landed
+
+    flashSaleService.getActiveFlashSale.and.returnValue(of({ ...sale, quantityAvailable: 120 }));
+
+    component.loadActiveFlashSale();
+
+    expect(component.quantityAvailable).toBe(120);
+  });
+
+  // QA P6-J (MINOR): the "live updates paused" indicator must only show when it is meaningful - an active
+  // sale, a signed-in shopper (a hub connection is only ever attempted with a token), and a connection
+  // that is not currently 'connected'. It must never misfire for anonymous or no-sale views.
+  it('gates the stale/paused indicator on active-sale + signed-in + not-connected (QA P6-J)', () => {
+    const getItem = spyOn(localStorage, 'getItem');
+
+    // Signed in, active sale, connection not connected -> show it.
+    getItem.and.returnValue('a-token');
+    component.activeFlashSale = sale;
+    component.liveUpdatesStale = true;
+    expect(component.showStaleIndicator).toBeTrue();
+
+    // Connected again -> hide it.
+    component.liveUpdatesStale = false;
+    expect(component.showStaleIndicator).toBeFalse();
+
+    // Not signed in (anonymous) -> never show it, even if stale + active sale.
+    getItem.and.returnValue(null);
+    component.liveUpdatesStale = true;
+    expect(component.showStaleIndicator).toBeFalse();
+
+    // No active sale -> never show it.
+    getItem.and.returnValue('a-token');
+    component.activeFlashSale = undefined;
+    expect(component.showStaleIndicator).toBeFalse();
+  });
+
+  it('marks live updates stale when the hub connectionState$ leaves "connected" (QA P6-J)', () => {
+    // Wire the hub streams directly (matching this suite's no-detectChanges convention) so the
+    // component subscribes to connectionState$ without also starting the real product load/render.
+    component.initInventoryHub();
+
+    hubService.connectionState$.next('reconnecting');
+    expect(component.liveUpdatesStale).toBeTrue();
+
+    hubService.connectionState$.next('connected');
+    expect(component.liveUpdatesStale).toBeFalse();
+
+    hubService.connectionState$.next('disconnected');
+    expect(component.liveUpdatesStale).toBeTrue();
+
+    // Tear down the timer/poll + hub subscriptions initInventoryHub created so nothing leaks past this spec.
+    component.ngOnDestroy();
   });
 });

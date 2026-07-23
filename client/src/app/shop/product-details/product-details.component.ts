@@ -29,8 +29,16 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   reservationError: string;
   private productId: number;
   private hubSubscriptions = new Subscription();
-  // C2-fe - ids of reservations taken on THIS page, released on destroy (see ngOnDestroy).
+  // C2-fe / QA R8-A - ids of reservations this page took. They are RETAINED to stay associated with
+  // the basket lines they back and are NOT released on route destruction (see ngOnDestroy); their
+  // terminal lifecycle is the TTL sweep (abandonment) or the checkout consume hook.
   private reservationIds: number[] = [];
+  // QA P7-G - epoch ms of the most recent LIVE hub InventoryUpdated/FlashSaleStarted stock value. Used
+  // to stop a slower/older REST poll response from moving displayed stock backward over a newer push.
+  private lastInventoryUpdateAt = 0;
+  // QA P6-J - true when the authenticated live-update connection is not currently 'connected'
+  // (offline / reconnecting), so the shopper can be told on-screen stock may be stale.
+  liveUpdatesStale = false;
 
   constructor(private shopService: ShopService, private activateRoute: ActivatedRoute,
               private bcService: BreadcrumbService, private basketService: BasketService,
@@ -54,6 +62,14 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
   get isSaleOutOfStock(): boolean {
     return this.isSaleActive && this.quantityAvailable === 0;
   }
+  // QA P6-J: show the "live updates paused" notice only when it is actually meaningful - i.e. there is
+  // an active flash sale whose stock the shopper is watching, the shopper is signed in (so a live hub
+  // connection is expected at all; anonymous shoppers only ever get the initial REST value and must not
+  // see a "paused" notice), and that connection is not currently 'connected'. This mirrors the hub
+  // acquisition gate in initInventoryHub (token present) so the indicator can never misfire.
+  get showStaleIndicator(): boolean {
+    return this.isSaleActive && this.liveUpdatesStale && !!localStorage.getItem('token');
+  }
 
   // C2-fe: for a product with an ACTIVE flash sale we RESERVE the requested quantity BEFORE mutating
   // the basket, so a shopper can never add flash-sale units the allocation cannot cover (zero-oversell
@@ -76,7 +92,9 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
     this.reservationError = undefined;
     this.flashSaleService.reserve(this.productId, this.quantity).subscribe(
       (reservation: IInventoryReservation) => {
-        // Hold secured: track its id (released on destroy) and only NOW mutate the basket.
+        // Hold secured: track its id (retained across route destruction per QA R8-A - the hold backs
+        // this basket line; TTL sweep or checkout consume owns its terminal lifecycle) and only NOW
+        // mutate the basket.
         this.reservationIds.push(reservation.id);
         this.basketService.addItemToBasket(this.product, this.quantity);
         this.reserving = false;
@@ -144,10 +162,18 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
 
   // Real-Time Inventory & Flash Sale - fetch the current active sale (if any) for this product
   loadActiveFlashSale(): void {
+    // QA P7-G: remember WHEN this read was issued. The subscribe callback below only applies the
+    // REST stock reading if NO live hub InventoryUpdated/FlashSaleStarted has arrived since (a newer
+    // live value must never be moved backward by an older, slower poll response).
+    const issuedAt = Date.now();
     this.flashSaleService.getActiveFlashSale(this.productId).subscribe(sale => {
       this.activeFlashSale = sale;
       if (sale) {
-        this.quantityAvailable = sale.quantityAvailable;
+        // QA P7-G: guard against a stale poll overwriting a fresher live push. If a hub stock value
+        // landed after this request was issued, keep the live value; otherwise adopt the REST value.
+        if (this.lastInventoryUpdateAt <= issuedAt) {
+          this.quantityAvailable = sale.quantityAvailable;
+        }
       }
     }, error => {
       console.log(error);
@@ -176,6 +202,9 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
       this.inventoryHubService.inventoryUpdated$.subscribe((update: IInventoryUpdate) => {
         if (update && update.productId === this.productId) {
           this.quantityAvailable = update.quantityAvailable;
+          // QA P7-G: this is the freshest LIVE value; stamp it so a slower REST poll that was issued
+          // earlier cannot overwrite it with an older number (previously stock flickered backward).
+          this.lastInventoryUpdateAt = Date.now();
         }
       })
     );
@@ -184,6 +213,9 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
         if (sale && sale.productId === this.productId) {
           this.activeFlashSale = sale;
           this.quantityAvailable = sale.quantityAvailable;
+          // QA P7-G: a freshly-started sale's stock is a live value; stamp it so an older in-flight
+          // REST poll response cannot clobber it with a stale number.
+          this.lastInventoryUpdateAt = Date.now();
         }
       })
     );
@@ -206,6 +238,16 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
       this.inventoryHubService.reconnected$.subscribe(() => this.loadActiveFlashSale())
     );
     this.hubSubscriptions.add(
+      // QA P6-J: track the live-connection state so the shopper can be told when live stock updates
+      // are paused (offline / reconnecting). liveUpdatesStale is true whenever the authenticated hub
+      // connection is not 'connected'; the on-screen indicator is additionally gated (see
+      // showStaleIndicator) on there being an active sale and a signed-in shopper who could ever have
+      // a live connection, so anonymous or no-sale views never show a spurious "paused" notice.
+      this.inventoryHubService.connectionState$.subscribe(state => {
+        this.liveUpdatesStale = state !== 'connected';
+      })
+    );
+    this.hubSubscriptions.add(
       // M14: poll fallback using environment.pollInterval (previously a dead, unused setting). The hub
       // is the primary live channel, but if it is disconnected/unreachable this periodic REST refresh
       // of the active sale (+ its authoritative quantityAvailable) reconciles stale state - e.g. a
@@ -214,28 +256,22 @@ export class ProductDetailsComponent implements OnInit, OnDestroy {
     );
   }
 
-  // Real-Time Inventory & Flash Sale - clean up hub subscriptions and connection on destroy
+  // Real-Time Inventory & Flash Sale - clean up hub subscriptions and connection on destroy.
   ngOnDestroy(): void {
     this.hubSubscriptions.unsubscribe();
     this.inventoryHubService.leaveProductGroup(this.productId);
     // M13: release shared ownership instead of stop(); the connection is torn down only when the
     // LAST consumer releases, so a sibling product-details instance keeps its live connection.
     this.inventoryHubService.release();
-    // C2-fe / M6-fe: best-effort release of any holds taken on this page, returning stock promptly
-    // rather than waiting for the RESERVATION_TTL_SECONDS sweep. Release is idempotent/ownership-
-    // checked server-side (a hold already consumed by a completed order simply 409s and is ignored
-    // here); the TTL sweep remains the backstop if the tab closes without ngOnDestroy firing.
-    this.releaseTrackedReservations();
-  }
-
-  // C2-fe: release every reservation this page took, using the owning basket UUID as sessionId.
-  private releaseTrackedReservations(): void {
-    const sessionId = localStorage.getItem('basket_id') || '';
-    this.reservationIds.forEach(id =>
-      this.flashSaleService.releaseReservation(id, sessionId).subscribe(
-        () => { /* released */ },
-        () => { /* best-effort: ignore already consumed/expired/released holds */ }
-      ));
-    this.reservationIds = [];
+    // QA R8-A FIX (CRITICAL, was: releaseTrackedReservations() here): do NOT release this session's
+    // holds on route destruction. A reservation backs a line the shopper has ADDED TO THE BASKET, and
+    // navigating product-details -> basket (or anywhere) is not an intent to cancel that line. The
+    // previous best-effort release returned the held stock to the pool while the Redis basket line
+    // stayed checkout-ready, leaving the basket line unbacked and re-exposing sold-through stock
+    // (oversell risk). Per AAP 0.4.3 destroy must only "leave the hub group" (done above); the hold's
+    // terminal lifecycle is owned by the RESERVATION_TTL_SECONDS sweep (AAP R4 auto-release on
+    // abandonment) and the checkout consume hook (AAP R5), never by page navigation. The reservation
+    // ids remain tracked (see reservationIds) so they stay associated with the basket lines they back;
+    // an explicit cart removal, checkout, or TTL expiry — not this destroy — releases them.
   }
 }

@@ -24,6 +24,14 @@
                              (expired)="onFlashSaleExpired()"></app-countdown-timer>
         <app-live-stock-indicator [quantityAvailable]="quantityAvailable"></app-live-stock-indicator>
       </div>
+      <!-- QA P6-J: when the authenticated live-update connection drops (offline / reconnecting) the
+           stock figure above can no longer refresh in real time. Tell the shopper it may be stale.
+           Gated by showStaleIndicator (active sale + signed-in shopper + connection not 'connected')
+           so anonymous or no-sale views never show it. role="status" + aria-live="polite" announces
+           the change to assistive tech without stealing focus. -->
+      <div *ngIf="showStaleIndicator" class="text-muted small mt-1" role="status" aria-live="polite">
+        Live updates paused — stock may be out of date.
+      </div>
       <div class="d-flex justify-content-start align-items-center">
         <!-- QA Issue #4 (accessibility): keyboard-operable, screen-reader-named quantity steppers with a
              >=44x44 hit area. Native <button>s are focusable and Enter/Space-activatable; the fa icon is

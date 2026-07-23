@@ -1,6 +1,9 @@
 import { Injectable } from '@angular/core';
 import * as signalR from '@microsoft/signalr';
-import { Subject } from 'rxjs';
+// P6-J: BehaviorSubject backs the new connectionState$ stream so a late subscriber (e.g. a
+// product-details instance created after the socket already connected/dropped) immediately receives
+// the CURRENT live-connection status rather than waiting for the next transition.
+import { BehaviorSubject, Subject } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import { IFlashSale, IFlashSaleEnded } from '../../shared/models/flash-sale';
 import { IInventoryUpdate } from '../../shared/models/inventory';
@@ -74,6 +77,18 @@ export class InventoryHubService {
   private reconnectedSource = new Subject<void>();
   reconnected$ = this.reconnectedSource.asObservable();
 
+  // P6-J (offline UI staleness): expose the live-connection status so a consumer can tell the shopper
+  // when on-screen inventory may be stale (offline / reconnecting) instead of silently presenting a
+  // last-known value as if it were live. Purely additive/observational — it never alters the
+  // (re)connection control flow; the values are emitted from the SAME lifecycle points that already
+  // drive start()/onclose/reconnect(). 'connected' = live push is flowing; 'reconnecting' = an
+  // unexpected drop we are actively healing (incl. parked-until-online); 'disconnected' = deliberately
+  // stopped, fully released, or the bounded reconnect budget was exhausted. Seeded 'disconnected' so a
+  // subscriber that connects before the first acquire() sees the correct pre-connection state.
+  private connectionStateSource =
+    new BehaviorSubject<'connected' | 'reconnecting' | 'disconnected'>('disconnected');
+  connectionState$ = this.connectionStateSource.asObservable();
+
   // M13: Retained registry of product groups this (shared) connection has joined. Kept so reconnect()
   // (QA finding F4) can transparently rejoin them after a self-managed reconnect, and so groups
   // requested before the socket is up are joined once it connects.
@@ -120,6 +135,11 @@ export class InventoryHubService {
     this.hubConnection.onclose(() => {
       // Drop the shared start promise so reconnect()/a future acquire() can reopen from Disconnected.
       this.startPromise = null;
+      // P6-J: reflect the drop to consumers using the SAME gate reconnect() applies below. An
+      // unexpected drop that we will actively heal (consumers still want the connection) is
+      // 'reconnecting'; a deliberate stop() or a fully-released connection is 'disconnected'.
+      this.connectionStateSource.next(
+        (this.userStopped || this.refCount <= 0) ? 'disconnected' : 'reconnecting');
       // Fire-and-forget: reconnect() is fully self-contained (every path is caught), so it can never
       // surface as an unhandled rejection; `void` marks the intentional non-await.
       void this.reconnect();
@@ -175,6 +195,8 @@ export class InventoryHubService {
       .then(() => this.rejoinGroups())
       .then(() => {
         this.startPromise = null;
+        // P6-J: the initial connect (and its group rejoin) succeeded — live push is now flowing.
+        this.connectionStateSource.next('connected');
       })
       .catch(err => {
         this.startPromise = null;
@@ -309,12 +331,18 @@ export class InventoryHubService {
           return this.stop();
         }
         await this.rejoinGroups();
+        // P6-J: live push has resumed after the drop — clear the 'reconnecting' status.
+        this.connectionStateSource.next('connected');
         this.reconnectedSource.next();
         return;
       }
       // Still transitioning (not yet Connected) - wait out the backoff and re-check.
       await this.delay(INITIAL_START_RETRY_DELAY_MS);
     }
+    // P6-J: the bounded online-retry budget was exhausted (sustained server-unreachable-while-online).
+    // We stop actively retrying here, so the status is 'disconnected' until a later acquire()/start()
+    // reopens the socket; the product-details M14 REST poll keeps reconciling stock/price meanwhile.
+    this.connectionStateSource.next('disconnected');
     // Online-retry budget exhausted (a sustained server-unreachable-while-online outage; an offline
     // outage never reaches here because it parks on 'online' above). Surface ONE handled warning (not an
     // unhandled rejection) so the give-up stays diagnosable; live push resumes on the next connection and
