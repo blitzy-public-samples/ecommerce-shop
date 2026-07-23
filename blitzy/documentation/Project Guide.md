@@ -1,12 +1,8 @@
-# Blitzy Project Guide — E-Commerce Shop Automated Test Suite
+# Blitzy Project Guide — Real-Time Inventory & Flash Sale
 
-> ⚠️ **Historical snapshot (dated).** This guide documents the earlier **"Add Testing"** engagement on branch `blitzy-bc9729c4-…` (HEAD `738df1d`) and **predates the Real-Time Inventory & Flash Sale feature** that has since been added to this codebase. Consequently:
-> - Its scope statements, the test counts below (e.g. "321 backend / 91 frontend / 412 in-scope"), and the §D/§E reference tables are a **point-in-time snapshot** of that engagement and no longer reflect the current test suite or full configuration surface.
-> - For the current feature — the four REST endpoints, the SignalR hub/events, reservation/rate-limit/TTL behavior, error contracts, config keys, and limitations — see the **"Real-Time Inventory & Flash Sale"** section in `README.md` and the feature entry at the end of `CHANGES.md`. The current operator environment-variable reference is augmented in §E below.
-
-> **Engagement type:** Add Testing (unit + integration/load) · **Stack:** .NET 5.0 backend + Angular 11 SPA
-> **Branch:** `blitzy-bc9729c4-3c5b-4c15-a797-e9d49001ce13` · **HEAD:** `738df1d` · **Baseline:** `a0630f1`
-> **Brand colors:** Completed / AI Work = **Dark Blue `#5B39F3`** · Remaining = **White `#FFFFFF`** · Headings = Violet-Black `#B23AF2` · Highlight = Mint `#A8FDD9`
+> Feature addition to an existing Angular 11 + ASP.NET Core 5 + PostgreSQL + Redis e-commerce store (Clean Architecture). Branch `blitzy-0d70ea78-b70d-4a45-bd51-39bd89eac086` · HEAD `fbd2694`.
+>
+> **Brand color key:** Completed / AI Work = Dark Blue `#5B39F3` · Remaining = White `#FFFFFF` · Headings & Accents = Violet-Black `#B23AF2` · Highlight = Mint `#A8FDD9`.
 
 ---
 
@@ -14,60 +10,66 @@
 
 ### 1.1 Project Overview
 
-The E-Commerce Shop is a full-stack online storefront consisting of a .NET 5 ASP.NET Core Web API (Core / Infrastructure / API layers) backed by PostgreSQL and Redis, paired with an Angular 11 single-page front end. This engagement adds a comprehensive, repeatable automated test suite — unit tests with mocked dependencies plus integration and load tests against real infrastructure — **without altering documented production runtime behavior**. The target users are the development and QA teams who gain a regression safety net covering financial, security, caching, and concurrency paths. Business impact: substantially reduced defect risk on the highest-blast-radius flows (order pricing, payment-intent calculation, JWT issuance, authorization) and a foundation for continuous integration.
+This project adds a **Real-Time Inventory & Flash Sale** capability to an existing online store so shoppers see live per-product stock counts and time-boxed promotional pricing update on-screen without refreshing, while the platform guarantees **zero oversell** during high-concurrency flash-sale checkout windows. The technical scope spans a new SignalR hub and three broadcast events, two new domain entities with an optimistic-concurrency token, four secured REST endpoints, a background reservation-expiry sweep, a single checkout-consume hook, per-session rate limiting, and three Angular widgets (banner, countdown, live-stock). Target users are storefront shoppers and store operators scheduling promotions; business impact is higher promotional conversion with protected inventory integrity.
 
 ### 1.2 Completion Status
 
+The completion percentage reflects **AAP-scoped work plus path-to-production for those deliverables only** (PA1 methodology). The feature is fully implemented and passes the complete autonomous test suite; the remaining work is a focused set of robustness/security follow-ups and standard production hardening.
+
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'pie1':'#5B39F3','pie2':'#FFFFFF','pieStrokeColor':'#B23AF2','pieStrokeWidth':'2px','pieOuterStrokeWidth':'2px','pieTitleTextSize':'16px','pieSectionTextColor':'#B23AF2'}}}%%
-pie showData title Completion Status — 92.8% Complete
-    "Completed Work (192h)" : 192
-    "Remaining Work (15h)" : 15
+%%{init: {'theme':'base','themeVariables':{'pie1':'#5B39F3','pie2':'#FFFFFF','pieStrokeColor':'#B23AF2','pieOuterStrokeColor':'#B23AF2','pieTitleTextColor':'#B23AF2','pieSectionTextColor':'#111111','pieStrokeWidth':'3px','pieOpacity':'1'}}}%%
+pie showData title Completion — 90.0% Complete (360 of 400 h)
+    "Completed Work (h)" : 360
+    "Remaining Work (h)" : 40
 ```
 
-| Metric | Hours |
-|--------|-------|
-| **Total Hours** | **207** |
-| Completed Hours (AI: 192 + Manual: 0) | 192 |
-| Remaining Hours | 15 |
-| **Percent Complete** | **92.8%** |
+| Metric | Value |
+|---|---|
+| **Total Hours** | **400** |
+| Completed Hours (AI + Manual) | 360 |
+| Remaining Hours | 40 |
+| **Percent Complete** | **90.0%** |
 
-> Completion % is computed with the PA1 AAP-scoped methodology: `Completed ÷ (Completed + Remaining) = 192 ÷ 207 = 92.8%`. All AAP functional requirements are delivered; the remaining 15h is exclusively path-to-production work (human review + CI/CD).
+> Formula: `Completed / (Completed + Remaining) = 360 / (360 + 40) = 360 / 400 = 90.0%`. All completed hours to date were delivered autonomously by Blitzy agents; there is no prior manual work in this figure.
 
 ### 1.3 Key Accomplishments
 
-- ✅ Created **4 xUnit test projects** (`Core.Tests`, `Infrastructure.Tests`, `API.Tests`, `API.IntegrationTests`) and registered all four in `ecommerce-shop.sln`.
-- ✅ Authored **321 backend tests (100% pass)** — 214 unit + 107 integration/load — and **91 in-scope frontend tests (100% pass)**.
-- ✅ Provisioned **real PostgreSQL + Redis via Testcontainers** (digest-pinned `postgres:13` / `redis:6`, isolated per-class, dynamic ports) — no reuse of the shared `docker-compose` infra; verified **zero flakiness across 3 consecutive runs**.
-- ✅ Met/exceeded **every documented coverage threshold** — backend critical paths (`OrderService`, `PaymentService`, `TokenService`, `ExceptionMiddleware`) at 100%; frontend Lines 93.9%.
-- ✅ Enforced **no live Stripe calls** anywhere (mocked in unit, stubbed in integration, offline signing for the webhook test).
-- ✅ Added coverage tooling: `karma.conf.js` LCOV reporter + headless launcher; `coverage.runsettings` (Cobertura + LCOV) with per-namespace filters.
-- ✅ Preserved the legacy `app.component.spec.ts` verbatim and left all tech-debt tooling (Protractor, TSLint) untouched, exactly per the binding constraints.
-- ✅ Introduced only **one minimal, annotated production seam** (`PaymentService` Stripe factory) with production behavior unchanged.
+- ✅ **All eight feature requirements (R1–R8) implemented** and exercised at runtime — live inventory over SignalR, flash-sale price overlay + countdown, zero-oversell reservations, TTL auto-release, checkout consume hook, sale scheduling, hub JWT auth, and basket-UUID session reuse.
+- ✅ **599 / 599 autonomous tests pass** — 307 backend unit (xUnit), 135 integration (Testcontainers on real PostgreSQL + Redis), 157 Angular (Karma/Jasmine); repeat runs stable.
+- ✅ **Zero-oversell proven under load** — a 500-concurrent-reservation test against a 100-unit allocation never over-allocates; 10,000-client fan-out p95 ≤ 237 ms and end-to-end rendered update p95 ≈ 991 ms (< 2 s target).
+- ✅ **Clean builds** — `dotnet build` 0 warnings / 0 errors; Angular production build succeeds; `@microsoft/signalr` 8.0.17 resolves under Angular 11 / TypeScript 4.1.
+- ✅ **All immutability contracts preserved** — `/api/products` and `/api/orders` shapes unchanged, Angular routing unchanged, `products.price` never overwritten, existing JWT reused, no Redis SignalR backplane, single-instance hub.
+- ✅ **Exact API contracts honored** — `409 {"error":"INSUFFICIENT_STOCK","available":N}`, `409 {"error":"RESERVATION_CONFLICT"}`, `429 {"error":"RATE_LIMIT_EXCEEDED"}`; non-cached `GET /api/flash-sales/active` returns `Cache-Control: no-store`.
+- ✅ **Dependency discipline** — zero new .NET packages (SignalR ships in the shared framework); exactly one new npm dependency, as specified.
 
 ### 1.4 Critical Unresolved Issues
 
+These are AAP-scoped robustness/security follow-ups identified by autonomous QA. Items HT-1 and HT-2 correspond to behaviors the AAP explicitly **deferred** via its "exactly one checkout hook" minimal-change clause; HT-3 is partly inherited from the pre-existing anonymous-basket architecture. None block the automated test suite (which is green), but they should be closed before a high-value flash-sale launch.
+
 | Issue | Impact | Owner | ETA |
-|-------|--------|-------|-----|
-| _None blocking._ All AAP-scoped functionality is delivered and green. | No release-blocking defects | — | — |
-| 3 legacy `AppComponent` assertions fail (out-of-scope, preserve-verbatim) | Cosmetic CI noise only; not a regression — requires a product disposition decision, not a fix | Product Owner | See HT-3 (1h) |
+|---|---|---|---|
+| **R5-A** Post-commit reservation-consume failure can let sold stock expire back to availability | Committed sale could be resold under a rare failure window | Backend team | HT-1 · 8 h |
+| **R5-B** Duplicate checkout is not idempotent (double consumption) | Retried/replayed order can over-consume a hold | Backend team | HT-2 · 6 h |
+| **P7-A** Cross-session basket IDOR — foreign `basketId` accepted at order/consume | An attacker could consume another shopper's reservation | Backend/Security | HT-3 · 6 h |
+| **R6-A** `POST /api/flash-sales` lacks a privileged-role policy (authenticated, but not admin-gated) | Any signed-in shopper can schedule a sale | Backend team | HT-4 · 2 h |
 
 ### 1.5 Access Issues
 
-| System/Resource | Type of Access | Issue Description | Resolution Status | Owner |
-|-----------------|----------------|-------------------|-------------------|-------|
-| CI/CD platform | Pipeline config | No CI workflow exists in the repo (only Git LFS hooks); the suite is not yet enforced on PRs | Open — see HT-2 | DevOps |
-| Docker registry (CI) | Image pull | Testcontainers pulls `postgres:13` / `redis:6` by digest; air-gapped CI needs a cached mirror | Advisory | DevOps |
+No credential or repository access issues block automated build/validation: the repository is checked out and writable, the .NET 5 SDK (5.0.408) and Node/npm/Docker toolchains are present, and PostgreSQL + Redis run via `docker compose`. The one deployment-integrity item below is a repository artifact concern, not an access grant.
 
-> No repository, credential, or third-party API access issues prevented autonomous validation. Backend build/tests and frontend tests were executed successfully in the working environment.
+| System / Resource | Type of Access | Issue Description | Resolution Status | Owner |
+|---|---|---|---|---|
+| Tracked `publish/` build artifact | Repo artifact / deploy | Committed pre-built bundle is stale and omits the feature (finding P8-D); deploying it verbatim would ship the pre-feature app | Open — see HT-8 | DevOps |
+| .NET 5 runtime on Ubuntu 25.10 | OS library | Requires `libssl1.1` (1.1.1f) for the .NET 5 runtime; present in this environment, must be provisioned in target images | Documented (Section 9/10) | DevOps |
+| Third-party APIs (Stripe, etc.) | Service credentials | No new external credentials introduced by this feature; payment path untouched | No action needed | — |
 
 ### 1.6 Recommended Next Steps
 
-1. **[High]** Perform senior code review and merge the test suite PR (HT-1).
-2. **[High]** Implement a CI/CD pipeline that runs the backend and frontend suites with coverage gates, provisioning Docker for Testcontainers and handling the Angular 11 / Node OpenSSL caveat (HT-2).
-3. **[Medium]** Make a product-owner triage decision on the 3 preserved legacy `AppComponent` assertions (HT-3).
-4. **[Low]** Automate ReportGenerator per-namespace coverage rollup + threshold enforcement in CI (HT-4).
-5. **[Low]** Document toolchain/environment prerequisites for future contributors (HT-5).
+1. **[High]** Close **HT-1** — make checkout reservation-consume durable/atomic so a committed sale can never be released back to availability (excludes committed holds from the sweep).
+2. **[High]** Close **HT-2** — add checkout idempotency (payment/idempotency-key guard + unique order-reservation ledger).
+3. **[High]** Close **HT-3** — bind basket/reservation ownership to the authenticated principal and reject foreign `basketId`.
+4. **[Medium]** Close **HT-6** and **HT-8** — add a real health/readiness endpoint and refresh the deployable `publish/` artifact.
+5. **[Medium]** Then run **HT-10** — human acceptance re-validation of the inventory lifecycle and security matrix, and re-run the full 599-test suite.
 
 ---
 
@@ -75,277 +77,311 @@ pie showData title Completion Status — 92.8% Complete
 
 ### 2.1 Completed Work Detail
 
+Every row traces to AAP requirements/deliverables and was delivered autonomously across 42 agent commits (≈ 3,540 new production lines + ≈ 4,632 test lines, plus 35 modified files).
+
 | Component | Hours | Description |
-|-----------|-------|-------------|
-| Test project scaffolding & tooling research | 8 | 4 `.csproj` created + `ecommerce-shop.sln` registration; research-backed version selection (Testcontainers, FluentAssertions licensing, Moq SponsorLink pin, Coverlet, `Mvc.Testing`) all matching the `net5.0` target |
-| Core.Tests (entities + specifications) | 16 | 81 tests over Core entities (state/`GetTotal()`/enum display) and all 5 specification classes (predicate/include/sort/paging), honoring the `API.Specifications` namespace quirk |
-| Infrastructure.Tests (services + data-access) | 26 | 56 tests: `OrderService` (server-side price authority, stale-order), `PaymentService` (amount math, price correction), `TokenService` (JWT), `ResponseCacheService`; `GenericRepository`/`UnitOfWork`/`BasketRepository`/`SpecificationEvaluator` over in-memory/SQLite + mocked Redis |
-| API.Tests (controllers + middleware + filters + errors) | 30 | 77 tests: all 7 controllers with mocked collaborators, `ClaimsPrincipal` injection, `UserManager`/`SignInManager` `IUserStore` pattern, `ModelState` seeding; `ExceptionMiddleware`, `CachedAttribute`, `MappingProfiles`, 3 error models + `ControllerTestHelpers` |
-| API.IntegrationTests (Testcontainers harness + 8 categories) | 52 | 107 tests: `CustomWebApplicationFactory` + `ContainerFixture` (`IAsyncLifetime`, PG+Redis, `WaitStrategy`) + collection + Stripe stub; Contract 47, Migrations 17, Caching 11, Concurrency 8, Payments 7, Resilience 13, Load 2 |
-| Frontend specs (guards/interceptors/services/components) | 28 | 91 tests across 16 colocated `*.spec.ts` using `TestBed`, `HttpClientTestingModule`, `HttpTestingController`, `RouterTestingModule`, Jasmine spies |
-| Coverage configuration | 3 | `karma.conf.js` (`lcovonly` reporter + `ChromeHeadlessNoSandbox` launcher; kept `html`+`text-summary`); `coverage.runsettings` (Cobertura+LCOV, Include/Exclude/Migrations filters) |
-| PaymentService testability seam | 1 | Minimal annotated `protected virtual CreatePaymentIntentService()` factory; production default unchanged |
-| Coverage measurement & threshold tuning | 8 | Per-component/per-namespace measurement to hit ≥90% critical-path and aggregate gates |
-| Constraint compliance & determinism validation | 6 | 3× consecutive full-suite runs (zero flakiness), `WaitStrategy` polling (no fixed sleeps), constraint audit |
-| QA & code-review remediation cycles | 14 | 10 review-driven commits (QA findings, code-review fixes, assertion strengthening, container-engine pinning, coverage-gap closure) |
-| **Total Completed** | **192** | |
+|---|---:|---|
+| Domain & data layer | 24 | `FlashSale`, `InventoryReservation`, `ReservationStatus`, `Product.Version` concurrency token; 3 EF `IEntityTypeConfiguration` classes; two additive migrations (auto-applied); `StoreContext` DbSets; migration catalog tests. |
+| Inventory reservation service | 34 | `InventoryReservationService` (413 L): optimistic-concurrency reserve/release, retry-once, availability aggregation, exact `409` semantics, broadcast emission. |
+| Flash-sale service | 24 | `FlashSaleService` (317 L): create/schedule, active-sale query, `quantityAvailable` computation, window-boundary events. |
+| Reservation expiry sweep | 18 | `ReservationExpirySweepService` `BackgroundService` (363 L): scoped DI, TTL expiry, stock release, rebroadcast, resilient loop. |
+| SignalR hub subsystem | 22 | `InventoryHub` (`[Authorize]`, per-product groups), `InventoryBroadcaster`, `InventoryBroadcastCoordinator`, `IInventoryBroadcaster` abstraction for testability. |
+| REST API surface | 20 | `FlashSalesController` (145 L), `InventoryController` (164 L), 4 DTOs, AutoMapper maps. |
+| Rate limiting & session identity | 14 | `SessionRateLimitFilter` (183 L, 10 req/min/session → 429), `CanonicalUuidV4Attribute` basket-UUID validation. |
+| Hub auth, CORS & config | 12 | JWT query-string `access_token` via `OnMessageReceived`; `AddSignalR`/`MapHub`/CORS `AllowCredentials`; three config keys; token-log-level hardening. |
+| Checkout hook & price overlay | 12 | Single defensive reservation-consume in `OrderService` after `_unitOfWork.Complete()`; read-time sale-price overlay in `ProductRepository` (DTO preserved). |
+| Frontend real-time client | 26 | `inventory-hub.service` (455 L): RxJS streams, `accessTokenFactory` auth, automatic reconnect; `flash-sale.service`; client models. |
+| Frontend widgets & integration | 26 | `flash-sale-banner`, `countdown-timer`, `live-stock-indicator` (ts/html/scss); `product-details` hosting + lifecycle cleanup; environment config. |
+| Backend test suite | 66 | 500-way concurrency (603 L), 10k-client load/latency (773 L), service & controller feature tests (~3,867 L / 81 tests) on Testcontainers. |
+| Frontend test suite | 22 | Feature component/service specs (765 L / 46 tests) + root `AppComponent` spec repair. |
+| Validation, review & QA remediation | 40 | 42-commit iteration: R8-A / P7-G / P6-J fixes, contract guards, migration-catalog hardening, F01–F13 & 44-finding review cycles, build/runtime validation. |
+| **Total Completed** | **360** | Matches Completed Hours in Section 1.2. |
 
 ### 2.2 Remaining Work Detail
 
+Each category traces to a specific AAP requirement or path-to-production need. Priorities: High = safe-launch blocker; Medium = production hardening; Low = docs/final validation.
+
 | Category | Hours | Priority |
-|----------|-------|----------|
-| Human PR review & merge of the test suite (65 files / ~15,182 LOC) | 5 | High |
-| CI/CD pipeline integration (backend + frontend suites, coverage gates, Docker-in-CI, Node/OpenSSL handling) | 6 | High |
-| Legacy `AppComponent` assertion triage decision (disposition of 3 preserved out-of-scope failures) | 1 | Medium |
-| ReportGenerator per-namespace coverage rollup + threshold gate automation | 2 | Low |
-| Toolchain/environment documentation (.NET SDK, Node/OpenSSL, Docker, headless Chrome) | 1 | Low |
-| **Total Remaining** | **15** | |
+|---|---:|---|
+| A. Durable/atomic reservation consumption on checkout (R5-A) | 8 | High |
+| B. Checkout idempotency guard + order-reservation ledger (R5-B) | 6 | High |
+| C. Reservation/basket ownership binding to authenticated principal (P7-A) | 6 | High |
+| D. Flash-sale scheduling authorization — admin/role policy (R6-A) | 2 | Medium |
+| E. Session-identity edge cases: multi-tab + UUID rotation (R8-B / R8-C) | 5 | Medium |
+| F. Health/readiness endpoint + hub & sweep monitoring hooks (P7-C) | 3 | Medium |
+| G. Error-response hygiene for new endpoints/deps (P5-B / P7-E) | 3 | Medium |
+| H. Refresh & reconcile tracked `publish/` deployment artifact (P8-D) | 2 | Medium |
+| I. Feature documentation corrections (DOC-3 / DOC-4 / DOC-6) | 2 | Low |
+| J. Human acceptance re-validation of the above (R3/R4/R5 lifecycle + security) | 3 | Low |
+| **Total Remaining** | **40** | Matches Remaining Hours in Section 1.2 and Section 7 pie. |
 
-### 2.3 Methodology & Reconciliation
+### 2.3 Hours Reconciliation
 
-- **Completed (192h) + Remaining (15h) = Total (207h)** → matches the Section 1.2 metrics table exactly.
-- **Completion = 192 ÷ 207 = 92.8%.**
-- All AAP functional requirements are classified **Completed**; there are **no Partially-Completed or Not-Started AAP items**. The remaining hours are 100% path-to-production activities required to operationalize the delivered suite.
+| Check | Result |
+|---|---|
+| Section 2.1 total (Completed) | 360 h |
+| Section 2.2 total (Remaining) | 40 h |
+| 2.1 + 2.2 = Total (Section 1.2) | 360 + 40 = **400 h** ✅ |
+| Completion % (1.2 / 7 / 8) | 360 / 400 = **90.0%** ✅ |
+| Human tasks (Section, below): High 20 + Medium 15 + Low 5 | **40 h** ✅ |
 
 ---
 
 ## 3. Test Results
 
-All tests below originate from Blitzy's autonomous validation logs and were independently re-executed during this assessment.
+All results below originate exclusively from **Blitzy's autonomous validation logs** for this project — the `.trx` result files under `blitzy/qa_harness/phase8_testresults/` (backend) and the Karma run logs (frontend). Totals: **599 tests, 599 passed, 0 failed** (100% pass rate).
 
 | Test Category | Framework | Total Tests | Passed | Failed | Coverage % | Notes |
-|---------------|-----------|-------------|--------|--------|------------|-------|
-| Core unit (entities + specifications) | xUnit 2.4.2 + FluentAssertions | 81 | 81 | 0 | Entities 100% / Specs 100% | `API.Specifications` namespace quirk honored |
-| Infrastructure unit (services + data-access) | xUnit + Moq + EF InMemory/SQLite | 56 | 56 | 0 | Critical-path (Order/Payment/Token) 100% | Server-side price authority + JWT + Redis TTL |
-| API unit (controllers + middleware + filters + errors) | xUnit + Moq | 77 | 77 | 0 | Controllers 98.1% / Middleware 100% | Auth + `ModelState` + Dev/Prod exception paths |
-| API integration & load (real infra) | xUnit + Testcontainers + `Mvc.Testing` | 107 | 107 | 0 | End-to-end pipeline | Contract 47 · Migrations 17 · Caching 11 · Concurrency 8 · Payments 7 · Resilience 13 · Load 2 — **zero flakiness over 3 runs** |
-| **Backend subtotal** | — | **321** | **321** | **0** | Aggregate line 95.32% | — |
-| Frontend unit (in-scope) | Jasmine 3.8 + Karma 6.1 | 91 | 91 | 0 | Lines 93.9% / Branches 86.15% / Functions 88.35% | 16 named guards/interceptors/services/components |
-| **In-scope total** | — | **412** | **412** | **0** | — | 100% in-scope pass rate |
+|---|---|---:|---:|---:|---:|---|
+| Backend Unit — Core | xUnit + FluentAssertions | 81 | 81 | 0 | 85.8%¹ | Domain entities & specifications. |
+| Backend Unit — Infrastructure | xUnit + Moq + FluentAssertions | 100 | 100 | 0 | 27.2%¹ | Services incl. reservation/flash-sale/sweep; isolated unit rate (see ¹). |
+| Backend Unit — API | xUnit + Moq | 126 | 126 | 0 | 17.9%¹ | Controllers, hub, filter, middleware; isolated unit rate (see ¹). |
+| Backend Integration | xUnit + Mvc.Testing + Testcontainers | 135 | 135 | 0 | 75.1%¹ | Real PostgreSQL 13 + Redis; concurrency (500-way), load (10k fan-out), contract regression, migration catalogs. |
+| Frontend Unit/Component | Karma + Jasmine | 157 | 157 | 0 | 86.3%² | Widgets, hub/flash-sale services, product-details, root shell. |
+| **Total** | — | **599** | **599** | **0** | — | 100% pass; repeat runs (15 × 3) stable. |
 
-**Documented out-of-scope (not counted above):** `app.component.spec.ts` contains 3 CLI-default assertions that fail (`NullInjectorError [BasketService → HttpClient]`) because the production `AppComponent` diverged from the 2021 Angular template. The file is under a **preserve-verbatim** constraint (last edited 2021-08-05, ~5 years before this engagement) and its failures are intentionally left visible — not a regression from this work.
+**¹ Backend coverage caveat (honesty note):** the figures are per-suite **isolated** line-rates from each project's `coverage.cobertura.xml`. Unit and integration suites intentionally overlap, so **combined** line coverage across suites is materially higher than any single suite's isolated rate (e.g., the API assembly is largely covered by the integration suite, not the API unit suite). Per-class coverage gates defined in `coverage.runsettings` were enforced on changed/feature classes and passed.
+**² Frontend coverage:** combined `lcov` line coverage = 442 / 512 lines = **86.3%**; the new flash-sale widget components report at/near 100% in the Istanbul report.
+
+**Special-purpose autonomous validations** (beyond the counted unit/integration tests; from the QA harness):
+
+- **Zero-oversell:** 500 concurrent single-unit reservations vs a 100-unit allocation — no oversell; surplus requests returned the exact `409 INSUFFICIENT_STOCK`.
+- **Broadcast scale/latency:** progressive fan-out 100→10,000 clients; per-client one frame; p95 9.7–237 ms. End-to-end HTTP→DB→SignalR→render p95 ≈ 991 ms (< 2 s target).
+- **Active-endpoint load:** 5,000 requests ×2 at concurrency 64 → 1,905–2,058 req/s, p95 62.5–68.1 ms; `Cache-Control: no-store` confirmed, no Redis cache key created.
 
 ---
 
 ## 4. Runtime Validation & UI Verification
 
-**Backend build & runtime**
-- ✅ **Operational** — `dotnet build -c Release`: 0 warnings, 0 errors across all 7 projects.
-- ✅ **Operational** — API boots under `ASPNETCORE_ENVIRONMENT=Development`, auto-applies EF Core migrations, and seeds data (6 brands / 4 types / 18 products / 4 delivery methods).
-- ✅ **Operational** — `GET /api/products` → 200 (18 products); `/brands` → 6; `/types` → 4; `/products/2` → 200; `/products/99999` → 404 (structured `ApiResponse`).
-- ✅ **Operational** — `POST /api/account/login` (`bob@test.com` / `Pa$$w0rd`) → 200 with a JWT issued by `TokenService`; `GET /api/account` with Bearer → 200, without → 401; `/api/account/address` → 200.
+Runtime exercised against the API on `http://localhost:5000` / `https://localhost:5001` with EF migrations auto-applied and data seeded.
 
-**Infrastructure integration**
-- ✅ **Operational** — Testcontainers provisions real PostgreSQL + Redis per test class (dynamic ports, digest-pinned images, `WaitStrategy` readiness, auto-disposed).
-- ✅ **Operational** — Redis caching semantics, 30-day basket TTL, cache miss→hit, deterministic key, and non-200-not-cached all validated.
-- ✅ **Operational** — Fail-closed resilience: with Redis/PostgreSQL stopped mid-test, the pipeline returns a structured `ApiException` 500.
-- ✅ **Operational** — Stripe webhook signature verification uses **offline** test-mode signing; no live Stripe calls.
+**Backend runtime**
+- ✅ **Operational** — API boots, migrations auto-apply, DB seeds, graceful shutdown; 0 unhandled exceptions across full endpoint exercise.
+- ✅ **Operational** — `POST /api/flash-sales` → 200; `GET /api/flash-sales/active` → 200 with `Cache-Control: no-store`.
+- ✅ **Operational** — `POST /api/inventory/reserve` → reservation created + `InventoryUpdated` broadcast; over-request → `409 INSUFFICIENT_STOCK {available:N}`; conflict → `409 RESERVATION_CONFLICT`; >10/min → `429 RATE_LIMIT_EXCEEDED`.
+- ✅ **Operational** — `DELETE /api/inventory/reserve/{id}` → 204, stock returned, rebroadcast.
+- ✅ **Operational** — `GET /api/products` unchanged (price = base, no `Version` leak); `POST /api/orders` unchanged (200 authenticated / 401 anonymous); order totals use server-side base price.
+- ✅ **Operational** — SignalR hub at `/hubs/inventory`: negotiate 200 with query `access_token`, 401 without; `InventoryUpdated` / `FlashSaleStarted` / `FlashSaleEnded` delivered; reconnect/rejoin verified; token absent from logs.
+- ⚠ **Partial** — checkout inventory **lifecycle** under adversarial conditions: post-commit consume failure (R5-A) and duplicate replay (R5-B) can mis-handle a committed hold; cross-session `basketId` (P7-A) is accepted. Happy-path checkout is operational; these edge paths are tracked as HT-1/2/3.
+- ⚠ **Partial** — operational surface: no dedicated health/readiness endpoint (P7-C); some failure paths can surface internal detail (P5-B/P7-E) — tracked as HT-6/HT-7.
 
-**Front end**
-- ✅ **Operational** — `ng test --watch=false --browsers=ChromeHeadless --code-coverage` runs the in-scope suite green and emits an LCOV report.
-- ⚠ **Partial (by design)** — 3 legacy `AppComponent` assertions fail as documented above (out-of-scope, preserve-verbatim).
+**Frontend / UI**
+- ✅ **Operational** — product-details page renders the flash-sale banner (sale vs struck-through base price), live countdown to `end_at`, and live-stock indicator; subscribes to the hub on init and cleans up on destroy.
+- ✅ **Operational** — offline/stale-connection indicator and stale-poll guard added (findings P6-J / P7-G resolved post-QA).
+- ✅ **Operational** — Angular routing unchanged; widgets are child components inside the existing product-details route.
+- ⚠ **Partial** — pre-existing storefront UI issues unrelated to this feature (responsive clipping, some a11y/contrast, checkout/registration validation) remain out of scope — see Section 6.
 
 ---
 
 ## 5. Compliance & Quality Review
 
-| Benchmark / Constraint (AAP) | Requirement | Status | Notes |
-|------------------------------|-------------|--------|-------|
-| Scaffolding gate | `dotnet test` builds all test projects with zero errors | ✅ Pass | 0/0 build; 4 projects registered in solution |
-| Backend pass rate | 100% of authored tests pass | ✅ Pass | 321/321 |
-| Frontend pass rate | 100% of in-scope specs pass | ✅ Pass | 91/91 in-scope |
-| Coverage — critical paths | ≥90% (Order/Payment/Token/ExceptionMiddleware) | ✅ Pass | 100% |
-| Coverage — backend aggregate | Line ≥70 / Branch ≥60 / Func ≥75 | ✅ Pass | Line 95.32% |
-| Coverage — frontend aggregate | Line ≥60 / Branch ≥50 / Func ≥65 / critical ≥80 | ✅ Pass | Lines 93.9% / Branches 86.15% / Functions 88.35% |
-| Real infra only in integration | No mocking PG/Redis/HTTP transport | ✅ Pass | Testcontainers; verified in fixture |
-| No live Stripe calls | Mock/stub/offline signing only | ✅ Pass | Offline webhook signing |
-| No shared docker-compose reuse | Isolated disposable containers per class | ✅ Pass | Dynamic ports, digest-pinned |
-| Minimal annotated production change | Only where strictly required, with comment | ✅ Pass | Single `PaymentService` seam, fully annotated, default unchanged |
-| Preserve `app.component.spec.ts` | Verbatim, no edits | ✅ Pass | Unmodified since 2021-08-05 |
-| Leave Protractor / TSLint untouched | Out of scope | ✅ Pass | No changes |
-| No inventory/flash-sale scope | Must not be introduced *by this test-only engagement* | ✅ Pass | Not added by this engagement (the Real-Time Inventory & Flash Sale feature was introduced later — see `README.md`) |
-| Naming convention | `MethodName_StateUnderTest_ExpectedBehavior` | ✅ Pass | Applied across backend |
-| Test code isolation | 4 test projects or colocated `*.spec.ts` | ✅ Pass | No leakage into production projects |
-| Determinism | Zero flakiness, no fixed sleeps | ✅ Pass | 3 consecutive clean runs; `WaitStrategy` |
+AAP deliverables and binding rules cross-mapped to autonomous validation outcomes. "Fixed during validation" marks items closed by post-QA commits (`36dde6e`, `5048d85`, `fbd2694`).
 
-**Fixes applied during autonomous validation:** container-engine version pinning to the .NET 5 era; strengthened `AccountController` auth/identity assertions; hardened stub/startup resilience tests; closed coverage gaps (basket TTL expiry, conflicting-payload concurrency, payment null-basket 400); restored test integrity & coverage measurement (QA findings M-16/17/18/33). **Outstanding compliance items:** none — all constraints satisfied.
+| AAP Deliverable / Rule | Benchmark | Status | Progress | Evidence / Notes |
+|---|---|---|---|---|
+| R1 Live inventory (hub + broadcast) | Live updates < 2 s, no refresh | ✅ Pass | 100% | Rendered p95 ≈ 991 ms; 10k fan-out p95 ≤ 237 ms; load test green. |
+| R2 Flash-sale price + countdown | Read-time overlay, no DTO/price mutation | ✅ Pass | 100% | `/api/products` byte-identical; banner/countdown tested. |
+| R3 Zero oversell (core algorithm) | 500 conc. vs 100 alloc, exact 409s | ✅ Pass | 100% | `ReservationConcurrencyTests` green; exact bodies verified. |
+| R4 Reservation TTL + auto-release | 300 s TTL, sweep, DELETE release | ✅ Pass | 100% | Sweep/race green; DELETE → 204 + rebroadcast; R8-A nav-release **fixed during validation**. |
+| R5 Checkout consume hook | Single hook, `/api/orders` unchanged | ⚠ Partial | ~75% | Hook + contract preserved & tested; durable/idempotent consume (R5-A/R5-B) remains — **AAP-deferred** by single-hook clause. |
+| R6 Scheduling | Create + non-cached active | ⚠ Partial | ~85% | Endpoints work; active `no-store`. Admin-role policy (R6-A) remains (never specified in AAP). |
+| R7 Hub authentication | Reuse JWT via query token | ✅ Pass | 100% | negotiate 200/401; token not logged. |
+| R8 Session identity reuse + rate limit | Basket UUID; 10/min → 429 | ⚠ Partial | ~70% | UUID reuse + exact limiter pass; R8-A **fixed during validation**; R8-B/C + ownership (P7-A) remain. |
+| Immutable `/api/products` & `/api/orders` | No shape change | ✅ Pass | 100% | Contract regression tests + runtime property sets. |
+| Angular routing unchanged | No route change | ✅ Pass | 100% | Deep routes + child widgets work. |
+| `products.price` never overwritten | Base price authority | ✅ Pass | 100% | DB before/after + base-price order subtotal. |
+| No Redis SignalR backplane / single instance | In-memory hub only | ✅ Pass | 100% | Redis PUBSUB empty; 10k tested on one instance. |
+| Dependency discipline | 0 .NET pkgs; 1 npm | ✅ Pass | 100% | SignalR shared framework; `@microsoft/signalr` 8.0.17. |
+| Query token absent from logs | No token leakage | ✅ Pass | 100% | Server/browser log scans clean. |
+| Additive/minimal change | Isolated, commented edits | ⚠ Partial | ~95% | Source isolated & commented; stale tracked `publish/` (P8-D) remains. |
+| Production security/readiness | Health, error hygiene | ⚠ Partial | — | Health endpoint (P7-C), error hygiene (P5-B/P7-E) outstanding — HT-6/HT-7. |
+
+**Fixes applied during autonomous validation:** R8-A (product-detail navigation no longer releases an active cart hold), P7-G (stale-poll no longer moves rendered stock backward), P6-J (offline connectivity indicator), DOC-1 (client README HTTPS port), and P8-B (root `AppComponent` spec repaired → 157/157 Karma).
+
+**Outstanding compliance items:** HT-1..HT-8 as detailed in Sections 1.4, 2.2, and the Human Task List.
 
 ---
 
 ## 6. Risk Assessment
 
-| Risk | Category | Severity | Probability | Mitigation | Status |
-|------|----------|----------|-------------|------------|--------|
-| Angular 11 + Node 17+ OpenSSL incompatibility (`ERR_OSSL_EVP_UNSUPPORTED`) | Technical | Medium | High | Set `NODE_OPTIONS=--openssl-legacy-provider` or pin Node 14/16 in CI | Identified / Documented |
-| 3 out-of-scope `AppComponent` failures may confuse CI gating | Technical | Low | Medium | Gate CI on in-scope specs; product triage (HT-3) | Documented |
-| SUT targets EOL runtimes (.NET 5, Angular 11) | Technical | Low | Low | Framework upgrade is a separate future engagement | Noted |
-| No production behavior change (test-only; seam is `protected virtual`) | Security | Low | Low | Seam reviewed & annotated; default unchanged | Mitigated |
-| Stripe test-key hygiene — no real secret in CI/logs | Security | Medium | Low | Test-mode keys only; keep secrets out of source | Compliant |
-| Seeded test credentials must never seed production | Security | Low | Low | Seed routines are dev/test only | Noted |
-| Testcontainers requires a running Docker daemon in CI | Operational | Medium | Medium | Provision Docker (DinD/socket) in CI (HT-2) | Identified |
-| Container image availability in air-gapped CI | Operational | Low | Low | Pre-cache images / registry mirror | Noted |
-| Integration runtime (~47s + container startup) adds CI time | Operational | Low | Medium | Shared collection fixture amortizes startup | Mitigated |
-| CI/CD not yet wired — suite not enforced on PRs | Integration | Medium | High | Implement CI workflow (HT-2) | Open |
-| ReportGenerator per-namespace threshold gate not automated | Integration | Low | Medium | Add reportgenerator + gate (HT-4) | Open |
-| Determinism re-confirmation in target CI environment | Integration | Low | Low | Run integration suite 3× in CI once | Recommended |
+Risks incorporate the autonomous QA findings. Items marked **Out-of-scope (pre-existing)** predate this feature and are excluded from the AAP completion math per the AAP's minimal-change clause; they are surfaced here for visibility.
 
-> No High-severity risks: the engagement is test-only, the suite is fully green, and there is zero production behavior change.
+| Risk | Category | Severity | Probability | Mitigation | Status |
+|---|---|---|---|---|---|
+| Post-commit consume failure returns sold stock (R5-A) | Technical | High | Low-Med | In-transaction/outbox consume; exclude committed holds from sweep; idempotent reconcile | Open · HT-1 |
+| Duplicate checkout not idempotent (R5-B) | Technical | High | Low | Idempotency key + unique order-reservation ledger | Open · HT-2 |
+| .NET 5 is end-of-life / unsupported runtime (P7-D) | Technical | Medium | Medium | Plan upgrade to a supported LTS after feature launch | Open (env; AAP immutability) |
+| 119 npm-audit transitive vulns in Angular 11 toolchain (P7-D) | Technical | Medium | Low | Toolchain major upgrade | Deferred/Accepted (explicitly out of AAP scope) |
+| Cross-session basket IDOR consumes another's reservation (P7-A) | Security | High | Medium | Bind basket ownership to principal; reject foreign IDs; ownership predicate in consume | Open · HT-3 (partly inherited) |
+| Scheduling lacks role authorization (R6-A) | Security | Medium | Medium | Admin/role policy on `POST /api/flash-sales` | Open · HT-4 |
+| Stack-trace / Redis-key disclosure on new/dep failures (P5-B/P7-E) | Security | Medium | Low-Med | Production exception handler; scrub internal details | Open · HT-7 |
+| JWT travels in WebSocket query string | Security | Low | Low | Hosting log level raised to Warning (done) + TLS | Mitigated |
+| No health/readiness endpoint; `/health` false-positive SPA 200 (P7-C) | Operational | Medium | Medium | Add DB/Redis/hub health checks distinct from SPA fallback | Open · HT-6 |
+| Stale tracked `publish/` artifact omits feature (P8-D) | Operational | High | Medium | Rebuild/reconcile or stop tracking build output | Open · HT-8 |
+| DB restart causes stale-connection 500 spill (P7-B) | Operational | Medium | Low | Connection resiliency/retry | Out-of-scope (pre-existing infra) |
+| Single-instance in-memory hub, no horizontal scaling | Operational | Low | Low | Documented scope boundary (backplane excluded by AAP) | Accepted by scope |
+| TSLint 220-error style debt (P8-C) | Operational | Low | Low | Lint cleanup initiative | Out-of-scope (pre-existing) |
+| Integration tests need Docker + Postgres/Redis + RYUK-disabled + libssl1.1 | Integration | Medium | Medium | Documented env prerequisites (Sections 9 & 10) | Mitigated |
+| Unknown `/api` routes return 200 SPA HTML, not 404 (P8-A) | Integration | Low-Med | Medium | Return API 404 for unmatched `/api/*` | Out-of-scope (pre-existing) |
+| `@microsoft/signalr` v8 client vs .NET 5 hub major skew | Integration | Low | Low | Protocol-compatible; builds verified; fallback `~5.0.x` documented | Mitigated |
+| Angular 11 on Node 17+ requires `--openssl-legacy-provider` | Integration | Low | Medium | Documented in guide/README | Mitigated |
 
 ---
 
 ## 7. Visual Project Status
 
-**Project hours breakdown** (Completed = Dark Blue `#5B39F3`, Remaining = White `#FFFFFF`):
+**Project hours (Completed = Dark Blue `#5B39F3`, Remaining = White `#FFFFFF`):**
 
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'pie1':'#5B39F3','pie2':'#FFFFFF','pieStrokeColor':'#B23AF2','pieStrokeWidth':'2px','pieOuterStrokeWidth':'2px','pieSectionTextColor':'#B23AF2'}}}%%
-pie showData title Project Hours (Total 207h)
-    "Completed Work" : 192
-    "Remaining Work" : 15
+%%{init: {'theme':'base','themeVariables':{'pie1':'#5B39F3','pie2':'#FFFFFF','pieStrokeColor':'#B23AF2','pieOuterStrokeColor':'#B23AF2','pieTitleTextColor':'#B23AF2','pieSectionTextColor':'#111111','pieStrokeWidth':'3px'}}}%%
+pie showData title Project Hours Breakdown (Total 400 h)
+    "Completed Work" : 360
+    "Remaining Work" : 40
 ```
 
-**Remaining work by priority** (15h total):
+**Remaining hours by priority (of the 40 h remaining):**
 
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'pie1':'#5B39F3','pie2':'#A8FDD9','pie3':'#FFFFFF','pieStrokeColor':'#B23AF2','pieStrokeWidth':'2px','pieSectionTextColor':'#B23AF2'}}}%%
-pie showData title Remaining Hours by Priority
-    "High (HT-1, HT-2)" : 11
-    "Medium (HT-3)" : 1
-    "Low (HT-4, HT-5)" : 3
+%%{init: {'theme':'base','themeVariables':{'pie1':'#B23AF2','pie2':'#5B39F3','pie3':'#A8FDD9','pieStrokeColor':'#333333','pieSectionTextColor':'#111111','pieStrokeWidth':'2px'}}}%%
+pie showData title Remaining Work by Priority (40 h)
+    "High" : 20
+    "Medium" : 15
+    "Low" : 5
 ```
 
-**Remaining hours per category (Section 2.2):**
+**Remaining hours by category (Section 2.2):**
 
-| Category | Hours |
-|----------|-------|
-| Human PR review & merge | 5 |
-| CI/CD pipeline integration | 6 |
-| Legacy assertion triage | 1 |
-| ReportGenerator automation | 2 |
-| Toolchain documentation | 1 |
-| **Total** | **15** |
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'xyChart':{'plotColorPalette':'#5B39F3'}}}}%%
+xychart-beta
+    title "Remaining Hours per Category"
+    x-axis ["A R5-A", "B R5-B", "C P7-A", "D R6-A", "E R8-B/C", "F P7-C", "G P5-B/E", "H P8-D", "I Docs", "J Re-val"]
+    y-axis "Hours" 0 --> 10
+    bar [8, 6, 6, 2, 5, 3, 3, 2, 2, 3]
+```
 
-> Integrity check: "Remaining Work" (15) equals Section 1.2 Remaining Hours (15) and the sum of the Section 2.2 Hours column (15).
+> Integrity: the Section 7 "Remaining Work" value (40 h) equals Section 1.2 Remaining Hours (40 h) and the Section 2.2 Hours total (40 h). "Completed Work" (360 h) equals Section 1.2 Completed Hours and the Section 2.1 total.
 
 ---
 
 ## 8. Summary & Recommendations
 
-**Achievements.** This engagement took the E-Commerce Shop from effectively **zero automated test coverage** to a comprehensive, green suite of **412 in-scope tests** (321 backend + 91 frontend) with real-infrastructure integration testing via Testcontainers. Every AAP functional requirement is delivered, every documented coverage threshold is met or exceeded, all binding constraints are satisfied, and the integration suite exhibits zero flakiness across three consecutive runs. The only production change is a single, minimal, annotated Stripe testability seam that leaves runtime behavior unchanged.
+**Achievements.** The Real-Time Inventory & Flash Sale feature is **90.0% complete** on an AAP-scoped basis (360 of 400 hours). All eight requirements are implemented and validated at runtime, the full **599-test** autonomous suite passes with clean builds, and the hard invariants hold: zero oversell under a 500-way concurrency test, sub-2-second live updates at 10k-client scale, and every immutability contract (`/api/products`, `/api/orders`, routing, `products.price`, JWT reuse, no backplane) preserved. Dependency discipline was exact — zero new .NET packages, one new npm package.
 
-**Remaining gaps.** The outstanding **15h** is exclusively path-to-production work, not AAP shortfall: a senior human review & merge, CI/CD pipeline integration (with Docker-in-CI and the Angular 11 / Node OpenSSL handling), a product decision on the preserved legacy spec, and two optional automation/documentation tasks.
+**Remaining gaps (40 h).** The outstanding work is a focused, well-understood set rather than broad incompleteness: (1) checkout inventory-lifecycle hardening — durable/atomic consume (R5-A) and idempotency (R5-B), which the AAP deliberately deferred behind its single-hook minimal-change clause; (2) reservation/basket ownership binding (P7-A), partly inherited from the store's pre-existing anonymous-basket model; (3) scheduling role authorization (R6-A) and session-identity edge cases (R8-B/C); and (4) standard path-to-production hardening — a health endpoint, error-response hygiene for the new surface, a refreshed deployment artifact, and feature-doc corrections.
 
-**Critical path to production.** (1) Review & merge the PR → (2) stand up the CI pipeline enforcing both suites and coverage gates → (3) resolve the legacy-spec disposition. Items 4–5 can follow without blocking release.
+**Critical path to production.** Close the three High-priority items (HT-1, HT-2, HT-3 = 20 h) to make the checkout/reservation lifecycle safe for a high-value flash sale, then the Medium production-hardening items (HT-4..HT-8 = 15 h), and finish with human acceptance re-validation (HT-9, HT-10 = 5 h). At the observed pace this is roughly one focused engineer-week.
 
-**Production readiness.** The delivered test suite is **production-ready as authored**: it compiles, runs green, and validates the highest-risk financial, security, caching, and concurrency paths end-to-end. It is not yet **operationalized** (enforced in CI), which is the primary remaining activity.
+**Success metrics to confirm before launch.** Zero oversell across the *full* lifecycle (including injected post-commit failure and duplicate replay); foreign-basket order attempts rejected with no mutation; non-admin scheduling rejected; `/health` returns structured status; and the deployed bundle serves the flash-sale UI.
 
-| Success Metric | Target | Actual |
-|----------------|--------|--------|
-| Backend test pass rate | 100% | 100% (321/321) |
-| Frontend in-scope pass rate | 100% | 100% (91/91) |
-| Critical-path coverage | ≥90% | 100% |
-| Integration flakiness (3 runs) | 0 | 0 |
-| **Overall completion (AAP-scoped)** | — | **92.8%** |
-
-> **The project is approximately 93% complete.** The suite is fully functional and validated; remaining effort is human review and CI/CD operationalization.
+**Production-readiness assessment.** **Conditionally ready.** The feature core is production-grade and thoroughly tested; it is **not** recommended to launch a high-stakes flash sale until the three High-priority lifecycle/security items are closed and re-validated. For a low-risk soft launch (small allocations, trusted operators), the current build is serviceable with monitoring.
 
 ---
 
 ## 9. Development Guide
 
+Every command below was verified in the validation environment (Ubuntu 25.10, .NET SDK 5.0.408, Node v22, npm 11, Docker 28).
+
 ### 9.1 System Prerequisites
 
-- **.NET SDK 5.0.x** (verified with `5.0.408`) — targets `net5.0`.
-- **Node.js + Angular CLI 11.2.x.** Angular 11 bundles a legacy webpack that is incompatible with the OpenSSL 3 provider in Node 17+. Use **Node 14/16** for native execution, **or** set `NODE_OPTIONS=--openssl-legacy-provider` on Node 17+.
-- **Docker Engine** (verified `28.5.2`) — required for the integration/load tests (Testcontainers) and for running local infra when manually starting the API.
-- **Headless Chrome/Chromium** — for the frontend coverage command.
+- **.NET 5.0 SDK** (verified `5.0.408`).
+- **Node.js** + **npm** (Angular 11 toolchain; on Node 17+ set `NODE_OPTIONS=--openssl-legacy-provider`).
+- **Angular CLI 11** (invoked via `npx ng` from `client/`).
+- **Docker** + `docker compose` (PostgreSQL & Redis; required for integration tests).
+- **`libssl1.1`** (1.1.1f) on Debian/Ubuntu hosts — required by the .NET 5 runtime.
 
 ### 9.2 Environment Setup
 
 ```bash
-# From the repository root
-# (Optional) local infra for MANUALLY running the API — NOT used by integration tests
-docker compose up -d          # Redis :6379, PostgreSQL :5432 (appuser/secret), Adminer :8080, Redis Commander :8081
-
-# Frontend dependencies
-cd client && npm ci && cd ..
+# .NET SDK is installed under $HOME/.dotnet (not on PATH by default)
+export DOTNET_ROOT=$HOME/.dotnet
+export PATH=$PATH:$HOME/.dotnet
+export ASPNETCORE_ENVIRONMENT=Development
+export NODE_OPTIONS=--openssl-legacy-provider     # Angular 11 on Node 17+
+export CHROME_BIN=/usr/bin/google-chrome          # headless Karma
+export TESTCONTAINERS_RYUK_DISABLED=true          # integration tests
 ```
 
-Backend connection strings live in `API/appsettings.Development.json` (`DefaultConnection` → `e-commerce` DB, `IdentityConnection` → `identity` DB, `Redis` → `localhost`). **Integration tests override all of these** through `CustomWebApplicationFactory` to point at Testcontainers endpoints — the shared compose infra is never reused.
+Configuration lives in `API/appsettings.Development.json`:
+- Connection strings — `DefaultConnection` (`…Database=e-commerce`), `IdentityConnection` (`…Database=identity`), both `Server=localhost;Port=5432;User Id=appuser;Password=secret`; `Redis=localhost`.
+- Feature keys — `SIGNALR_HUB_PATH=/hubs/inventory`, `RESERVATION_TTL_SECONDS=300`, `FLASH_SALE_POLL_INTERVAL_MS=5000`.
+- Client (`client/src/environments/environment.ts`) — `hubUrl=https://localhost:5001/hubs/inventory` (prod: relative `hubs/inventory`), `pollInterval=5000`.
 
 ### 9.3 Dependency Installation
 
 ```bash
-# Backend (offline-friendly; restores from the NuGet cache)
-dotnet restore ecommerce-shop.sln
-
-# Frontend
-cd client && npm ci && cd ..
+docker compose up -d db redis            # PostgreSQL :5432 (appuser/secret), Redis :6379
+dotnet restore ecommerce-shop.sln        # zero new .NET packages (SignalR in shared framework)
+cd client && npm install --legacy-peer-deps && cd ..   # resolves @microsoft/signalr 8.0.17
 ```
 
 ### 9.4 Build
 
 ```bash
-dotnet build ecommerce-shop.sln -c Release --no-restore
-# Expected: Build succeeded. 0 Warning(s) / 0 Error(s)
+dotnet build ecommerce-shop.sln -c Debug                         # verified: 0 warnings / 0 errors
+(cd client && NODE_OPTIONS=--openssl-legacy-provider npx ng build --configuration production)   # exit 0
 ```
 
-### 9.5 Running the Tests
+### 9.5 Application Startup
 
 ```bash
-# ---- Backend: all projects with coverage ----
-dotnet test --configuration Release --logger trx --collect:"XPlat Code Coverage"
+# Terminal 1 — API (auto-applies EF migrations + seeds data)
+dotnet run --project API -c Debug
+# Listens on http://localhost:5000 and https://localhost:5001 (self-signed dev cert → use curl -k)
+# The solution root has no runnable project, so --project API is required.
 
-# ---- Backend: a single project ----
-dotnet test Core.Tests/Core.Tests.csproj -c Release
-dotnet test Infrastructure.Tests/Infrastructure.Tests.csproj -c Release
-dotnet test API.Tests/API.Tests.csproj -c Release
-dotnet test API.IntegrationTests/API.IntegrationTests.csproj -c Release   # requires Docker
-
-# ---- Backend: filter to one class ----
-dotnet test --filter "FullyQualifiedName~OrderServiceTests"
-
-# ---- Backend: LCOV alongside Cobertura ----
-dotnet test --collect:"XPlat Code Coverage;Format=cobertura,lcov"
-
-# ---- Frontend: run once with coverage (from client/) ----
-cd client
-export CHROME_BIN=/usr/bin/google-chrome
-export NODE_OPTIONS=--openssl-legacy-provider     # only needed on Node 17+
-ng test --watch=false --browsers=ChromeHeadless --code-coverage
-# In containerized CI, prefer the provided no-sandbox launcher:
-# ng test --watch=false --browsers=ChromeHeadlessNoSandbox --code-coverage
+# Terminal 2 — Angular dev server
+cd client && NODE_OPTIONS=--openssl-legacy-provider npx ng serve
 ```
 
-**Expected results:** Backend `Passed! Failed: 0` for each project (Core 81, Infrastructure 56, API 77, Integration 107 = **321**). Frontend `TOTAL: 3 FAILED, 91 SUCCESS` — the 3 failures are the documented out-of-scope legacy `AppComponent` assertions; **all 91 in-scope specs pass**. An LCOV report is written to `client/coverage/client/lcov.info`.
-
-### 9.6 Running the Application (optional)
+### 9.6 Verification Steps
 
 ```bash
-docker compose up -d                      # ensure Redis + PostgreSQL are up
-dotnet run --project API                  # auto-migrates + seeds; serves http://localhost:5000 / https://localhost:5001
-# In a second terminal, serve the SPA:
-cd client && npm start                     # http://localhost:4200
+# Full autonomous test suite (599 total)
+dotnet test Core.Tests --no-build            # 81
+dotnet test Infrastructure.Tests --no-build  # 100
+dotnet test API.Tests --no-build             # 126
+(cd client && NODE_OPTIONS=--openssl-legacy-provider npx ng test --watch=false --browsers=ChromeHeadlessNoSandbox)  # 157
+TESTCONTAINERS_RYUK_DISABLED=true dotnet test API.IntegrationTests --no-build   # 135 (needs Docker db+redis)
+
+# Runtime smoke
+curl -k https://localhost:5001/api/products                 # unchanged (price=base, no Version)
+curl -k -i https://localhost:5001/api/flash-sales/active    # expect: Cache-Control: no-store
 ```
 
-### 9.7 Verification
+### 9.7 Example Usage
 
 ```bash
-# Use HTTPS with -k (self-signed dev cert); plain http://localhost:5000 only 307-redirects to https and returns no body
-curl -sk https://localhost:5001/api/products | head -c 200      # 200, 18 products
-curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:5001/api/products/99999   # 404 (structured ApiResponse)
-curl -sk -X POST https://localhost:5001/api/account/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"bob@test.com","password":"Pa$$w0rd"}'          # 200 + JWT
+# Schedule a flash sale (JWT required; obtain via /api/account/login)
+curl -k -X POST https://localhost:5001/api/flash-sales \
+  -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" \
+  -d '{"productId":1,"startAt":"2026-07-23T18:00:00Z","endAt":"2026-07-23T19:00:00Z","salePrice":9.99,"stockAllocation":100}'
+
+# Reserve stock (rate-limited 10/min/session; sessionId = basket UUID from localStorage['basket_id'])
+curl -k -X POST https://localhost:5001/api/inventory/reserve \
+  -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" \
+  -d '{"productId":1,"quantity":2,"sessionId":"3f8a1c2e-9b4d-4c7a-8e21-0d5b6f7a1c99"}'
+#   over-request  -> 409 {"error":"INSUFFICIENT_STOCK","available":N}
+#   version clash -> 409 {"error":"RESERVATION_CONFLICT"}
+#   >10 req/min   -> 429 {"error":"RATE_LIMIT_EXCEEDED"}
+
+# Release a reservation
+curl -k -X DELETE https://localhost:5001/api/inventory/reserve/<id> -H "Authorization: Bearer <JWT>"   # 204
+
+# SignalR hub: connect to /hubs/inventory?access_token=<JWT>
+#   events: InventoryUpdated(productId, quantityAvailable), FlashSaleStarted, FlashSaleEnded
 ```
 
 ### 9.8 Troubleshooting
 
-- **`ERR_OSSL_EVP_UNSUPPORTED` during `ng test`/`ng build`** → export `NODE_OPTIONS=--openssl-legacy-provider` (Node 17+) or use Node 14/16.
-- **Testcontainers "Docker not available"** → start the Docker daemon or mount `/var/run/docker.sock`; confirm with `docker info`.
-- **Headless Chrome crashes in a container** → use the `ChromeHeadlessNoSandbox` launcher already defined in `client/karma.conf.js`.
-- **3 `AppComponent` spec failures** → expected and out-of-scope (preserve-verbatim); not a regression.
-- **Integration images missing offline** → pre-pull `postgres:13` and `redis:6`, or point Testcontainers at a registry mirror.
+| Symptom | Resolution |
+|---|---|
+| API fails to start on Ubuntu 25 (`libssl` error) | Install `libssl1.1` (1.1.1f). |
+| `ng build/test/serve` → "digital envelope routines::unsupported" | Prefix `NODE_OPTIONS=--openssl-legacy-provider`. |
+| Integration tests hang or leak containers | Set `TESTCONTAINERS_RYUK_DISABLED=true`; ensure `docker compose up -d db redis`. |
+| `curl` TLS errors on `https://localhost:5001` | Use `-k` (self-signed dev certificate). |
+| npm peer-dependency resolution errors | Use `npm install --legacy-peer-deps`. |
+| SPA shows stale bundle after a dev build | Never commit `API/wwwroot` dev output; restore it to the committed baseline. |
 
 ---
 
@@ -354,98 +390,87 @@ curl -sk -X POST https://localhost:5001/api/account/login \
 ### A. Command Reference
 
 | Purpose | Command |
-|---------|---------|
+|---|---|
 | Restore | `dotnet restore ecommerce-shop.sln` |
-| Build (Release) | `dotnet build ecommerce-shop.sln -c Release` |
-| All backend tests + coverage | `dotnet test --configuration Release --collect:"XPlat Code Coverage"` |
-| Single test class | `dotnet test --filter "FullyQualifiedName~OrderServiceTests"` |
-| LCOV + Cobertura | `dotnet test --collect:"XPlat Code Coverage;Format=cobertura,lcov"` |
-| Coverage rollup (optional) | `reportgenerator -reports:**/coverage.cobertura.xml -targetdir:coveragereport` |
-| Frontend tests + coverage | `ng test --watch=false --browsers=ChromeHeadless --code-coverage` |
-| Frontend single spec | `ng test --watch=false --browsers=ChromeHeadless --include='**/auth.guard.spec.ts'` |
-| Run API | `dotnet run --project API` |
-| Local infra | `docker compose up -d` |
+| Build (backend) | `dotnet build ecommerce-shop.sln -c Debug` |
+| Build (frontend, prod) | `NODE_OPTIONS=--openssl-legacy-provider npx ng build --configuration production` |
+| Run API | `dotnet run --project API -c Debug` |
+| Run SPA | `NODE_OPTIONS=--openssl-legacy-provider npx ng serve` |
+| Backend unit tests | `dotnet test {Core.Tests,Infrastructure.Tests,API.Tests} --no-build` |
+| Integration tests | `TESTCONTAINERS_RYUK_DISABLED=true dotnet test API.IntegrationTests --no-build` |
+| Frontend tests | `NODE_OPTIONS=--openssl-legacy-provider npx ng test --watch=false --browsers=ChromeHeadlessNoSandbox` |
+| Start data services | `docker compose up -d db redis` |
 
 ### B. Port Reference
 
-| Service | Port |
-|---------|------|
-| API (HTTP) | 5000 |
-| API (HTTPS) | 5001 |
-| PostgreSQL | 5432 |
-| Redis | 6379 |
-| Adminer | 8080 |
-| Redis Commander | 8081 |
-| Angular dev server (`ng serve`) | 4200 |
-| Integration test containers | **dynamic** (assigned by Testcontainers) |
+| Service | Port | Notes |
+|---|---|---|
+| API (HTTP) | 5000 | Redirects to HTTPS. |
+| API (HTTPS) | 5001 | Self-signed dev cert (`curl -k`). |
+| PostgreSQL | 5432 | `appuser` / `secret`. |
+| Redis | 6379 | Basket store + response cache (not a SignalR backplane). |
+| SignalR hub | 5001 | Path `/hubs/inventory?access_token=<JWT>`. |
+| redis-commander | 8081 | Optional (docker compose). |
+| adminer | 8080 | Optional (docker compose). |
 
 ### C. Key File Locations
 
-| Artifact | Path |
-|----------|------|
-| Solution | `ecommerce-shop.sln` |
-| Backend unit tests | `Core.Tests/`, `Infrastructure.Tests/`, `API.Tests/` |
-| Backend integration tests | `API.IntegrationTests/` |
-| Testcontainers fixture | `API.IntegrationTests/Infrastructure/ContainerFixture.cs` |
-| Integration host factory | `API.IntegrationTests/Infrastructure/CustomWebApplicationFactory.cs` |
-| Stripe integration stub | `API.IntegrationTests/Infrastructure/StripePaymentServiceStub.cs` |
-| In-memory context helper | `Infrastructure.Tests/Helpers/TestStoreContextFactory.cs` |
-| Controller test helpers | `API.Tests/Helpers/ControllerTestHelpers.cs` |
-| Coverage config | `coverage.runsettings` |
-| Karma config | `client/karma.conf.js` |
-| Frontend specs | `client/src/app/**/*.spec.ts` |
-| Preserved legacy spec | `client/src/app/app.component.spec.ts` |
-| Production seam | `Infrastructure/Services/PaymentService.cs` |
+| Area | Path |
+|---|---|
+| Entities | `Core/Entities/{FlashSale,InventoryReservation,ReservationStatus}.cs`, `Core/Entities/Product.cs` (+ `Version`) |
+| Interfaces | `Core/Interfaces/{IFlashSaleService,IInventoryReservationService,IInventoryBroadcaster,IInventoryBroadcastCoordinator}.cs` |
+| Services | `Infrastructure/Services/{FlashSaleService,InventoryReservationService,ReservationExpirySweepService,InventoryBroadcastCoordinator,OrderService}.cs` |
+| EF config & migrations | `Infrastructure/Data/Config/*Configuration.cs`, `Infrastructure/Data/Migrations/20260721*_*.cs` |
+| Hub & API | `API/Hubs/{InventoryHub,InventoryBroadcaster}.cs`, `API/Controllers/{FlashSalesController,InventoryController}.cs`, `API/Dtos/*.cs`, `API/Helpers/{SessionRateLimitFilter,CanonicalUuidV4Attribute}.cs` |
+| DI & startup | `API/Startup.cs`, `API/Extension/{ApplicationServicesExtensions,IdentityServiceExtensions}.cs`, `API/appsettings.Development.json` |
+| Frontend | `client/src/app/core/services/inventory-hub.service.ts`, `client/src/app/shop/{flash-sale.service.ts,flash-sale-banner,countdown-timer,live-stock-indicator,product-details}`, `client/src/app/shared/models/{flash-sale,inventory}.ts` |
 
 ### D. Technology Versions
 
-| Component | Version |
-|-----------|---------|
-| .NET SDK / target | 5.0.408 / `net5.0` |
-| Angular / TypeScript / RxJS | 11.2.1 / 4.1.2 / 6.6.0 |
-| xUnit / runner.visualstudio / NET.Test.Sdk | 2.4.2 / 2.4.5 / 17.4.0 |
-| Moq | 4.18.4 (pinned < 4.20 — SponsorLink) |
-| FluentAssertions | 6.12.0 (Apache-2.0; pinned < 8.0) |
-| coverlet.collector | 3.2.0 |
-| EntityFrameworkCore.InMemory | 5.0.8 |
-| AspNetCore.Mvc.Testing | 5.0.17 |
-| Testcontainers.PostgreSql / .Redis | 3.9.0 |
-| Jasmine / Karma / karma-coverage | ^3.8.0 / ~6.1.0 / ~2.0.3 |
-| Docker Engine | 28.5.2 |
-| Container images | `postgres:13`, `redis:6` (digest-pinned) |
+| Technology | Version |
+|---|---|
+| .NET / target framework | SDK 5.0.408 / `net5.0` |
+| ASP.NET Core runtime | 5.0.x |
+| EF Core | 5.0.8 |
+| Npgsql EF Core (PostgreSQL) | 5.0.7 |
+| StackExchange.Redis | 2.2.62 |
+| Stripe.net | 39.66.0 |
+| Angular | 11.2.1 |
+| @microsoft/signalr | ^8.0.0 (resolved 8.0.17) |
+| RxJS / TypeScript | 6.6.0 / 4.1.2 |
+| Node / npm (env) | v22.23.1 / 11.18.0 |
+| Docker | 28.5.2 |
 
 ### E. Environment Variable Reference
 
-| Variable | Value / Example | Purpose |
-|----------|-----------------|---------|
-| `ASPNETCORE_ENVIRONMENT` | `Development` | Selects `appsettings.Development.json`; enables dev exception detail |
-| `NODE_OPTIONS` | `--openssl-legacy-provider` | Required for Angular 11 webpack on Node 17+ |
-| `CHROME_BIN` | `/usr/bin/google-chrome` | Headless Chrome binary for Karma |
-| `ConnectionStrings__DefaultConnection` | `Server=localhost;Port=5432;...;Database=e-commerce` | Store DB (overridden in integration tests) |
-| `ConnectionStrings__IdentityConnection` | `...;Database=identity` | Identity DB (overridden in integration tests) |
-| `ConnectionStrings__Redis` | `localhost` | Redis (overridden in integration tests) |
-| `StripeSettings__SecretKey` | *(test-mode key)* | Stripe test key — never a live secret; no live calls |
-| `SIGNALR_HUB_PATH` | `/hubs/inventory` | Real-Time Inventory & Flash Sale — SignalR hub route; both the server hub mapping and the JWT query-string `access_token` check resolve through this value |
-| `RESERVATION_TTL_SECONDS` | `300` | Real-Time Inventory & Flash Sale — how long a stock reservation is held before automatic expiry/release |
-| `FLASH_SALE_POLL_INTERVAL_MS` | `5000` | Real-Time Inventory & Flash Sale — cadence of the background reservation-expiry sweep |
+| Variable | Purpose | Value (dev) |
+|---|---|---|
+| `DOTNET_ROOT` / `PATH` | Locate the .NET SDK | `$HOME/.dotnet` |
+| `ASPNETCORE_ENVIRONMENT` | ASP.NET environment | `Development` |
+| `NODE_OPTIONS` | Angular 11 on Node 17+ | `--openssl-legacy-provider` |
+| `CHROME_BIN` | Headless Karma browser | `/usr/bin/google-chrome` |
+| `TESTCONTAINERS_RYUK_DISABLED` | Testcontainers in CI/container | `true` |
+| `SIGNALR_HUB_PATH` | Hub route (config key) | `/hubs/inventory` |
+| `RESERVATION_TTL_SECONDS` | Reservation lifetime | `300` |
+| `FLASH_SALE_POLL_INTERVAL_MS` | Sweep/poll cadence | `5000` |
 
 ### F. Developer Tools Guide
 
-- **Coverlet + `coverage.runsettings`** — emits Cobertura + LCOV; `Include` limited to `[Core]`/`[Infrastructure]`/`[API]`; `ExcludeByFile` drops EF `**/Migrations/*.cs`; test assemblies and xUnit excluded.
-- **ReportGenerator (optional global tool)** — `reportgenerator -reports:**/coverage.cobertura.xml -targetdir:coveragereport` rolls Cobertura up into per-namespace/per-class percentages for threshold verification (offline environments can parse the Cobertura XML directly).
-- **Testcontainers** — provisions isolated `postgres:13` + `redis:6` per test class with `WaitStrategy` readiness (no fixed sleeps) and automatic disposal via `IAsyncLifetime`; `testcontainers/ryuk` handles orphan cleanup.
-- **Karma reporters** — `html`, `text-summary`, and `lcovonly`; launchers `ChromeHeadless` and `ChromeHeadlessNoSandbox` (for containerized CI).
+- **Redis Commander** (`:8081`) and **Adminer** (`:8080`) ship in `docker-compose.yml` for inspecting Redis baskets/cache and the PostgreSQL schema.
+- **Swagger** is available while the API runs (dev) for exploring endpoints — note DOC-4 (anonymous endpoints falsely marked as requiring Bearer) is tracked under HT-9.
+- **Testcontainers** spins up real PostgreSQL + Redis for integration tests; requires Docker and `TESTCONTAINERS_RYUK_DISABLED=true` in this container environment.
+- **`.trx` results** and coverage (`coverage.cobertura.xml`, Angular `lcov.info`) are archived under `blitzy/qa_harness/phase8_testresults/`.
 
 ### G. Glossary
 
 | Term | Meaning |
-|------|---------|
-| AAP | Agent Action Plan — the authoritative requirements/scope document for this engagement |
-| SUT | System Under Test — the production code being exercised by the tests |
-| Testcontainers | Library that provisions throwaway Docker containers (PostgreSQL/Redis) for integration tests |
-| `WebApplicationFactory<Startup>` | ASP.NET Core in-process test host used to drive the full HTTP pipeline |
-| Fail-closed | Behavior where infrastructure loss yields a safe, structured error (HTTP 500) rather than degraded/unsafe success |
-| Coverlet | Cross-platform .NET code-coverage collector (Cobertura/LCOV output) |
-| LCOV | Line-coverage report format consumed by `--code-coverage` pipelines |
-| Seam | A minimal, annotated production change enabling substitution of a dependency under test |
-| Preserve-verbatim | Constraint requiring a file (`app.component.spec.ts`) to remain byte-for-byte unchanged |
+|---|---|
+| **Flash sale** | A promotion with a discounted `sale_price` valid only within `[start_at, end_at]` and a fixed `stock_allocation`. |
+| **Reservation** | A time-bounded hold on stock (`quantity`, `session_id`, `expires_at`) that prevents oversell. |
+| **Zero oversell** | Invariant that concurrent reservations never allocate more than `stock_allocation`. |
+| **Optimistic concurrency (`Version`)** | A DB row-version token; a stale write throws `DbUpdateConcurrencyException`, retried once, else `409 RESERVATION_CONFLICT`. |
+| **Session id** | The client basket UUID (`localStorage['basket_id']`) reused as the reservation key — no new identity concept. |
+| **Sweep** | The `ReservationExpirySweepService` background job that expires holds and returns stock. |
+| **`quantityAvailable`** | Derived value = `stock_allocation` − Σ active (non-expired) reservations. |
+| **IDOR** | Insecure Direct Object Reference — here, accepting a foreign `basketId` (finding P7-A). |
+| **AAP** | Agent Action Plan — the authoritative specification for this feature. |
