@@ -1,0 +1,867 @@
+# Checkout Workflow — Basket, Order and Payment Reference (F-003 / F-004 / F-005)
+
+This document is the source-grounded reference for the end-to-end checkout workflow: the path that carries a Redis-resident `CustomerBasket` `Core/Entities/CustomerBasket.cs:L16-L22` through Stripe PaymentIntent creation `Infrastructure/Services/PaymentService.cs:L52-L76`, server-authoritative order materialisation into PostgreSQL `Infrastructure/Services/OrderService.cs:L30-L55`, client-side basket teardown `client/src/app/basket/basket.service.ts:L150-L154`, and asynchronous Stripe webhook-driven order-status settlement `API/Controllers/PaymentsController.cs:L40-L67`. It is written for a developer who has to change checkout safely, so every mechanic in [Section 6](#6-key-mechanics) and every failure mode in [Section 8](#8-failure-modes--edge-cases) closes by stating what breaks downstream when you touch it.
+
+**Citation convention.** Every factual statement carries an inline locator immediately after the claim. Source files use `path:Lnn` or `path:Lnn-Lnn` (for example `API/Controllers/PaymentsController.cs:L44`), prose documents use `path:§heading` (for example `CHANGES.md:§9.6`), and configuration keys use `path:key.path`. All paths are repository-relative.
+
+**Unverified convention.** Any statement that cannot be confirmed from repository source is marked with a bold `**unverified**` label rather than asserted as fact. The complete set of unverified items in this document is: the value, storage location and shape of `StripeSettings:SecretKey`, which is read at `Infrastructure/Services/PaymentService.cs:L29` but appears in no tracked configuration file; the value, storage location and shape of `StripeSettings:WhSecret`, which is read at `API/Controllers/PaymentsController.cs:L27` under the same conditions; and Stripe-side behaviour that this repository cannot evidence, namely retry cadence, delivery guarantees, and the internal structure of the `Stripe-Signature` header. Nothing outside that set is inferred or invented.
+
+**Line-number caveat.** Locators refer to the repository state at authoring time. Drift is expected rather than erroneous. If the cited lines no longer contain the cited symbol, treat the statement as needing review — that pairing of claim to locator is the maintainability mechanism this document relies on. It has to be, because nothing in the repository can regenerate this content: none of the three project files declares a `DocumentationFile` or `GenerateDocumentationFile` property `API/API.csproj:L1-L25`, `Core/Core.csproj:L1-L11`, `Infrastructure/Infrastructure.csproj:L1-L27`, so no XML documentation artifact is ever produced to extract from.
+
+**Contents.**
+
+- [1. Overview](#1-overview)
+- [2. End-to-end sequence](#2-end-to-end-sequence)
+- [3. Component & responsibility map](#3-component--responsibility-map)
+- [4. API reference](#4-api-reference)
+- [5. Data model](#5-data-model)
+- [6. Key mechanics](#6-key-mechanics)
+- [7. Order status lifecycle](#7-order-status-lifecycle)
+- [8. Failure modes & edge cases](#8-failure-modes--edge-cases)
+- [9. Configuration dependencies](#9-configuration-dependencies)
+
+**Endpoint count.** The checkout surface is often described as eight endpoints, because the three distinct `BasketController` actions — `GetBasketById` `API/Controllers/BasketController.cs:L21-L26`, `UpdateBasket` `API/Controllers/BasketController.cs:L28-L34` and `DeleteBasketAsync` `API/Controllers/BasketController.cs:L36-L40` — are usually collapsed into the single phrase "basket CRUD". Counted individually against the code, the set is **nine** endpoints, and [Section 4](#4-api-reference) documents all nine. Nine is a superset of eight, so the extra row is not additional scope; it is the third basket action stated explicitly.
+
+**Scope.** This document covers only the Shopping Basket (F-003), Order Processing (F-004) and Payment Processing (F-005) features, whose identifiers come from the specification's requirement catalogue `tech spec §2.2`. It does not document product catalog browsing, filtering or pagination; authentication and token issuance internals; response caching; customer address management; Angular modules outside `client/src/app/basket/` and `client/src/app/checkout/`; or deployment beyond the runtime dependencies named in [Section 9](#9-configuration-dependencies). Five components outside the three features are mentioned only where checkout touches them directly, each bounded to the sentence or table row that explains the contact.
+
+**Requirement traceability.** The seventeen in-scope requirement identifiers from the specification's requirement catalogue `tech spec §2.2` map onto code as follows. The identifiers are taken from that catalogue; the behaviour in the third column is taken from the code cited there, not from the catalogue text.
+
+| Feature | Requirement identifiers | Realised in code by | Documented in |
+|---|---|---|---|
+| F-003 Shopping Basket | RQ-001 through RQ-004 (4) | `BasketController` three actions `API/Controllers/BasketController.cs:L21-L40`; Redis get/set/delete with a 30-day expiry `Infrastructure/Data/BasketRepository.cs:L18-L37`; basket shape `Core/Entities/CustomerBasket.cs:L16-L22` | [4](#4-api-reference) rows 1-3, [5](#5-data-model), [8.5](#85-basket-not-found) |
+| F-004 Order Processing | RQ-001 through RQ-007 (7) | `OrdersController` four actions `API/Controllers/OrdersController.cs:L28-L61`; order materialisation `Infrastructure/Services/OrderService.cs:L24-L78`; `Order` aggregate `Core/Entities/OrderAggregate/Order.cs:L6-L34` | [4](#4-api-reference) rows 4-7, [5](#5-data-model), [6.1](#61-server-side-price-verification-against-the-database-during-order-and-intent-creation), [6.2](#62-unit-of-work-commit), [7](#7-order-status-lifecycle), [8.1](#81-tampered-basket-prices), [8.3](#83-unit-of-work-save-failure) |
+| F-005 Payment Processing | RQ-001 through RQ-006 (6) | `PaymentsController` intent endpoint and webhook `API/Controllers/PaymentsController.cs:L30-L67`; intent lifecycle and both status mutators `Infrastructure/Services/PaymentService.cs:L27-L106` | [4](#4-api-reference) rows 8-9, [6.1](#61-server-side-price-verification-against-the-database-during-order-and-intent-creation), [6.3](#63-stripe-webhook-signature-verification), [6.4](#64-stale-order-replacement-by-paymentintentid), [7](#7-order-status-lifecycle), [8.2](#82-invalid-webhook-signatures), [8.4](#84-re-submitted-intents) |
+
+---
+
+## 1. Overview
+
+The checkout workflow converts a Redis-resident basket into a persisted PostgreSQL order whose payment status is settled asynchronously by Stripe. It **starts** when the shopper reaches the Review stage of the four-step Angular stepper — `Address`, `Delivery`, `Review`, `Payment` at `client/src/app/checkout/checkout.component.html:L5`, `:L8`, `:L11` and `:L14` — and the Review component asks the SPA to issue `POST api/payments/{basketId}` with an empty body `client/src/app/checkout/checkout-review/checkout-review.component.ts:L23` and `client/src/app/basket/basket.service.ts:L25`, which creates or updates a Stripe PaymentIntent and writes the intent identifier and client secret back into the basket `Infrastructure/Services/PaymentService.cs:L64-L66, L78`. On the Payment step the SPA then calls `POST api/orders`, which re-reads every product price from the database, materialises an `Order` whose status defaults to `Pending`, and commits it `Infrastructure/Services/OrderService.cs:L32-L34, L52-L55` and `Core/Entities/OrderAggregate/Order.cs:L28`. Only after that does the browser confirm the card with Stripe and clear its own basket state `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L82-L85`. The workflow **ends** when Stripe delivers an asynchronous event to `POST api/payments/webhook` and the matching `Order` row transitions out of `Pending` into either `PaymentReceived` or `PaymentFailed` `API/Controllers/PaymentsController.cs:L40-L67` and `Infrastructure/Services/PaymentService.cs:L88, L102`. Everything between those two endpoints is in scope; the shopper's browser is never the authority on price, and the order row exists before any card is charged.
+
+---
+
+## 2. End-to-end sequence
+
+**Figure 1 — Checkout Workflow End-to-End Sequence** traces the whole path across seven participants. Every branch is expressed inside this single diagram: the create-versus-update PaymentIntent alternative `Infrastructure/Services/PaymentService.cs:L56`, the optional stale-order replacement `Infrastructure/Services/OrderService.cs:L46`, and the succeeded-versus-failed webhook alternative `API/Controllers/PaymentsController.cs:L51, L57`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Shopper
+    participant SPA as Angular SPA<br/>(checkout module)
+    participant API as API Layer<br/>PaymentsController / OrdersController
+    participant SVC as Infrastructure Services<br/>PaymentService / OrderService
+    participant Redis as Redis<br/>CustomerBasket JSON
+    participant PG as PostgreSQL e-commerce<br/>StoreContext
+    participant Stripe as Stripe API
+
+    Note over Shopper,Stripe: STEP 1 - Create or update the PaymentIntent (Review step)
+    Shopper->>SPA: Advance to Review step
+    SPA->>API: POST api/payments/{basketId} (Authorize, empty body)
+    API->>SVC: PaymentService.CreateOrUpdatePaymentIntent(basketId)
+    SVC->>Redis: GetBasketAsync(basketId)
+    Redis-->>SVC: CustomerBasket or null
+    SVC->>PG: GetByIdAsync(Product) per basket item
+    PG-->>SVC: authoritative Product.Price values
+    SVC->>SVC: overwrite item.Price where basket disagrees
+    alt basket.PaymentIntentId is empty
+        SVC->>Stripe: PaymentIntentService.CreateAsync(amount in cents)
+        Stripe-->>SVC: PaymentIntent id plus ClientSecret
+    else basket.PaymentIntentId already set
+        SVC->>Stripe: PaymentIntentService.UpdateAsync(id, amount)
+        Stripe-->>SVC: updated PaymentIntent (ClientSecret NOT refreshed)
+    end
+    SVC->>Redis: UpdateBasketAsync (corrected prices plus intent fields, 30-day TTL)
+    API-->>SPA: CustomerBasket with ClientSecret and PaymentIntentId
+
+    Note over Shopper,Stripe: STEP 2 - Create the Order from the basket
+    Shopper->>SPA: Submit payment on the Payment step
+    SPA->>API: POST api/orders (Authorize, OrderDto)
+    API->>SVC: OrderService.CreateOrderAsync(email, deliveryMethodId, basketId, address)
+    SVC->>Redis: GetBasketAsync(basketId)
+    SVC->>PG: re-read Product prices and DeliveryMethod
+    SVC->>PG: GetEntityWithSpec(OrderByPaymentIntentIdSpecification)
+    opt a prior Order carries the same PaymentId
+        SVC->>PG: Repository(Order).Delete(existingOrder)
+        SVC->>Stripe: CreateOrUpdatePaymentIntent(basket.PaymentIntentId)
+    end
+    SVC->>PG: Repository(Order).Add(new Order, Status = Pending)
+    SVC->>PG: UnitOfWork.Complete() - SaveChangesAsync
+    API-->>SPA: Order entity (Status Pending)
+
+    Note over Shopper,Stripe: STEP 3 - Basket teardown (client-side only)
+    SPA->>Stripe: stripe.confirmCardPayment(clientSecret)
+    Stripe-->>SPA: paymentIntent result
+    SPA->>SPA: BasketService.deleteLocalBasket(id) - clears subjects plus localStorage
+    Note right of Redis: The Redis key is NOT deleted here.<br/>It survives until the 30-day TTL expires.
+
+    Note over Shopper,Stripe: STEP 4 - Stripe delivers the webhook event
+    Stripe->>API: POST api/payments/webhook (anonymous, Stripe-Signature header)
+    API->>API: EventUtility.ConstructEvent(rawJson, signature, WhSecret)
+
+    Note over Shopper,Stripe: STEP 5 - The Order status is updated
+    alt event type is payment_intent.succeeded
+        API->>SVC: PaymentService.UpdateOrderPaymentSucceeded(intent.Id)
+        SVC->>PG: locate Order by PaymentId, set Status = PaymentReceived
+    else event type is payment_intent.payment_failed
+        API->>SVC: PaymentService.UpdateOrderPaymentFailed(intent.Id)
+        SVC->>PG: locate Order by PaymentId, set Status = PaymentFailed
+    end
+    SVC->>PG: UnitOfWork.Complete() - SaveChangesAsync
+    API-->>Stripe: EmptyResult (HTTP 200)
+```
+
+**Legend for Figure 1.** Solid arrows are outbound calls; dashed arrows are returns. The five `Note over` bands delimit the five workflow steps and are the anchors the narration below groups under. `alt`/`else` blocks are mutually exclusive branches taken on the stated condition, evaluated at `Infrastructure/Services/PaymentService.cs:L56` and `API/Controllers/PaymentsController.cs:L49`. The `opt` block executes only when a prior order already carries the same Stripe intent identifier `Infrastructure/Services/OrderService.cs:L46`. The number `autonumber` attaches to each arrow is the key the narration references, so every arrow has exactly one narration entry and every entry has exactly one arrow. The right-hand note on Redis records the deliberate absence of a server-side basket delete on this path `Infrastructure/Services/OrderService.cs:L24-L61`.
+
+### Step 1 — Create or update the PaymentIntent (arrows 1-14)
+
+1. The shopper advances to the Review stage of the stepper, declared as `[label]="'Review'"` at `client/src/app/checkout/checkout.component.html:L11`.
+2. The SPA issues `POST api/payments/{basketId}` with an empty object as the body — `this.http.post(this.baseUrl + 'payments/' + this.getCurrentBasketValue().id, {})` at `client/src/app/basket/basket.service.ts:L25` — triggered by the Review component at `client/src/app/checkout/checkout-review/checkout-review.component.ts:L23`, which advances the stepper only after the call succeeds `client/src/app/checkout/checkout-review/checkout-review.component.ts:L24`.
+3. The controller delegates straight to the payment service with no work of its own `API/Controllers/PaymentsController.cs:L34`.
+4. The service loads the basket from Redis `Infrastructure/Services/PaymentService.cs:L31`, which issues `StringGetAsync` against the raw basket id `Infrastructure/Data/BasketRepository.cs:L20`.
+5. Redis returns either the deserialised basket or `null` when the key is empty `Infrastructure/Data/BasketRepository.cs:L21`; the service guards that case immediately `Infrastructure/Services/PaymentService.cs:L34`.
+6. For each basket item the service reads the product row by the item's id `Infrastructure/Services/PaymentService.cs:L45`.
+7. The read resolves through `FindAsync`, so the returned price is the database's `Infrastructure/Data/GenericRepository.cs:L22`.
+8. Where the basket's price disagrees with the database, the basket's own price is overwritten in memory `Infrastructure/Services/PaymentService.cs:L46-L48`.
+9. When the basket carries no intent id yet, a new PaymentIntent is created `Infrastructure/Services/PaymentService.cs:L64` with the amount computed at `Infrastructure/Services/PaymentService.cs:L60`; the branch is selected at `Infrastructure/Services/PaymentService.cs:L56`.
+10. Stripe returns the intent, whose id and client secret are copied onto the basket `Infrastructure/Services/PaymentService.cs:L65-L66`.
+11. When the basket already carries an intent id, the existing intent is updated instead `Infrastructure/Services/PaymentService.cs:L75`, with the amount recomputed at `Infrastructure/Services/PaymentService.cs:L73`.
+12. The update branch returns the updated intent but assigns nothing back to the basket, so `ClientSecret` keeps its original value `Infrastructure/Services/PaymentService.cs:L69-L76`.
+13. The corrected basket — adjusted prices plus the intent fields — is written back to Redis `Infrastructure/Services/PaymentService.cs:L78`, which resets the key's 30-day expiry `Infrastructure/Data/BasketRepository.cs:L27`.
+14. The controller returns the basket, now carrying `ClientSecret` and `PaymentIntentId` `API/Controllers/PaymentsController.cs:L37`.
+
+### Step 2 — Create the Order from the basket (arrows 15-25)
+
+15. The shopper submits on the Payment step, entering `submitOrder()` at `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L78`.
+16. The SPA posts to `api/orders` `client/src/app/checkout/checkout.service.ts:L17` with the payload assembled at `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L115-L121`.
+17. The controller resolves the buyer email from the principal `API/Controllers/OrdersController.cs:L31`, maps the address DTO to the order-aggregate address `API/Controllers/OrdersController.cs:L32`, and calls the order service `API/Controllers/OrdersController.cs:L33`.
+18. The service fetches the basket from Redis `Infrastructure/Services/OrderService.cs:L27` — with no null check, which is the subject of [Section 8.5](#85-basket-not-found).
+19. It re-reads every product row `Infrastructure/Services/OrderService.cs:L32` and the selected delivery method `Infrastructure/Services/OrderService.cs:L38`, then computes the subtotal from the database-sourced prices `Infrastructure/Services/OrderService.cs:L40`.
+20. It looks for an existing order carrying the same Stripe intent id `Infrastructure/Services/OrderService.cs:L43-L44`.
+21. When one exists, that order is marked for deletion `Infrastructure/Services/OrderService.cs:L48`.
+22. The payment service is then called again, with the intent id passed into the parameter declared `basketId` `Infrastructure/Services/OrderService.cs:L49` and `Infrastructure/Services/PaymentService.cs:L27` — see [Section 6.4](#64-stale-order-replacement-by-paymentintentid).
+23. A replacement `Order` is constructed with the basket's intent id as its `PaymentId` and added to the context `Infrastructure/Services/OrderService.cs:L52-L53`; its `Status` takes the field-initialiser default `OrderStatus.Pending` `Core/Entities/OrderAggregate/Order.cs:L28`.
+24. A single `Complete()` flushes the delete and the insert together `Infrastructure/Services/OrderService.cs:L55`, which is one `SaveChangesAsync` call `Infrastructure/Data/UnitOfWork.cs:L42`; a non-positive result returns `null` `Infrastructure/Services/OrderService.cs:L57`.
+25. The controller returns `Ok(order)` — the `Order` entity itself `API/Controllers/OrdersController.cs:L35`.
+
+### Step 3 — Basket teardown, client-side only (arrows 26-28)
+
+This step is named for basket deletion, and the accurate description is narrower than the name: **no server-side deletion happens anywhere on the checkout path.** `OrderService.CreateOrderAsync` contains no call to `DeleteBasketAsync` `Infrastructure/Services/OrderService.cs:L24-L61`, and the client method invoked after payment clears only local state `client/src/app/basket/basket.service.ts:L150-L154`. A genuine server-side delete does exist — `DELETE api/basket` `API/Controllers/BasketController.cs:L36-L40` reaching `BasketRepository.DeleteBasketAsync` `Infrastructure/Data/BasketRepository.cs:L34-L37`, which the client calls from `deleteBasket()` `client/src/app/basket/basket.service.ts:L141-L149` — but checkout never invokes it. The Redis key therefore survives until its 30-day expiry lapses `Infrastructure/Data/BasketRepository.cs:L27`, which the specification independently describes as the basket persisting until explicitly deleted or expired `tech spec §4.4.2`.
+
+26. The SPA confirms the card with Stripe using the basket's client secret `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L99`, called at `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L83`.
+27. Stripe returns a result whose `paymentIntent` member decides the success path `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L84`, with the error surfaced to a toast otherwise `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L89`.
+28. The SPA calls `deleteLocalBasket(basket.id)` `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L85`, which pushes `null` onto both `BehaviorSubject`s and removes the `basket_id` entry from `localStorage` with no HTTP request at all `client/src/app/basket/basket.service.ts:L151-L153`, then navigates to the success route `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L87` declared at `client/src/app/checkout/checkout-routing.module.ts:L9`.
+
+### Step 4 — Stripe delivers the webhook event (arrows 29-30)
+
+29. Stripe posts the event to the anonymous webhook route `API/Controllers/PaymentsController.cs:L40-L41`, whose body is read as raw text through a `StreamReader` rather than model-bound `API/Controllers/PaymentsController.cs:L43`.
+30. The raw payload, the `Stripe-Signature` header and the endpoint signing secret are passed to `EventUtility.ConstructEvent` `API/Controllers/PaymentsController.cs:L44`, with the secret captured once in the constructor `API/Controllers/PaymentsController.cs:L27`. There is no `try`/`catch` here, which fixes this endpoint's failure contract — see [Section 6.3](#63-stripe-webhook-signature-verification).
+
+### Step 5 — The Order status is updated (arrows 31-36)
+
+31. On `payment_intent.succeeded` `API/Controllers/PaymentsController.cs:L51` the controller calls `UpdateOrderPaymentSucceeded` with the intent id `API/Controllers/PaymentsController.cs:L54`.
+32. The service resolves the order by `PaymentId` `Infrastructure/Services/PaymentService.cs:L84-L85`, returns early when nothing matches `Infrastructure/Services/PaymentService.cs:L86`, sets `Status` to `PaymentReceived` `Infrastructure/Services/PaymentService.cs:L88` and marks the entity modified `Infrastructure/Services/PaymentService.cs:L89`.
+33. On `payment_intent.payment_failed` `API/Controllers/PaymentsController.cs:L57` the controller calls `UpdateOrderPaymentFailed` `API/Controllers/PaymentsController.cs:L60`.
+34. That method resolves the order through the same Specification `Infrastructure/Services/PaymentService.cs:L98-L99`, guards the null case `Infrastructure/Services/PaymentService.cs:L100`, and sets `Status` to `PaymentFailed` `Infrastructure/Services/PaymentService.cs:L102` without the sibling's `Update` call — see [Section 7](#7-order-status-lifecycle).
+35. Either branch commits with `Complete()` `Infrastructure/Services/PaymentService.cs:L91` and `Infrastructure/Services/PaymentService.cs:L103`, which is again one `SaveChangesAsync` `Infrastructure/Data/UnitOfWork.cs:L42`.
+36. The controller answers Stripe with `new EmptyResult()`, an HTTP 200 with no body `API/Controllers/PaymentsController.cs:L65`. Because the `switch` has no `default` arm, any other event type reaches this same return having done nothing `API/Controllers/PaymentsController.cs:L49-L63`.
+
+---
+
+## 3. Component & responsibility map
+
+**Figure 2 — Checkout Component and Layer Map** shows the layer topology the checkout path spans, from the Angular SPA `client/src/app/basket/basket.service.ts:L13-L14` through the API Layer `API/Controllers/BaseApiController.cs:L5-L6` and the Core Layer contracts `Core/Interfaces/IOrderService.cs:L7-L13` down to the Infrastructure Layer implementations registered against them `API/Extension/ApplicationServicesExtensions.cs:L17-L22` and the two datastores plus Stripe `API/Startup.cs:L31-L42` and `Infrastructure/Services/PaymentService.cs:L29`. Read Figure 2 for the shape; the table beneath it gives each participant's single responsibility.
+
+```mermaid
+flowchart TB
+    subgraph CLIENT["Client - Angular 11 SPA"]
+        BS["BasketService"]
+        CS["CheckoutService"]
+        CRC["CheckoutReviewComponent"]
+        CPC["CheckoutPaymentComponent"]
+    end
+    subgraph APIL["API Layer - ASP.NET Core 5"]
+        BC["BasketController"]
+        OC["OrdersController"]
+        PC["PaymentsController"]
+        MP["MappingProfiles<br/>OrderItemUrlResolver"]
+        EM["ExceptionMiddleware"]
+    end
+    subgraph COREL["Core Layer - contracts and entities"]
+        IOS["IOrderService"]
+        IPS["IPaymentService"]
+        IBR["IBasketRepository"]
+        IUOW["IUnitOfWork"]
+        ORD["Order aggregate"]
+        CB["CustomerBasket<br/>BasketItem"]
+        SPEC["OrderByPaymentIntentIdSpecification<br/>OrdersWithItemsAndOrderingSpecification"]
+    end
+    subgraph INFRA["Infrastructure Layer"]
+        OS["OrderService"]
+        PS["PaymentService"]
+        BR["BasketRepository"]
+        UOW["UnitOfWork<br/>GenericRepository"]
+        SCTX["StoreContext<br/>EF configurations"]
+    end
+    subgraph EXT["External stores and services"]
+        REDIS[("Redis on 6379")]
+        PGDB[("PostgreSQL e-commerce")]
+        STRIPE["Stripe API"]
+    end
+
+    CRC --> BS
+    CPC --> BS
+    CPC --> CS
+    BS --> BC
+    BS --> PC
+    CS --> OC
+    BC --> IBR
+    OC --> IOS
+    OC --> MP
+    PC --> IPS
+    IOS -.implemented by.-> OS
+    IPS -.implemented by.-> PS
+    IBR -.implemented by.-> BR
+    IUOW -.implemented by.-> UOW
+    OS --> IBR
+    OS --> IPS
+    OS --> IUOW
+    OS --> SPEC
+    PS --> IBR
+    PS --> IUOW
+    PS --> SPEC
+    ORD --> SCTX
+    CB --> BR
+    UOW --> SCTX
+    SCTX --> PGDB
+    BR --> REDIS
+    PS --> STRIPE
+    CPC --> STRIPE
+    EM -.wraps all requests.-> APIL
+```
+
+**Legend for Figure 2.** Solid edges are runtime calls. Dotted edges are implementation or wrapping relationships rather than calls: each `-.implemented by.->` edge links a Core Layer interface to the Infrastructure Layer class registered against it `API/Extension/ApplicationServicesExtensions.cs:L17-L22`, and the single `-.wraps all requests.->` edge records that `ExceptionMiddleware` is registered first in the pipeline `API/Startup.cs:L59` and therefore wraps every request in the diagram. Cylinder nodes are external datastores. Subgraph boxes are the four code layers plus the external dependencies.
+
+Layer assignment follows the project each type physically lives in, cross-checked against the dependency-injection registrations. The five services this workflow depends on are all registered `Scoped` — `IOrderService` `API/Extension/ApplicationServicesExtensions.cs:L17`, `IPaymentService` `:L18`, `IUnitOfWork` `:L19`, `IBasketRepository` `:L21` and the open generic `IGenericRepository<>` `:L22` — so one `StoreContext` and one change tracker serve an entire request. The Redis connection is the exception: `IConnectionMultiplexer` is a `Singleton` `API/Startup.cs:L37-L42`. Note that the extension folder is `API/Extension/` in the singular `API/Extension/ApplicationServicesExtensions.cs:L9`.
+
+| Class/Service | Layer | One-line responsibility | Source |
+|---|---|---|---|
+| `BasketService` | Client (Angular SPA) | Holds basket state in two `BehaviorSubject`s and calls the basket and payment-intent endpoints | `client/src/app/basket/basket.service.ts:L15-L31` |
+| `CheckoutService` | Client (Angular SPA) | Posts the order payload and fetches delivery methods, re-sorting them price-descending in the browser | `client/src/app/checkout/checkout.service.ts:L16-L25` |
+| `CheckoutReviewComponent` | Client (Angular SPA) | Triggers PaymentIntent creation on the Review step and advances the stepper on success | `client/src/app/checkout/checkout-review/checkout-review.component.ts:L22-L29` |
+| `CheckoutPaymentComponent` | Client (Angular SPA) | Creates the order, then confirms the card with Stripe Elements and clears local basket state | `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L78-L96` |
+| `BaseApiController` | API Layer | Supplies the shared `[ApiController]` behaviour and the `api/[controller]` route prefix every checkout endpoint inherits | `API/Controllers/BaseApiController.cs:L5-L6` |
+| `BasketController` | API Layer | Exposes the three anonymous basket actions and maps the inbound basket DTO to the entity | `API/Controllers/BasketController.cs:L21-L40` |
+| `OrdersController` | API Layer | Exposes the four authorised order actions and resolves the buyer email from the JWT principal | `API/Controllers/OrdersController.cs:L16-L61` |
+| `PaymentsController` | API Layer | Exposes the authorised intent endpoint and the anonymous Stripe webhook, and holds the signing secret | `API/Controllers/PaymentsController.cs:L27-L67` |
+| `MappingProfiles` | API Layer | Declares the AutoMapper maps for the basket, the order-aggregate address, the order and its items | `API/Helpers/MappingProfiles.cs:L18-L28` |
+| `OrderItemUrlResolver` | API Layer | Prefixes the configured `ApiUrl` onto every order-item picture URL during mapping | `API/Helpers/OrderItemUrlResolver.cs:L18-L26` |
+| `ExceptionMiddleware` | API Layer | Converts any unhandled exception into a camelCase `ApiException` body with HTTP 500 | `API/Middleware/ExceptionMiddleware.cs:L31-L43` |
+| `IOrderService` | Core Layer | Contract for order creation and the three order read operations | `Core/Interfaces/IOrderService.cs:L9-L12` |
+| `IPaymentService` | Core Layer | Contract for intent create-or-update and the two order-status mutators | `Core/Interfaces/IPaymentService.cs:L9-L11` |
+| `IBasketRepository` | Core Layer | Contract for basket get, upsert and delete against Redis | `Core/Interfaces/IBasketRepository.cs:L8-L10` |
+| `IUnitOfWork` | Core Layer | Contract exposing a per-entity repository accessor and a single `Complete()` commit | `Core/Interfaces/IUnitOfWork.cs:L7-L10` |
+| `IGenericRepository<T>` | Core Layer | Contract for entity CRUD plus Specification-driven queries | `Core/Interfaces/IGenericRepository.cs:L10-L17` |
+| `Order` | Core Layer | Aggregate root holding buyer, address, items, subtotal, status and the Stripe intent id | `Core/Entities/OrderAggregate/Order.cs:L6-L34` |
+| `OrderItem` | Core Layer | Line item pairing an ordered-product snapshot with the price and quantity charged | `Core/Entities/OrderAggregate/OrderItem.cs:L3-L18` |
+| `ProductItemOrdered` | Core Layer | Owned snapshot of the product as ordered, deliberately not a `BaseEntity` | `Core/Entities/OrderAggregate/ProductItemOrdered.cs:L3-L18` |
+| `DeliveryMethod` | Core Layer | Seeded shipping option whose price is added to the subtotal to make the total | `Core/Entities/OrderAggregate/DeliveryMethod.cs:L3-L8` |
+| `OrderStatus` | Core Layer | Three-value enumeration defining the order payment lifecycle | `Core/Entities/OrderAggregate/OrderStatus.cs:L5-L12` |
+| `OrderAggregate.Address` | Core Layer | Owned six-field shipping address with no identity of its own | `Core/Entities/OrderAggregate/Address.cs:L3-L24` |
+| `CustomerBasket` | Core Layer | Redis-resident basket carrying items, the chosen delivery method and the Stripe intent fields | `Core/Entities/CustomerBasket.cs:L16-L22` |
+| `BasketItem` | Core Layer | Client-supplied basket line whose price is never trusted by the server | `Core/Entities/BasketItem.cs:L5-L11` |
+| `OrderByPaymentIntentIdSpecification` | Core Layer | Single-predicate Specification selecting the order whose `PaymentId` matches a Stripe intent id | `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9` |
+| `OrdersWithItemsAndOrderingSpecification` | Core Layer | Eager-loads items and delivery method, ordering by date only in its list-returning constructor | `Core/Specifications/OrdersWithItemsAndOrderingSpecification.cs:L7-L19` |
+| `OrderService` | Infrastructure Layer | Materialises the order from the basket using database prices, replacing any stale order first | `Infrastructure/Services/OrderService.cs:L24-L61` |
+| `PaymentService` | Infrastructure Layer | Creates or updates the Stripe PaymentIntent and applies both webhook-driven status changes | `Infrastructure/Services/PaymentService.cs:L27-L106` |
+| `BasketRepository` | Infrastructure Layer | Serialises the basket to Redis under a 30-day expiry and reads or deletes it by key | `Infrastructure/Data/BasketRepository.cs:L18-L37` |
+| `UnitOfWork` | Infrastructure Layer | Caches one repository per entity type over a shared context and commits with one `SaveChangesAsync` | `Infrastructure/Data/UnitOfWork.cs:L24-L43` |
+| `GenericRepository<T>` | Infrastructure Layer | Executes the entity reads, writes and Specification queries against `StoreContext` | `Infrastructure/Data/GenericRepository.cs:L20-L59` |
+| `StoreContext` | Infrastructure Layer | EF Core context owning the `Orders`, `OrderItems` and `DeliveryMethods` sets | `Infrastructure/Data/StoreContext.cs:L21-L23` |
+| `OrderConfiguration` | Infrastructure Layer | Configures the owned address, the enum-to-text status conversion and cascade delete of items | `Infrastructure/Data/Config/OrderConfiguration.cs:L12-L17` |
+| `OrderItemConfiguration` | Infrastructure Layer | Configures the owned product snapshot and the item price as `decimal(18,2)` | `Infrastructure/Data/Config/OrderItemConfiguration.cs:L11-L13` |
+| `DeliveryMethodConfiguration` | Infrastructure Layer | Configures the delivery-method price as `decimal(18,2)` | `Infrastructure/Data/Config/DeliveryMethodConfiguration.cs:L11-L12` |
+
+One namespace detail is worth knowing before you move files around: both Specifications live under `Core/Specifications/` but declare `namespace API.Specifications` `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L5` and `Core/Specifications/OrdersWithItemsAndOrderingSpecification.cs:L3`. That is why Infrastructure Layer services and the Core Layer repository contract all carry `using API.Specifications;` `Infrastructure/Services/OrderService.cs:L4`, `Infrastructure/Services/PaymentService.cs:L4` and `Core/Interfaces/IGenericRepository.cs:L3` — the folder name and the namespace do not agree.
+
+For historical context on how the basket repository came to be shaped this way, see `CHANGES.md:§6.4` "6.4. Implementing the basket repository" at `CHANGES.md:L1887`. That narrative is a build log rather than a reference: it stops at chapter 9.11 `CHANGES.md:L3674` of 3,731 lines and so never reaches payments, the Stripe webhook or the order status lifecycle, and its header still declares the stack as SQLite `CHANGES.md:L7` while the shipped code registers PostgreSQL through Npgsql `API/Startup.cs:L31-L36`.
+
+---
+
+## 4. API reference
+
+Nine endpoints make up the checkout surface. The `api/` prefix and the controller-name segment of every route come from the shared base controller, which carries `[ApiController]` and `[Route("api/[controller]")]` `API/Controllers/BaseApiController.cs:L5-L6`. Rows 1 to 3 are the endpoint surface of **F-003 Shopping Basket** `API/Controllers/BasketController.cs:L21-L40`, rows 4 to 7 that of **F-004 Order Processing** `API/Controllers/OrdersController.cs:L28-L61`, and rows 8 and 9 that of **F-005 Payment Processing** `API/Controllers/PaymentsController.cs:L30-L67`; the seventeen requirement identifiers behind those three features are enumerated in the traceability table above.
+
+Five of the nine require a JWT, and the two categories of anonymous access are themselves facts about the flow's trust model. The three basket endpoints are unauthenticated and keyed only by a basket id the browser generates itself — `export class Basket implements IBasket { id = uuidv4(); }` `client/src/app/shared/models/basket.ts:L21-L24` — so possession of the id is the only thing standing between a caller and a basket. The webhook is unauthenticated in the token sense and authenticated instead by Stripe's signature over the raw payload `API/Controllers/PaymentsController.cs:L44`.
+
+| Method | Route | Auth | Request DTO | Response DTO | Notable side effects | Source |
+|---|---|---|---|---|---|---|
+| GET | `api/basket?id={id}` | Anonymous — no `[Authorize]` on class or method | `string id` bound from the query string | `CustomerBasket` | None. Reads the Redis key and returns `Ok(basket ?? new CustomerBasket(id))`, so a missing key yields an empty basket rather than a 404 | `API/Controllers/BasketController.cs:L21-L26` |
+| POST | `api/basket` | Anonymous | `CustomerBasketDto` | `CustomerBasket` | Writes the Redis key with a 30-day expiry after mapping DTO to entity, then returns the re-read basket; overwrites any existing basket wholesale | `API/Controllers/BasketController.cs:L28-L34` |
+| DELETE | `api/basket?id={id}` | Anonymous | `string id` bound from the query string | None — the action returns a bare `Task`, so the response has no body | Deletes the Redis key; the repository's `bool` result is discarded by the controller | `API/Controllers/BasketController.cs:L36-L40` |
+| POST | `api/orders` | `[Authorize]` at class level | `OrderDto` | `Order` entity, not `OrderToReturnDto` | Re-reads every product price and the delivery method from PostgreSQL, may delete a pre-existing order carrying the same `PaymentId` and re-call the intent service, inserts a new `Order` with `Status = Pending`, then commits once; answers `BadRequest` with `ApiResponse(400,"Problem creating order")` when the service returns null | `API/Controllers/OrdersController.cs:L16, L28-L36` |
+| GET | `api/orders` | `[Authorize]` at class level | None — the buyer email comes from the JWT principal | `OrderToReturnDto` list, although the action declares an `OrderDto` list | Read-only. Eager-loads `OrderItems` and `DeliveryMethod` and orders by `OrderDate` descending | `API/Controllers/OrdersController.cs:L38-L46` |
+| GET | `api/orders/{id}` | `[Authorize]` at class level | `int id` bound from the route | `OrderToReturnDto` | Read-only. Eager-loads the same graph but applies no ordering, and answers `NotFound` with `ApiResponse(404)` when the id and email do not match a row | `API/Controllers/OrdersController.cs:L48-L55` |
+| GET | `api/orders/deliveryMethods` | `[Authorize]` at class level | None | `DeliveryMethod` list | Read-only `ListAllAsync` over the seeded table; the browser re-sorts the result price-descending before display | `API/Controllers/OrdersController.cs:L57-L61` |
+| POST | `api/payments/{basketId}` | `[Authorize]` at method level | None — the SPA sends an empty body and the basket id travels in the route | `CustomerBasket` | Overwrites each `item.Price` in memory from the product row, creates or updates the Stripe PaymentIntent, and rewrites the basket in Redis with a fresh 30-day expiry; answers `BadRequest` with `ApiResponse(400, "Problem with your basket")` when the basket is missing | `API/Controllers/PaymentsController.cs:L30-L38` |
+| POST | `api/payments/webhook` | Anonymous — authenticated by the Stripe signature rather than a token | Raw JSON body plus the `Stripe-Signature` header | `EmptyResult`, an HTTP 200 with no body | Reads the raw request body, verifies the signature, and on the two handled event types mutates `Order.Status` and commits; performs no idempotency check and persists no Stripe event id | `API/Controllers/PaymentsController.cs:L40-L67` |
+
+### Illustrative request and response shapes
+
+There is no test project in the solution — `ecommerce-shop.sln` declares exactly three, API, Core and Infrastructure `ecommerce-shop.sln:L6, L8, L10` — so the shapes below are lifted from real DTO definitions and real client call sites and are labelled as illustrative shapes rather than captured transcripts. Each is cross-checked against the signature, route or column it describes `API/Dtos/OrderDto.cs:L5-L7` and `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L115-L121`.
+
+The order-creation payload is assembled by the payment component and posted verbatim `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L115-L121` and `client/src/app/checkout/checkout.service.ts:L17`, and binds to `OrderDto` `API/Dtos/OrderDto.cs:L5-L7` whose address member is `AddressDto` `API/Dtos/AddressDto.cs:L9-L20`:
+
+```json
+{
+  "basketId": "b7f1c4de-0000-4a00-9000-000000000000",
+  "deliveryMethodId": 2,
+  "shipToAddress": {
+    "firstName": "Ada", "lastName": "Lovelace",
+    "street": "1 Analytical Way", "city": "London",
+    "state": "LDN", "zipCode": "EC1A"
+  }
+}
+```
+
+The basket upsert body binds to `CustomerBasketDto` `API/Dtos/CustomerBasketDto.cs:L8-L13` with items shaped by `BasketItemDto` `API/Dtos/BasketItemDto.cs:L7-L20`, and the same shape comes back from `GET api/basket` and from `POST api/payments/{basketId}` as a `CustomerBasket` `Core/Entities/CustomerBasket.cs:L16-L22` — with `clientSecret` and `paymentIntentId` populated only after the intent call `Infrastructure/Services/PaymentService.cs:L65-L66`. The product-derived values below mirror real seeded rows rather than invented placeholders: the item is the first seeded product `Infrastructure/Data/SeedData/products.json:L3-L6`, its brand and type are the rows its foreign keys point at `Infrastructure/Data/SeedData/brands.json:L3-L4` and `Infrastructure/Data/SeedData/types.json:L3-L4`, and `deliveryMethodId` is the second seeded delivery method `Infrastructure/Data/SeedData/delivery.json:L9-L15`. Three values are illustrative rather than seeded: the basket `id` stands in for the GUID the browser generates `client/src/app/shared/models/basket.ts:L21-L24`, the item `id` is the catalog primary key the server uses as its re-read key `Core/Entities/BasketItem.cs:L5` and `Infrastructure/Services/PaymentService.cs:L45`, and `quantity` is shopper-chosen `Core/Entities/BasketItem.cs:L8`:
+
+```json
+{
+  "id": "b7f1c4de-0000-4a00-9000-000000000000",
+  "items": [{ "id": 1, "productName": "Angular Speedster Board 2000", "price": 200,
+              "quantity": 1, "pictureUrl": "images/products/sb-ang1.png",
+              "brand": "Angular", "type": "Boards" }],
+  "deliveryMethodId": 2, "clientSecret": null, "paymentIntentId": null, "shippingPrice": 0
+}
+```
+
+The order read endpoints return `OrderToReturnDto` `API/Dtos/OrderToReturnDto.cs:L9-L18`, whose `deliveryMethod` is flattened to the method's short name `API/Helpers/MappingProfiles.cs:L22`, whose `shippingPrice` is the method's price `API/Helpers/MappingProfiles.cs:L23`, whose items are `OrderItemDto` `API/Dtos/OrderItemDto.cs:L5-L9`, and whose `status` is the enum name as text `API/Dtos/OrderToReturnDto.cs:L18`. `GET api/orders/deliveryMethods` returns the seeded `DeliveryMethod` rows directly `Core/Entities/OrderAggregate/DeliveryMethod.cs:L5-L8`, for example `{ "id": 2, "shortName": "UPS2", "deliveryTime": "2-5 Days", "description": "Get it within 5 days", "price": 5.00 }` `Infrastructure/Data/SeedData/delivery.json:L9-L15`.
+
+### Error-response contracts
+
+Deliberate error returns use `ApiResponse`, which carries `StatusCode` and `Message` `API/Errors/ApiResponse.cs:L11-L12` and fills the message from a status-code default when none is supplied — 400 "You have made a bad request", 401 "You are not authorized", 404 "Resource not found", 500 "Server Error" `API/Errors/ApiResponse.cs:L15-L22`. Unhandled exceptions instead produce `ApiException`, which adds a `Details` member `API/Errors/ApiException.cs:L5-L10` populated with the stack trace only in the Development environment `API/Middleware/ExceptionMiddleware.cs:L37-L39`.
+
+Model-validation failures on `POST api/orders` and `POST api/basket` never reach the action. They are intercepted by the configured `InvalidModelStateResponseFactory`, which collects every model-state error message into an array and returns a `BadRequestObjectResult` wrapping it `API/Extension/ApplicationServicesExtensions.cs:L23-L38`. For basket items that includes the two range checks — `Price` must exceed 0.1 and `Quantity` must be at least 1 `API/Dtos/BasketItemDto.cs:L10-L16`. Note what those checks do and do not do: a client-supplied price is validated as positive but never compared against the database, which is precisely why the server re-reads prices itself in [Section 6.1](#61-server-side-price-verification-against-the-database-during-order-and-intent-creation).
+
+Response bodies are camelCase, but nothing in the startup path configures that: `services.AddControllers();` is called with no `AddJsonOptions` argument `API/Startup.cs:L30`, and a repository-wide search finds no `AddJsonOptions` call anywhere. camelCase is the ASP.NET Core 5 `System.Text.Json` web default. The one place the codebase configures a naming policy explicitly is inside the exception middleware, which builds its own `JsonSerializerOptions` with `JsonNamingPolicy.CamelCase` before serialising the error body `API/Middleware/ExceptionMiddleware.cs:L41`. The specification attributes the camelCase behaviour to `Startup.cs` `tech spec §6.3.1.1`; the behaviour is real, but its origin is the framework default rather than a configured option.
+
+None of the three checkout controllers carries XML documentation comments, `ProducesResponseType`, `SwaggerOperation` or an `IncludeXmlComments` registration `API/Controllers/BasketController.cs:L21-L40`, `API/Controllers/OrdersController.cs:L28-L61`, `API/Controllers/PaymentsController.cs:L30-L67`. Their OpenAPI surface, served by Swashbuckle 5.6.3 `API/API.csproj:L15` and mounted at startup `API/Startup.cs:L45, L83`, is therefore reflection-only: routes, verbs and CLR types with no descriptions, response codes, examples or side effects. This section is the semantic layer that surface cannot supply.
+
+### Endpoint contracts worth reading twice
+
+Six endpoint contracts behave differently from what their signatures suggest; each is set out below with the line that produces it, and none is a recommendation to change anything `API/Controllers/OrdersController.cs:L28-L61` and `API/Controllers/BasketController.cs:L21-L40`.
+
+- **`POST api/orders` returns the `Order` entity, not a DTO.** The action's declared return type is `ActionResult<Order>` and its success path is `return Ok(order);` `API/Controllers/OrdersController.cs:L29, L35`. Consumers therefore receive the aggregate as serialised by the framework, not the flattened `OrderToReturnDto` the read endpoints return. The specification states this endpoint returns `OrderToReturnDto` `tech spec §2.2.4`; the code returns the entity.
+- **`GET api/orders` declares one type and returns another.** The signature is `Task<ActionResult<IReadOnlyList<OrderDto>>>` `API/Controllers/OrdersController.cs:L39` while the body is `return Ok(_mapper.Map<IReadOnlyList<OrderToReturnDto>>(orders));` `API/Controllers/OrdersController.cs:L45`. The runtime payload is the `OrderToReturnDto` list; the declared `OrderDto` list is what a reflection-derived schema will advertise.
+- **`GET api/basket` never returns 404.** A missing Redis key produces a freshly constructed empty basket carrying the requested id `API/Controllers/BasketController.cs:L25`, so "no such basket" and "basket with no items" are indistinguishable to the caller — see [Section 8.5](#85-basket-not-found).
+- **`DELETE api/basket` returns nothing at all.** The action is declared `public async Task DeleteBasketAsync(string id)` `API/Controllers/BasketController.cs:L37`, so there is no body and no status object, even though the repository method it awaits returns `Task<bool>` `Core/Interfaces/IBasketRepository.cs:L10` and the underlying `KeyDeleteAsync` reports whether a key was actually removed `Infrastructure/Data/BasketRepository.cs:L36`. The caller cannot tell a successful delete from a no-op.
+- **`AddressDto` has a `[Required]` `Id` the order flow never uses.** The property is declared `[Required] public int Id { get; set; }` `API/Dtos/AddressDto.cs:L7-L8`, but the client sends only the six address fields `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L119` and `client/src/app/checkout/checkout.component.ts:L27-L34`, and the map used by the order path targets `Core.Entities.OrderAggregate.Address` `API/Helpers/MappingProfiles.cs:L20`, which has no `Id` member at all `Core/Entities/OrderAggregate/Address.cs:L19-L24`. Because `[Required]` on a non-nullable `int` is satisfied by the default `0`, the attribute never rejects a request. The property is inert and unused rather than a live failure mode.
+- **Route ordering resolves `deliveryMethods` by precedence, not by declaration order.** `[HttpGet("{id}")]` is declared at `API/Controllers/OrdersController.cs:L48`, ahead of `[HttpGet("deliveryMethods")]` at `API/Controllers/OrdersController.cs:L57`. ASP.NET Core prefers the literal segment over the parameter segment, so `api/orders/deliveryMethods` reaches the intended action; the resolution depends on that precedence rule rather than on the order the actions appear in.
+
+---
+
+## 5. Data model
+
+Eight types make up the checkout data model, split across two stores, and the split is also the feature boundary: the six PostgreSQL types are the persistence surface of **F-004 Order Processing** `Core/Entities/OrderAggregate/Order.cs:L6-L34`, while the two Redis types are that of **F-003 Shopping Basket** `Core/Entities/CustomerBasket.cs:L16-L22`, and the correlation between them is what **F-005 Payment Processing** writes `Infrastructure/Services/OrderService.cs:L52`. Six are persisted to the PostgreSQL `e-commerce` database through `StoreContext`, which declares the `Orders`, `OrderItems` and `DeliveryMethods` sets `Infrastructure/Data/StoreContext.cs:L21-L23`: `Order`, `OrderItem`, `ProductItemOrdered`, `DeliveryMethod`, the `OrderStatus` enumeration and the `OrderAggregate.Address` owned type. Two live only in Redis as serialised JSON under the basket id with a 30-day expiry `Infrastructure/Data/BasketRepository.cs:L27`: `CustomerBasket` and `BasketItem`.
+
+**Figure 3 — Checkout Data Model** shows the structure and the relationships. Figure 3 is drawn as a `classDiagram` rather than an `erDiagram` deliberately: only a class diagram can express EF Core owned types — `Address` and `ProductItemOrdered`, which have no identity of their own and are persisted as prefixed columns on the owner's table `Infrastructure/Data/Config/OrderConfiguration.cs:L12` and `Infrastructure/Data/Config/OrderItemConfiguration.cs:L11` — and the `<<enumeration>>` stereotype on `OrderStatus` `Core/Entities/OrderAggregate/OrderStatus.cs:L5-L12`.
+
+```mermaid
+classDiagram
+    direction LR
+    class Order {
+        +int Id
+        +string BuyerEmail
+        +DateTimeOffset OrderDate
+        +Address ShipToAddress
+        +DeliveryMethod DeliveryMethod
+        +IReadOnlyList~OrderItem~ OrderItems
+        +decimal Subtotal
+        +OrderStatus Status
+        +string PaymentId
+        +GetTotal() decimal
+    }
+    class OrderItem {
+        +int Id
+        +ProductItemOrdered ItemOrdered
+        +decimal Price
+        +int Quantity
+    }
+    class ProductItemOrdered {
+        +int ProductItemId
+        +string ProductName
+        +string PictureUrl
+    }
+    class DeliveryMethod {
+        +int Id
+        +string ShortName
+        +string DeliveryTime
+        +string Description
+        +decimal Price
+    }
+    class Address {
+        +string FirstName
+        +string LastName
+        +string Street
+        +string City
+        +string State
+        +string ZipCode
+    }
+    class OrderStatus {
+        <<enumeration>>
+        Pending
+        PaymentReceived
+        PaymentFailed
+    }
+    class CustomerBasket {
+        +string Id
+        +List~BasketItem~ Items
+        +int DeliveryMethodId
+        +string ClientSecret
+        +string PaymentIntentId
+        +decimal ShippingPrice
+    }
+    class BasketItem {
+        +int Id
+        +string ProductName
+        +decimal Price
+        +int Quantity
+        +string PictureUrl
+        +string Brand
+        +string Type
+    }
+
+    Order "1" *-- "many" OrderItem : OrderItems, cascade delete
+    Order "1" *-- "1" Address : owned, ShipToAddress_ columns
+    Order "many" --> "1" DeliveryMethod : FK DeliveryMethodId
+    Order --> OrderStatus : Status, stored as text
+    OrderItem "1" *-- "1" ProductItemOrdered : owned, ItemOrdered_ columns
+    CustomerBasket "1" *-- "many" BasketItem : Items
+    CustomerBasket ..> Order : PaymentIntentId maps to Order.PaymentId
+```
+
+**Legend for Figure 3.** A filled diamond denotes an owned type persisted into the owner's own table as prefixed columns, not a separate table. A plain arrow denotes a foreign-key relationship. The arrow from `Order` to `OrderStatus` denotes the enum-typed property, stored as text through a value conversion `Infrastructure/Data/Config/OrderConfiguration.cs:L13-L16`. The dashed `CustomerBasket ..> Order` edge denotes a logical cross-store correlation that carries no database constraint whatsoever — no foreign key, no index, no unique constraint, as the migration's `Orders` table definition shows `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L53-L70`. `<<enumeration>>` marks `OrderStatus`. One diagram simplification is worth correcting against the source: `CustomerBasket.DeliveryMethodId` is shown as `int` for parser safety but is genuinely `int?` `Core/Entities/CustomerBasket.cs:L18`, and the table below records the true nullability.
+
+Column names, column types and nullability in the tables below are taken only from the migration `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L11-L155` and the model snapshot, whose three checkout entities are declared at `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L22` for `DeliveryMethod`, `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L46` for `Order` and `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L79` for `OrderItem`, and their two owned types declared at `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L175` for `ShipToAddress` and `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L220` for `ItemOrdered`. They are never inferred from CLR property types, because in several places the two disagree.
+
+### `Order` — the aggregate root
+
+| Property | CLR type | PostgreSQL column and type | Notes |
+|---|---|---|---|
+| `Id` | `int`, inherited from `BaseEntity` `Core/Entities/BaseEntity.cs:L5` | `Id` integer, identity by default `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L57-L58` | Primary key `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L74` |
+| `BuyerEmail` | `string` `Core/Entities/OrderAggregate/Order.cs:L22` | `BuyerEmail` text, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L59` | Set from the JWT principal, never from the request body `API/Controllers/OrdersController.cs:L31` |
+| `OrderDate` | `DateTimeOffset`, initialised to `DateTimeOffset.Now` `Core/Entities/OrderAggregate/Order.cs:L23` | `OrderDate` timestamp with time zone, not null `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L60` | Assigned by the field initialiser at construction, not by the database |
+| `ShipToAddress` | `Address` `Core/Entities/OrderAggregate/Order.cs:L24` | Six text-nullable columns `ShipToAddress_FirstName`, `_LastName`, `_Street`, `_City`, `_State`, `_ZipCode` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L61-L66` | Owned type, configured with `OwnsOne` `Infrastructure/Data/Config/OrderConfiguration.cs:L12` |
+| `DeliveryMethod` | `DeliveryMethod` `Core/Entities/OrderAggregate/Order.cs:L25` | `DeliveryMethodId` integer, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L67` | Foreign key with `ReferentialAction.Restrict` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L75-L80`; indexed `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L142-L145` |
+| `OrderItems` | `IReadOnlyList<OrderItem>` `Core/Entities/OrderAggregate/Order.cs:L26` | No column; the child rows carry `OrderId` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L124` | Cascade delete configured on the parent `Infrastructure/Data/Config/OrderConfiguration.cs:L17` |
+| `Subtotal` | `decimal` `Core/Entities/OrderAggregate/Order.cs:L27` | `Subtotal` numeric with no precision or scale, not null `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L68` | Computed from database prices, never from basket prices `Infrastructure/Services/OrderService.cs:L40` |
+| `Status` | `OrderStatus`, initialised to `OrderStatus.Pending` `Core/Entities/OrderAggregate/Order.cs:L28` | `Status` text, **not null** `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L69` | Stored as the enum member name through a value conversion `Infrastructure/Data/Config/OrderConfiguration.cs:L13-L16` |
+| `PaymentId` | `string` `Core/Entities/OrderAggregate/Order.cs:L29` | `PaymentId` text, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L70` | Holds the Stripe PaymentIntent id; carries no index and no unique constraint `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L62-L63` |
+| `GetTotal()` | method returning `decimal` `Core/Entities/OrderAggregate/Order.cs:L31-L34` | Not persisted | Returns `Subtotal + DeliveryMethod.Price` `Core/Entities/OrderAggregate/Order.cs:L33`, so it dereferences the navigation and requires it to be loaded |
+
+The property that holds the Stripe intent id is named `PaymentId`, not `PaymentIntentId` `Core/Entities/OrderAggregate/Order.cs:L29`, while the basket-side property it is copied from is named `PaymentIntentId` `Core/Entities/CustomerBasket.cs:L20`. The two names refer to the same Stripe value. `Order` also declares a parameterless constructor alongside its six-argument one so EF Core can materialise it `Core/Entities/OrderAggregate/Order.cs:L8-L20`.
+
+### `OrderItem` and its owned `ProductItemOrdered`
+
+| Property | CLR type | PostgreSQL column and type | Notes |
+|---|---|---|---|
+| `Id` | `int`, inherited from `BaseEntity` `Core/Entities/OrderAggregate/OrderItem.cs:L3` | `Id` integer, identity by default `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L117-L118` | Primary key `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L128` |
+| `ItemOrdered.ProductItemId` | `int` `Core/Entities/OrderAggregate/ProductItemOrdered.cs:L16` | `ItemOrdered_ProductItemId` integer, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L119` | Owned-type column; snapshot of the catalog row's id at order time `Infrastructure/Services/OrderService.cs:L33` |
+| `ItemOrdered.ProductName` | `string` `Core/Entities/OrderAggregate/ProductItemOrdered.cs:L17` | `ItemOrdered_ProductName` text, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L120` | Copied from the database row, not from the basket `Infrastructure/Services/OrderService.cs:L33` |
+| `ItemOrdered.PictureUrl` | `string` `Core/Entities/OrderAggregate/ProductItemOrdered.cs:L18` | `ItemOrdered_PictureUrl` text, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L121` | Rewritten with the `ApiUrl` prefix on the way out `API/Helpers/OrderItemUrlResolver.cs:L22` |
+| `Price` | `decimal` `Core/Entities/OrderAggregate/OrderItem.cs:L17` | `Price` numeric(18,2), not null `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L122` | Configured explicitly as `decimal(18,2)` `Infrastructure/Data/Config/OrderItemConfiguration.cs:L12-L13`; always the database price `Infrastructure/Services/OrderService.cs:L34` |
+| `Quantity` | `int` `Core/Entities/OrderAggregate/OrderItem.cs:L18` | `Quantity` integer, not null `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L123` | The one item field taken from the client basket `Infrastructure/Services/OrderService.cs:L34` |
+| (parent link) | none — no CLR property | `OrderId` integer, **nullable** `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L124` | Shadow foreign key with `ReferentialAction.Cascade` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L129-L134`; indexed as `IX_OrderItems_OrderId` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L137-L140` |
+
+`ProductItemOrdered` is deliberately not a `BaseEntity` — it is declared as a plain class `Core/Entities/OrderAggregate/ProductItemOrdered.cs:L3` — which is what allows EF Core to treat it as an owned type persisted into the `OrderItems` table `Infrastructure/Data/Config/OrderItemConfiguration.cs:L11` rather than as a table of its own.
+
+### `DeliveryMethod`
+
+| Property | CLR type | PostgreSQL column and type | Notes |
+|---|---|---|---|
+| `Id` | `int`, inherited from `BaseEntity` `Core/Entities/OrderAggregate/DeliveryMethod.cs:L3` | `Id` integer, identity by default `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L15-L16` | Primary key `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L24`; the value the client sends as `deliveryMethodId` `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L118` |
+| `ShortName` | `string` `Core/Entities/OrderAggregate/DeliveryMethod.cs:L5` | `ShortName` text, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L17` | Flattened into `OrderToReturnDto.DeliveryMethod` `API/Helpers/MappingProfiles.cs:L22` |
+| `DeliveryTime` | `string` `Core/Entities/OrderAggregate/DeliveryMethod.cs:L6` | `DeliveryTime` text, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L18` | Display-only; no code branches on it `Infrastructure/Services/OrderService.cs:L38` |
+| `Description` | `string` `Core/Entities/OrderAggregate/DeliveryMethod.cs:L7` | `Description` text, nullable `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L19` | Display-only, sourced from the seed file `Infrastructure/Data/SeedData/delivery.json:L5` |
+| `Price` | `decimal` `Core/Entities/OrderAggregate/DeliveryMethod.cs:L8` | `Price` numeric(18,2), not null `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L20` | Configured as `decimal(18,2)` `Infrastructure/Data/Config/DeliveryMethodConfiguration.cs:L11-L12`; feeds both the Stripe amount `Infrastructure/Services/PaymentService.cs:L40` and `GetTotal()` `Core/Entities/OrderAggregate/Order.cs:L33` |
+
+Four rows are seeded, and they are seeded only when the table is already empty `Infrastructure/Data/StoreContextSeed.cs:L53`: `UPS1`, "Fastest delivery time", 1-2 Days, 10 `Infrastructure/Data/SeedData/delivery.json:L2-L8`; `UPS2`, "Get it within 5 days", 2-5 Days, 5 `Infrastructure/Data/SeedData/delivery.json:L9-L15`; `UPS3`, "Slower but cheap", 5-10 Days, 2 `Infrastructure/Data/SeedData/delivery.json:L16-L22`; and `FREE`, "Free! You get what you pay for", 1-2 Weeks, 0 `Infrastructure/Data/SeedData/delivery.json:L23-L29`. Every order total depends on one of those four rows existing `Core/Entities/OrderAggregate/Order.cs:L33`.
+
+### `OrderStatus` and the `OrderAggregate.Address` owned type
+
+| Member | CLR form | Persisted form | Notes |
+|---|---|---|---|
+| `Pending` | enum member carrying `[EnumMember(Value = "Pending")]` `Core/Entities/OrderAggregate/OrderStatus.cs:L7-L8` | the text `Pending` in `Orders.Status` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L69` | The field-initialiser default for every new order `Core/Entities/OrderAggregate/Order.cs:L28` |
+| `PaymentReceived` | enum member carrying `[EnumMember(Value = "Payment Received")]` `Core/Entities/OrderAggregate/OrderStatus.cs:L9-L10` | the text `PaymentReceived` `Infrastructure/Data/Config/OrderConfiguration.cs:L15` | Set only by the succeeded webhook handler `Infrastructure/Services/PaymentService.cs:L88` |
+| `PaymentFailed` | enum member carrying `[EnumMember(Value = "Payment Failed")]` `Core/Entities/OrderAggregate/OrderStatus.cs:L11-L12` | the text `PaymentFailed` `Infrastructure/Data/Config/OrderConfiguration.cs:L15` | Set only by the failed webhook handler `Infrastructure/Services/PaymentService.cs:L102` |
+
+The `[EnumMember]` display values are inert on every path this workflow uses. Persistence converts with `o => o.ToString()` `Infrastructure/Data/Config/OrderConfiguration.cs:L15`, which emits the member name rather than the attribute value, and the reverse conversion parses that same name back `Infrastructure/Data/Config/OrderConfiguration.cs:L16`. On the wire, `OrderToReturnDto.Status` is a plain `string` `API/Dtos/OrderToReturnDto.cs:L18` that AutoMapper fills by the same name-based conversion, and a repository-wide search finds no `JsonStringEnumConverter` and no `AddJsonOptions` anywhere to change that. Consumers therefore observe `Pending`, `PaymentReceived` and `PaymentFailed`; the space-separated strings never render. The specification's order-status table lists the space-separated forms `tech spec §4.4.1`, which is the divergence this paragraph records.
+
+The order's shipping address is `Core/Entities/OrderAggregate/Address.cs`, which has **no `Id`** and exactly six string properties `Core/Entities/OrderAggregate/Address.cs:L19-L24`, persisted as the six `ShipToAddress_*` columns on the `Orders` table `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L61-L66`. It is a different class from `Core/Entities/Identity/Address.cs`, which shares the name but declares an `int Id` `Core/Entities/Identity/Address.cs:L7`, a `[Required] AppUserId` `Core/Entities/Identity/Address.cs:L15-L16` and an `AppUser` navigation `Core/Entities/Identity/Address.cs:L17`. The order path uses only the first: the map registered for order creation targets `Core.Entities.OrderAggregate.Address` explicitly `API/Helpers/MappingProfiles.cs:L20`, and `OrderToReturnDto.ShipToAddress` is typed as that same entity rather than as `AddressDto` `API/Dtos/OrderToReturnDto.cs:L3, L12`. When you read `Address` in this codebase, check the namespace first.
+
+### `CustomerBasket` and `BasketItem` in Redis
+
+The basket is not in PostgreSQL at all. It is serialised with `JsonSerializer.Serialize` and stored under the basket id as the Redis key with a 30-day expiry `Infrastructure/Data/BasketRepository.cs:L27`, and read back with `JsonSerializer.Deserialize` `Infrastructure/Data/BasketRepository.cs:L21`. There is no schema, no migration and no constraint on any of it.
+
+| Property | CLR type | Redis JSON member | Notes |
+|---|---|---|---|
+| `CustomerBasket.Id` | `string` `Core/Entities/CustomerBasket.cs:L16` | `id`, and simultaneously the Redis key itself `Infrastructure/Data/BasketRepository.cs:L27` | A GUID the browser generates `client/src/app/shared/models/basket.ts:L22` and keeps in `localStorage` `client/src/app/basket/basket.service.ts:L87` |
+| `CustomerBasket.Items` | `List<BasketItem>`, initialised empty `Core/Entities/CustomerBasket.cs:L17` | `items` array | Iterated without a null guard during order creation `Infrastructure/Services/OrderService.cs:L30` |
+| `CustomerBasket.DeliveryMethodId` | `int?` — genuinely nullable `Core/Entities/CustomerBasket.cs:L18` | `deliveryMethodId` | Gate for the shipping lookup: `HasValue` decides whether shipping is priced at all `Infrastructure/Services/PaymentService.cs:L36-L41` |
+| `CustomerBasket.ClientSecret` | `string` `Core/Entities/CustomerBasket.cs:L19` | `clientSecret` | Written only on the intent-create branch `Infrastructure/Services/PaymentService.cs:L66`; consumed by the browser to confirm the card `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L99` |
+| `CustomerBasket.PaymentIntentId` | `string` `Core/Entities/CustomerBasket.cs:L20` | `paymentIntentId` | Written on the create branch `Infrastructure/Services/PaymentService.cs:L65`; copied into `Order.PaymentId` at order construction `Infrastructure/Services/OrderService.cs:L52` |
+| `CustomerBasket.ShippingPrice` | `decimal` `Core/Entities/CustomerBasket.cs:L22` | `shippingPrice` | Never written by `PaymentService`, which uses a local `shippingPrice` variable instead `Infrastructure/Services/PaymentService.cs:L32, L40`; only the client sets it `client/src/app/basket/basket.service.ts:L37` |
+| `BasketItem.Id` | `int` `Core/Entities/BasketItem.cs:L5` | `id` | Used as the product id for the database re-read `Infrastructure/Services/PaymentService.cs:L45` and `Infrastructure/Services/OrderService.cs:L32` |
+| `BasketItem.ProductName` | `string` `Core/Entities/BasketItem.cs:L6` | `productName` | Ignored at order creation, which takes the name from the database row `Infrastructure/Services/OrderService.cs:L33` |
+| `BasketItem.Price` | `decimal` `Core/Entities/BasketItem.cs:L7` | `price` | Overwritten in place when it disagrees with the database `Infrastructure/Services/PaymentService.cs:L46-L48`, and ignored entirely at order creation `Infrastructure/Services/OrderService.cs:L34` |
+| `BasketItem.Quantity` | `int` `Core/Entities/BasketItem.cs:L8` | `quantity` | Trusted as supplied, subject only to the DTO range check `API/Dtos/BasketItemDto.cs:L14-L16` |
+| `BasketItem.PictureUrl` | `string` `Core/Entities/BasketItem.cs:L9` | `pictureUrl` | Ignored at order creation in favour of the database value `Infrastructure/Services/OrderService.cs:L33` |
+| `BasketItem.Brand` | `string` `Core/Entities/BasketItem.cs:L10` | `brand` | Display-only; the order aggregate has no equivalent member `Core/Entities/OrderAggregate/ProductItemOrdered.cs:L16-L18` |
+| `BasketItem.Type` | `string` `Core/Entities/BasketItem.cs:L11` | `type` | Display-only, with no order-side counterpart `Core/Entities/OrderAggregate/ProductItemOrdered.cs:L16-L18` |
+
+### How the two relate
+
+The link between the Redis basket and the PostgreSQL order is a **logical correlation with no database constraint of any kind**. When the order is constructed, `basket.PaymentIntentId` is passed as the last constructor argument and lands in `Order.PaymentId` `Infrastructure/Services/OrderService.cs:L52` and `Core/Entities/OrderAggregate/Order.cs:L15`. From that point on, every lookup that has to find an order from a Stripe identifier goes through that one column: stale-order replacement during order creation `Infrastructure/Services/OrderService.cs:L43-L44`, the succeeded webhook handler `Infrastructure/Services/PaymentService.cs:L84-L85` and the failed webhook handler `Infrastructure/Services/PaymentService.cs:L98-L99`, all using the same single-predicate Specification `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9`. Nothing enforces the correlation: `Orders.PaymentId` is a nullable text column `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L70` with no foreign key, no index and no unique constraint `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L62-L63`, and the basket side is a JSON member in a different store `Infrastructure/Data/BasketRepository.cs:L27`. The consequences are traced in [Section 6.4](#64-stale-order-replacement-by-paymentintentid) and [Section 8.4](#84-re-submitted-intents).
+
+### Mapping notes
+
+Three mapping behaviours change the payload in ways the DTO definitions alone do not reveal, and all three live in one profile `API/Helpers/MappingProfiles.cs:L21-L28`.
+
+- **`OrderToReturnDto.Total` is never explicitly mapped.** The `Order` to `OrderToReturnDto` profile configures only two members, `DeliveryMethod` from the method's short name and `ShippingPrice` from its price `API/Helpers/MappingProfiles.cs:L21-L23`. `Total` is populated because AutoMapper matches the destination member `Total` `API/Dtos/OrderToReturnDto.cs:L17` to the source method `GetTotal()` `Core/Entities/OrderAggregate/Order.cs:L31-L34` by its Get-prefix convention. The value therefore comes from `Subtotal + DeliveryMethod.Price` `Core/Entities/OrderAggregate/Order.cs:L33` and depends on the delivery-method navigation having been eager-loaded `Core/Specifications/OrdersWithItemsAndOrderingSpecification.cs:L10, L18`.
+- **`PictureUrl` is mapped twice for the same destination member.** The `OrderItem` to `OrderItemDto` profile first maps it from `ItemOrdered.PictureUrl` `API/Helpers/MappingProfiles.cs:L27` and then maps the same destination member again from `OrderItemUrlResolver` `API/Helpers/MappingProfiles.cs:L28`. The last registration wins, so what consumers actually receive is the resolver's output: the configured `ApiUrl` concatenated with the stored relative path `API/Helpers/OrderItemUrlResolver.cs:L22`, or `null` when the stored path is empty `API/Helpers/OrderItemUrlResolver.cs:L25`.
+- **The basket maps straight through with no adjustment.** `CustomerBasketDto` maps to `CustomerBasket` and `BasketItemDto` to `BasketItem` with no member configuration at all `API/Helpers/MappingProfiles.cs:L18-L19`, which is why a client-supplied price reaches the entity untouched and has to be corrected server-side later `Infrastructure/Services/PaymentService.cs:L46-L48`.
+
+### Schema facts that contradict the aggregate
+
+Two schema details do not match how the code treats the entities, and both are properties of the shipped migration `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L53-L135` rather than of the CLR model `Core/Entities/OrderAggregate/Order.cs:L22-L34`.
+
+- **Precision is inconsistent across the money columns.** `Orders.Subtotal` is plain `numeric` with no precision or scale `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L68`, corroborated by the snapshot `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L69-L70`, whereas `OrderItems.Price` is `numeric(18,2)` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L122` and `DeliveryMethods.Price` likewise `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L20`. The difference follows from the configuration: the two `Price` properties are configured explicitly `Infrastructure/Data/Config/OrderItemConfiguration.cs:L12-L13` and `Infrastructure/Data/Config/DeliveryMethodConfiguration.cs:L11-L12`, while `Subtotal` is not configured anywhere `Infrastructure/Data/Config/OrderConfiguration.cs:L12-L17`.
+- **Two columns are nullable that the aggregate treats as required.** `Orders.DeliveryMethodId` is `integer, nullable` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L67` even though `GetTotal()` dereferences the navigation unconditionally `Core/Entities/OrderAggregate/Order.cs:L33`, and `OrderItems.OrderId` is `integer, nullable` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L124` even though the relationship is configured as a required-looking cascade `Infrastructure/Data/Config/OrderConfiguration.cs:L17`. Both are optional at the database level because neither navigation is declared required in the model `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L56-L57`.
+
+For the history behind the basket type and the order aggregate, see `CHANGES.md:§6.2` "6.2. Setting up a basket class" at `CHANGES.md:L1816` and `CHANGES.md:§9.1` "9.1. Creating the order aggregate" at `CHANGES.md:L2882`. Both carry the same caveat as every other cross-reference in this document: that narrative ends at chapter 9.11 `CHANGES.md:L3674` and never covers payments, the Stripe webhook or the order status lifecycle, and its stack header is stale `CHANGES.md:L7` relative to the Npgsql registration the code actually performs `API/Startup.cs:L31-L36`.
+
+---
+
+## 6. Key mechanics
+
+Four mechanics carry most of the workflow's risk. Each sub-section traces the exact call path and closes with an explicit statement of what breaks downstream if you change it. By feature, [6.1](#61-server-side-price-verification-against-the-database-during-order-and-intent-creation) spans **F-004 Order Processing** and **F-005 Payment Processing**, because the same rule is applied independently in `Infrastructure/Services/OrderService.cs:L32-L34` and `Infrastructure/Services/PaymentService.cs:L45-L49`; [6.2](#62-unit-of-work-commit) is **F-004** `Infrastructure/Data/UnitOfWork.cs:L40-L43`; and [6.3](#63-stripe-webhook-signature-verification) and [6.4](#64-stale-order-replacement-by-paymentintentid) are **F-005** `API/Controllers/PaymentsController.cs:L44` and `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9`.
+
+### 6.1 Server-side price verification against the database during order and intent creation
+
+The server never trusts the price the browser sends. It re-reads the product row and uses the database's price, and it does so in **two separate places** with two different consequences `Infrastructure/Services/OrderService.cs:L30-L36` and `Infrastructure/Services/PaymentService.cs:L43-L50`.
+
+**At order creation.** `CreateOrderAsync` fetches the basket `Infrastructure/Services/OrderService.cs:L27`, then loops over its items `Infrastructure/Services/OrderService.cs:L30-L36`. For each one it reads the product by the basket item's id `Infrastructure/Services/OrderService.cs:L32`, builds a snapshot from the database row's id, name and picture URL `Infrastructure/Services/OrderService.cs:L33`, and constructs the line item from the database price and the client's quantity:
+
+```csharp
+var productItem = await _unitOfWork.Repository<Product>().GetByIdAsync(item.Id);
+var itemOrdered = new ProductItemOrdered(productItem.Id, productItem.Name, productItem.PictureUrl);
+var orderItem = new OrderItem(itemOrdered, productItem.Price, item.Quantity);
+```
+
+`item.Price` — the basket's price — is not referenced anywhere in that construction `Infrastructure/Services/OrderService.cs:L34`. It is ignored entirely, not compared and not corrected. The subtotal is then summed from those database-sourced line items `Infrastructure/Services/OrderService.cs:L40`, so the persisted `Orders.Subtotal` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L68` cannot reflect a tampered basket.
+
+**At intent creation.** `CreateOrUpdatePaymentIntent` performs the same read `Infrastructure/Services/PaymentService.cs:L45` but then does something the order path does not: it writes the corrected value back onto the basket object when the two disagree `Infrastructure/Services/PaymentService.cs:L46-L48`, and at the end of the method it **persists that corrected basket back to Redis** `Infrastructure/Services/PaymentService.cs:L78`. The correction is therefore durable, and because the write goes through `UpdateBasketAsync` it also resets the key's 30-day expiry `Infrastructure/Data/BasketRepository.cs:L27`.
+
+**Amount arithmetic.** The Stripe amount is computed identically in both branches `Infrastructure/Services/PaymentService.cs:L60` and `Infrastructure/Services/PaymentService.cs:L73`:
+
+```csharp
+Amount = (long) basket.Items.Sum(i => i.Quantity * (i.Price * 100)) + (long) shippingPrice * 100
+```
+
+Item money is multiplied to cents before the cast, so item amounts keep their cents. Shipping does not: the cast binds tighter than the multiplication, so `(long) shippingPrice` truncates to whole dollars **before** being multiplied by 100 `Infrastructure/Services/PaymentService.cs:L60`. A shipping price with a fractional part loses it from the amount charged. `shippingPrice` starts at `0m` `Infrastructure/Services/PaymentService.cs:L32` and is only set when the basket carries a delivery method id `Infrastructure/Services/PaymentService.cs:L36-L41`, taken from the selected method's `Price` `Infrastructure/Services/PaymentService.cs:L40`. The four seeded prices are all whole dollars `Infrastructure/Data/SeedData/delivery.json:L7, L14, L21, L28`, so the truncation has no effect on seeded data.
+
+The DTO validation layer is not a substitute for any of this. `BasketItemDto` requires `Price` to exceed 0.1 and `Quantity` to be at least 1 `API/Dtos/BasketItemDto.cs:L10-L16`, which rejects zero and negative prices but never compares the value to the database. The re-read is the only authority.
+
+**What breaks if you change this.** Removing or reordering the re-read in either place makes the client's price authoritative and the amount charged attacker-controlled — that is the whole of the protection described in [Section 8.1](#81-tampered-basket-prices). The two computations are independent: the Stripe amount is derived in `PaymentService` from basket items `Infrastructure/Services/PaymentService.cs:L60` while the persisted subtotal is derived in `OrderService` from freshly built line items `Infrastructure/Services/OrderService.cs:L40`, so changing the rule in one place without the other de-synchronises what Stripe charges from what the order records. Because only the intent path writes the basket back `Infrastructure/Services/PaymentService.cs:L78`, moving or removing that call changes two things at once — the stored prices and the key's expiry `Infrastructure/Data/BasketRepository.cs:L27`. And because the amount uses `i.Price` after the correction loop has run `Infrastructure/Services/PaymentService.cs:L43-L50, L60`, any reordering that computes the amount before the loop would charge the client's price while persisting the database's.
+
+### 6.2 Unit of Work commit
+
+"Unit of Work" here is narrower than the pattern name suggests, and knowing exactly how narrow is the point of this sub-section: the interface exposes a repository factory and a single commit `Core/Interfaces/IUnitOfWork.cs:L7-L10`, and the commit is one call `Infrastructure/Data/UnitOfWork.cs:L40-L43`.
+
+The contract exposes two members and derives from `IDisposable`: a generic repository accessor and a commit `Core/Interfaces/IUnitOfWork.cs:L7-L10`. The implementation holds one injected `StoreContext` `Infrastructure/Data/UnitOfWork.cs:L11, L14-L17` and caches one repository per entity type in a `Hashtable` keyed on the type's name `Infrastructure/Data/UnitOfWork.cs:L24-L38`, constructing each through reflection `Infrastructure/Data/UnitOfWork.cs:L32-L33` and handing every one of them the same context instance `Infrastructure/Data/UnitOfWork.cs:L33`. That shared context is what makes the pattern work at all: repositories obtained for different entity types write into a single change tracker.
+
+The commit is one line `Infrastructure/Data/UnitOfWork.cs:L42`:
+
+```csharp
+public async Task<int> Complete()
+{
+    return await _context.SaveChangesAsync();
+}
+```
+
+That is the whole of it `Infrastructure/Data/UnitOfWork.cs:L40-L43`. **There is no explicit transaction anywhere** — a repository-wide search finds no `BeginTransaction`, no `TransactionScope` and no explicit isolation level. Atomicity is exactly what one `SaveChangesAsync` call gives you over one batch on one context, and nothing more. `Complete()` returns the affected-row count, which is the only signal callers get `Infrastructure/Data/UnitOfWork.cs:L42`.
+
+The repository operations that stage work into that batch are thin `Infrastructure/Data/GenericRepository.cs:L20-L59`: `GetByIdAsync` is `FindAsync` `Infrastructure/Data/GenericRepository.cs:L22`; `GetEntityWithSpec` applies the Specification and takes `FirstOrDefaultAsync` `Infrastructure/Data/GenericRepository.cs:L32`; `Add` is `Set<T>().Add` `Infrastructure/Data/GenericRepository.cs:L47`; `Delete` is `Set<T>().Remove` `Infrastructure/Data/GenericRepository.cs:L58`; and `Update` attaches the entity and forces its state to `Modified` `Infrastructure/Data/GenericRepository.cs:L52-L53`.
+
+Lifetimes make the sharing safe. All five services are registered `Scoped` `API/Extension/ApplicationServicesExtensions.cs:L17-L22`, so a single request gets one `UnitOfWork`, one `StoreContext` and one change tracker, and `OrderService` plus `PaymentService` therefore stage into the same batch even though they are separate objects `Infrastructure/Services/OrderService.cs:L14` and `Infrastructure/Services/PaymentService.cs:L17`.
+
+In the order-creation path this is what one commit covers: the delete of a stale order `Infrastructure/Services/OrderService.cs:L48` and the insert of its replacement `Infrastructure/Services/OrderService.cs:L53` are both flushed by the single `Complete()` at `Infrastructure/Services/OrderService.cs:L55`, and the only failure check is `if (result <= 0) return null;` `Infrastructure/Services/OrderService.cs:L57`.
+
+**What breaks if you change this.** Because there is no explicit transaction, adding a second `Complete()` call anywhere in `CreateOrderAsync` splits what is currently one atomic batch into two independently-failing ones, and the delete could commit while the insert does not `Infrastructure/Services/OrderService.cs:L48-L55`. Anything that relies on the row count breaks silently the moment a future change stages a no-op modification, because `result <= 0` is read as failure `Infrastructure/Services/OrderService.cs:L57` even though zero affected rows is a legitimate outcome of `SaveChangesAsync`. Swapping the `Hashtable` cache `Infrastructure/Data/UnitOfWork.cs:L26-L34` for per-call construction, or changing any of the five `Scoped` registrations to `Transient` `API/Extension/ApplicationServicesExtensions.cs:L17-L22`, would give repositories separate contexts and quietly break cross-repository atomicity with no compilation error to warn you. The webhook handlers depend on the same shared-context behaviour for a subtler reason set out in [Section 7](#7-order-status-lifecycle). For the original derivation of the pattern here, see `CHANGES.md:§9.6` "9.6. Implementing Unit Of Work Design Pattern" at `CHANGES.md:L3323`, remembering that the narrative stops at chapter 9.11 `CHANGES.md:L3674` and never reaches the payment path that depends on it, and that its stack header is stale `CHANGES.md:L7`.
+
+### 6.3 Stripe webhook signature verification
+
+The webhook is the only anonymous write in the workflow — the action carries no `[Authorize]` attribute `API/Controllers/PaymentsController.cs:L40-L41`, unlike the intent endpoint above it `API/Controllers/PaymentsController.cs:L30` — and the signature is the only thing authenticating it `API/Controllers/PaymentsController.cs:L44`.
+
+The signing secret is read once, in the controller's constructor, straight from configuration `API/Controllers/PaymentsController.cs:L27`:
+
+```csharp
+_whSecret = config.GetSection("StripeSettings:WhSecret").Value;
+```
+
+The request body is read as raw text rather than model-bound `API/Controllers/PaymentsController.cs:L43`:
+
+```csharp
+var json = await new StreamReader(HttpContext.Request.Body).ReadToEndAsync();
+var stripeEvent = EventUtility.ConstructEvent(json, Request.Headers["Stripe-Signature"], _whSecret);
+```
+
+That is deliberate and load-bearing. Verification is computed over the exact bytes Stripe signed, so binding a typed parameter — which would deserialise and re-serialise the payload — would change those bytes and invalidate the signature. Stripe's published contract requires the raw payload, the `Stripe-Signature` header and the endpoint's signing secret; the header carries a timestamp and a `v1` signature, though its internal structure is **unverified** from this repository. `ConstructEvent` performs the verification `API/Controllers/PaymentsController.cs:L44`, and it is **not wrapped in a `try`/`catch`** — the file contains no `try` statement at all.
+
+Once an event is constructed, the switch handles exactly two types `API/Controllers/PaymentsController.cs:L49-L63`: `"payment_intent.succeeded"` `API/Controllers/PaymentsController.cs:L51` and `"payment_intent.payment_failed"` `API/Controllers/PaymentsController.cs:L57`. There is no `default` arm, so any other event type falls through to the same unconditional `return new EmptyResult();` `API/Controllers/PaymentsController.cs:L65` having taken no action.
+
+**The failure contract is HTTP 500, not HTTP 400.** Because nothing catches the verification failure `API/Controllers/PaymentsController.cs:L44`, the `StripeException` propagates all the way to `ExceptionMiddleware`, which is registered first in the pipeline `API/Startup.cs:L59` and therefore wraps this endpoint. That middleware logs the exception `API/Middleware/ExceptionMiddleware.cs:L33`, sets `application/json` `API/Middleware/ExceptionMiddleware.cs:L34`, sets the status to `InternalServerError` `API/Middleware/ExceptionMiddleware.cs:L35`, builds an `ApiException` that in Development also carries the message and stack trace `API/Middleware/ExceptionMiddleware.cs:L37-L39`, and serialises it with a camelCase policy `API/Middleware/ExceptionMiddleware.cs:L41`. Reference implementations of this endpoint answer 400 on a verification failure; this one answers 500 with an `ApiException` body. Stripe treats any non-2xx response as a failed delivery and retries with backoff, though the exact cadence is Stripe-side behaviour and therefore **unverified** from this repository.
+
+**There is no idempotency defence.** Stripe guarantees at-least-once delivery, and the standard protection is to persist processed event identifiers under a unique constraint and skip repeats. This endpoint stores no Stripe event id and performs no such check `API/Controllers/PaymentsController.cs:L40-L67`, so a redelivered event simply re-runs the same handler and re-applies the same status `Infrastructure/Services/PaymentService.cs:L88` or `Infrastructure/Services/PaymentService.cs:L102`.
+
+One design property does align with the recommended pattern and is worth stating: the order already exists in a pending state before the webhook arrives, because `Order.Status` defaults to `OrderStatus.Pending` at construction `Core/Entities/OrderAggregate/Order.cs:L28` and the order is created during the order call rather than in the webhook `Infrastructure/Services/OrderService.cs:L52-L55`. The webhook only has to transition an existing row, never create one.
+
+Signing secrets are per-endpoint and differ between Stripe's test and live modes, and must never be committed — which is consistent with `appsettings.json` being excluded from version control `.gitignore:L4`. The key's actual value and location are **unverified**; see [Section 9](#9-configuration-dependencies).
+
+**What breaks if you change this.** Replacing the raw-body read with a bound parameter `API/Controllers/PaymentsController.cs:L43` breaks verification outright, and it breaks it in the worst way — every legitimate delivery starts failing while the code still looks correct. Wrapping the verification call in a `try`/`catch` that returns 400 `API/Controllers/PaymentsController.cs:L44` changes the response class Stripe sees and therefore changes its retry behaviour, which is a delivery-semantics change and not merely a cosmetic one. Rotating `WhSecret` without updating the configuration the constructor reads `API/Controllers/PaymentsController.cs:L27` turns every delivery into a 500-and-retry loop, and because the failure is a generic 500 it is indistinguishable in logs from any other unhandled exception `API/Middleware/ExceptionMiddleware.cs:L35`. Inserting any middleware ahead of `ExceptionMiddleware` `API/Startup.cs:L59` changes this endpoint's observable failure contract, as does anything that consumes or buffers the request body before the action runs. Finally, adding a `default` arm to the switch `API/Controllers/PaymentsController.cs:L49-L63` would change the response for every unhandled Stripe event type, all of which currently receive a silent 200. For the repository's own account of the Redis-backed basket this endpoint ultimately settles, see `CHANGES.md:§6.4` at `CHANGES.md:L1887` — again noting it ends at chapter 9.11 `CHANGES.md:L3674` before reaching any of the payment code, and that its stack line is stale `CHANGES.md:L7`.
+
+### 6.4 Stale-order replacement by PaymentIntentId
+
+When the same basket is checked out twice, the second attempt does not create a second order alongside the first — it deletes the first and inserts a replacement `Infrastructure/Services/OrderService.cs:L43-L53`. The mechanism is one Specification `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9` and one `if` `Infrastructure/Services/OrderService.cs:L46`.
+
+The Specification is a single predicate over the order's `PaymentId` column `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9`:
+
+```csharp
+public OrderByPaymentIntentIdSpecification(string paymentIntentId) : base(o => o.PaymentId == paymentIntentId)
+```
+
+`CreateOrderAsync` builds it from the basket's intent id `Infrastructure/Services/OrderService.cs:L43`, resolves it `Infrastructure/Services/OrderService.cs:L44`, and when a prior order comes back `Infrastructure/Services/OrderService.cs:L46` it stages that order for deletion `Infrastructure/Services/OrderService.cs:L48` and calls the payment service again `Infrastructure/Services/OrderService.cs:L49` before constructing the replacement `Infrastructure/Services/OrderService.cs:L52`. Both the delete and the insert are flushed by the single commit described in [Section 6.2](#62-unit-of-work-commit) `Infrastructure/Services/OrderService.cs:L55`.
+
+Three details of that path are counter-intuitive enough to matter when you modify it `Infrastructure/Services/OrderService.cs:L43-L50`.
+
+**The re-call passes an intent id into a parameter named `basketId`.** The argument at the call site is `basket.PaymentIntentId` `Infrastructure/Services/OrderService.cs:L49`, while the method it calls declares `CreateOrUpdatePaymentIntent(string basketId)` `Infrastructure/Services/PaymentService.cs:L27`. The receiving method uses that parameter directly as a Redis key `Infrastructure/Services/PaymentService.cs:L31`, so the lookup is performed against a Stripe intent id rather than a basket id. Basket keys are only ever written as `basket.Id` `Infrastructure/Data/BasketRepository.cs:L27`, which is the browser-generated GUID `client/src/app/shared/models/basket.ts:L22`, so no key matches a Stripe intent id; the read returns `null` `Infrastructure/Data/BasketRepository.cs:L21` and the method exits at its guard `Infrastructure/Services/PaymentService.cs:L34` without reaching Stripe or writing Redis. The order-replacement path continues regardless, because the caller neither inspects nor assigns the result `Infrastructure/Services/OrderService.cs:L49`.
+
+**The column is named `PaymentId`, not `PaymentIntentId`.** The order-side property is `PaymentId` `Core/Entities/OrderAggregate/Order.cs:L29` and the basket-side property it is copied from is `PaymentIntentId` `Core/Entities/CustomerBasket.cs:L20`; the Specification's parameter uses the basket name while its predicate uses the order name `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9`.
+
+**The lookup column is unindexed and unconstrained.** The migration creates four indexes, and none of them covers `Orders.PaymentId`: `IX_OrderItems_OrderId` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L137-L140`, `IX_Orders_DeliveryMethodId` `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L142-L145` and two on the catalog table `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L147-L155`. The column block itself declares nothing beyond the type `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L70`, and the model snapshot corroborates it independently: `PaymentId` carries only `HasColumnType("text")` `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L62-L63` and the entity's only index is on `DeliveryMethodId` `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L74`. Every resolution of this Specification is therefore an unindexed scan of `Orders`, and nothing at the database level prevents two rows sharing a `PaymentId`.
+
+That same Specification is the only way either webhook handler finds its order `Infrastructure/Services/PaymentService.cs:L84` and `Infrastructure/Services/PaymentService.cs:L98`, and it resolves through `FirstOrDefaultAsync` `Infrastructure/Data/GenericRepository.cs:L32`. With duplicate rows, which row wins is unspecified — there is no ordering in the Specification `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9`.
+
+**What breaks if you change this.** Renaming `Order.PaymentId` `Core/Entities/OrderAggregate/Order.cs:L29` breaks three call sites simultaneously — the Specification's predicate `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9`, and through it both webhook handlers `Infrastructure/Services/PaymentService.cs:L84, L98` and stale-order replacement `Infrastructure/Services/OrderService.cs:L43` — and because they all go through the same Specification, a single rename silently changes the behaviour of the entire settlement path rather than just one method. The delete-then-insert shape means the replacement order receives a **new** identity value from the database `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L57-L58`, so any client that stored the earlier order id — for instance the id handed to the success route `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L86-L87` — is left pointing at a deleted row, and the cascade removes that order's items with it `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L129-L134`. The unindexed scan `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L62-L63` is the performance characteristic of every single webhook delivery, so it scales with the `Orders` table rather than staying constant. And because the replacement runs inside the same commit as the insert `Infrastructure/Services/OrderService.cs:L48-L55`, separating them would make it possible to destroy an existing order without creating its replacement.
+
+---
+
+## 7. Order status lifecycle
+
+The status lifecycle is where **F-004 Order Processing** and **F-005 Payment Processing** meet: the entry transition is written by the order service `Infrastructure/Services/OrderService.cs:L52` and both exit transitions are written by the payment service on behalf of a Stripe event `Infrastructure/Services/PaymentService.cs:L88, L102`. An order has exactly three possible statuses, declared as the three members of `OrderStatus` `Core/Entities/OrderAggregate/OrderStatus.cs:L5-L12`. **Figure 4 — Order Status Lifecycle** shows the machine: one entry transition set by construction and two exit transitions each driven by one specific Stripe event.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Pending : OrderService.CreateOrderAsync<br/>constructs new Order (default Status)
+    Pending --> PaymentReceived : POST api/payments/webhook<br/>event payment_intent.succeeded<br/>PaymentService.UpdateOrderPaymentSucceeded
+    Pending --> PaymentFailed : POST api/payments/webhook<br/>event payment_intent.payment_failed<br/>PaymentService.UpdateOrderPaymentFailed
+    PaymentReceived --> [*] : terminal - no code path leaves this state
+    PaymentFailed --> [*] : terminal - no code path leaves this state
+```
+
+**Legend for Figure 4.** The three rounded nodes are the three `OrderStatus` members `Core/Entities/OrderAggregate/OrderStatus.cs:L8, L10, L12`. `[*]` is the lifecycle boundary rather than a status: on the left it is order construction `Infrastructure/Services/OrderService.cs:L52`, and on the right it marks a state no transition leaves. Each transition label carries three things — the endpoint that receives the trigger, the exact Stripe event string that drives it, and the service method that applies it. Both non-initial states are terminal: no method in the repository assigns any status other than `PaymentReceived` `Infrastructure/Services/PaymentService.cs:L88` and `PaymentFailed` `Infrastructure/Services/PaymentService.cs:L102`, and neither is ever assigned from the other.
+
+| From | To | Driving event | Method | Persistence |
+|---|---|---|---|---|
+| (construction) | `Pending` | None — no Stripe event is involved. The status is the field-initialiser default `Core/Entities/OrderAggregate/Order.cs:L28` applied when the six-argument constructor runs `Core/Entities/OrderAggregate/Order.cs:L8-L16` | `OrderService.CreateOrderAsync` constructs the order `Infrastructure/Services/OrderService.cs:L52` and stages it `Infrastructure/Services/OrderService.cs:L53` | Written by the single `Complete()` at `Infrastructure/Services/OrderService.cs:L55`, converted to the text `Pending` `Infrastructure/Data/Config/OrderConfiguration.cs:L13-L16` into `Orders.Status` text not null `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L69` |
+| `Pending` | `PaymentReceived` | `payment_intent.succeeded` — matched as a literal string in the webhook switch `API/Controllers/PaymentsController.cs:L51` | `PaymentService.UpdateOrderPaymentSucceeded` `Infrastructure/Services/PaymentService.cs:L82-L94`, invoked at `API/Controllers/PaymentsController.cs:L54`; resolves the order by `PaymentId` `Infrastructure/Services/PaymentService.cs:L84-L85`, returns null when nothing matches `Infrastructure/Services/PaymentService.cs:L86`, assigns the status `Infrastructure/Services/PaymentService.cs:L88` and marks the entity `Modified` `Infrastructure/Services/PaymentService.cs:L89` | Committed by `Complete()` `Infrastructure/Services/PaymentService.cs:L91`, stored as the text `PaymentReceived` through the same conversion `Infrastructure/Data/Config/OrderConfiguration.cs:L15` |
+| `Pending` | `PaymentFailed` | `payment_intent.payment_failed` — matched as a literal string in the same switch `API/Controllers/PaymentsController.cs:L57` | `PaymentService.UpdateOrderPaymentFailed` `Infrastructure/Services/PaymentService.cs:L96-L106`, invoked at `API/Controllers/PaymentsController.cs:L60`; resolves the order through the same Specification `Infrastructure/Services/PaymentService.cs:L98-L99`, guards the null case `Infrastructure/Services/PaymentService.cs:L100` and assigns the status `Infrastructure/Services/PaymentService.cs:L102` with no `Update` call | Committed by `Complete()` `Infrastructure/Services/PaymentService.cs:L103`, stored as the text `PaymentFailed` `Infrastructure/Data/Config/OrderConfiguration.cs:L15` |
+
+Nothing else moves an order between statuses. The switch handles only those two event strings and has no `default` arm `API/Controllers/PaymentsController.cs:L49-L63`, so every other Stripe event type leaves the status untouched and still receives an HTTP 200 `API/Controllers/PaymentsController.cs:L65`. Both handlers exit early when the Specification finds no order `Infrastructure/Services/PaymentService.cs:L86` and `Infrastructure/Services/PaymentService.cs:L100`, which is a real possibility given the `PaymentId` lookup described in [Section 6.4](#64-stale-order-replacement-by-paymentintentid). Neither `PaymentReceived` nor `PaymentFailed` is ever read as a precondition anywhere, so nothing prevents a later event from overwriting a status that has already settled — the consequence is traced in [Section 8.4](#84-re-submitted-intents).
+
+### The two handlers are not symmetrical
+
+`UpdateOrderPaymentSucceeded` calls the repository's `Update` after assigning the status `Infrastructure/Services/PaymentService.cs:L89`. `UpdateOrderPaymentFailed` does not — it assigns the status and goes straight to the commit `Infrastructure/Services/PaymentService.cs:L102-L103`. The two methods are otherwise line-for-line equivalent.
+
+**Both paths still persist, and the reason is change tracking.** `GenericRepository.Update` is `Attach` followed by forcing the entity state to `Modified` `Infrastructure/Data/GenericRepository.cs:L52-L53`. Neither operation is required here, because the order was loaded through `GetEntityWithSpec` on the very same `StoreContext` `Infrastructure/Services/PaymentService.cs:L99` and `Infrastructure/Data/GenericRepository.cs:L32` — that context is `Scoped` for the request `API/Extension/ApplicationServicesExtensions.cs:L19` and shares one change tracker `Infrastructure/Data/UnitOfWork.cs:L33` — so the entity is already tracked and the assignment at `Infrastructure/Services/PaymentService.cs:L102` is detected by `SaveChangesAsync` `Infrastructure/Data/UnitOfWork.cs:L42` without any explicit marking. The failed-status update is therefore **not** lost; the asymmetry is an inconsistency between two sibling methods rather than a difference in observable behaviour. It matters only if the loading strategy changes: an order obtained from outside the tracking context would persist in the succeeded path and not in the failed one.
+
+### What consumers actually see
+
+The status a client reads is the enum member name, never the `[EnumMember]` display value. The database stores `o.ToString()` `Infrastructure/Data/Config/OrderConfiguration.cs:L15`, `OrderToReturnDto.Status` is a plain `string` `API/Dtos/OrderToReturnDto.cs:L18` filled by that same name-based conversion, and there is no `JsonStringEnumConverter` and no `AddJsonOptions` anywhere in the repository to interpose the attribute value. So `GET api/orders` and `GET api/orders/{id}` report `Pending`, `PaymentReceived` and `PaymentFailed` `API/Controllers/OrdersController.cs:L45, L54`; the strings `"Payment Received"` and `"Payment Failed"` declared at `Core/Entities/OrderAggregate/OrderStatus.cs:L9, L11` never appear on any wire or in any column.
+
+Finally, note the ordering that makes this machine reachable at all: the order row is created and committed before the card is ever confirmed `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L82-L83`, so a `Pending` row exists and is waiting when the webhook arrives. That ordering is also what makes an orphaned `Pending` order possible, which [Section 8.3](#83-unit-of-work-save-failure) covers.
+
+---
+
+## 8. Failure modes & edge cases
+
+Five failure modes matter on this path. Each is set out as trigger, code path, observable outcome and blast radius, and each describes behaviour as the code currently exhibits it. By feature, [8.1](#81-tampered-basket-prices) and [8.3](#83-unit-of-work-save-failure) sit in **F-004 Order Processing** `Infrastructure/Services/OrderService.cs:L30-L36, L55-L57`, [8.2](#82-invalid-webhook-signatures) and [8.4](#84-re-submitted-intents) in **F-005 Payment Processing** `API/Controllers/PaymentsController.cs:L44` and `Infrastructure/Services/PaymentService.cs:L56`, and [8.5](#85-basket-not-found) in **F-003 Shopping Basket** `Infrastructure/Data/BasketRepository.cs:L18-L22`.
+
+### 8.1 Tampered basket prices
+
+**Trigger.** A caller writes a basket whose `item.Price` differs from the product row — trivially available, because `POST api/basket` is anonymous `API/Controllers/BasketController.cs:L28-L34` and the inbound DTO maps to the entity with no member configuration `API/Helpers/MappingProfiles.cs:L18-L19`.
+
+**Code path.** On the intent call, the loop reads the product row `Infrastructure/Services/PaymentService.cs:L45`, compares `item.Price` against `productItem.Price` `Infrastructure/Services/PaymentService.cs:L46`, overwrites the basket's value when they differ `Infrastructure/Services/PaymentService.cs:L48`, and persists the corrected basket back to Redis `Infrastructure/Services/PaymentService.cs:L78`. The Stripe amount is then computed from the corrected `i.Price` values `Infrastructure/Services/PaymentService.cs:L60`. On the order call, the correction is not even needed, because the line item is built directly from the database price and the basket's price is never read `Infrastructure/Services/OrderService.cs:L32-L34`, with the subtotal summed from those line items `Infrastructure/Services/OrderService.cs:L40`.
+
+**Observable outcome.** The tampered price is silently replaced. There is no error, no log entry and no rejection anywhere on either path `Infrastructure/Services/PaymentService.cs:L43-L50` and `Infrastructure/Services/OrderService.cs:L30-L36`. The caller receives an HTTP 200 with a basket whose prices have been quietly rewritten `API/Controllers/PaymentsController.cs:L37`, so the response itself is the only signal that anything changed. Both the amount Stripe is asked to charge `Infrastructure/Services/PaymentService.cs:L60` and the subtotal persisted to `Orders.Subtotal` `Infrastructure/Services/OrderService.cs:L40` use database prices. The DTO range check is not part of this defence: it only requires `Price` to exceed 0.1 `API/Dtos/BasketItemDto.cs:L10-L12`, so any positive tampered value passes validation and is then overwritten.
+
+**Blast radius.** This is the workflow's only price-integrity control, and it lives entirely in two loops `Infrastructure/Services/PaymentService.cs:L43-L50` and `Infrastructure/Services/OrderService.cs:L30-L36`. Anything that bypasses them re-exposes the amount to the client: adding a code path that constructs an `OrderItem` from `item.Price` instead of `productItem.Price` `Infrastructure/Services/OrderService.cs:L34`, or computing the Stripe amount before the correction loop runs `Infrastructure/Services/PaymentService.cs:L60`. Because the correction is silent, a regression here produces no error and no log — the first evidence would be a mismatch between charged and recorded amounts. Note also that the silent overwrite makes the intent endpoint a write operation on the basket `Infrastructure/Services/PaymentService.cs:L78`, so callers cannot treat it as read-only, and any caching placed in front of it would serve stale prices.
+
+### 8.2 Invalid webhook signatures
+
+**Trigger.** A request reaches `POST api/payments/webhook` whose `Stripe-Signature` header does not verify against the configured signing secret — a forged or replayed request, a secret rotated on Stripe's side but not in configuration, or a missing `StripeSettings:WhSecret` leaving the field null `API/Controllers/PaymentsController.cs:L27`.
+
+**Code path.** Verification happens at `API/Controllers/PaymentsController.cs:L44` with no surrounding `try`/`catch` — the file contains no `try` statement at all. The resulting `StripeException` therefore unwinds out of the action and is caught by `ExceptionMiddleware` `API/Middleware/ExceptionMiddleware.cs:L31`, which is registered first in the pipeline `API/Startup.cs:L59`.
+
+**Observable outcome.** **HTTP 500, not HTTP 400.** The middleware sets `application/json` `API/Middleware/ExceptionMiddleware.cs:L34` and the status to `InternalServerError` `API/Middleware/ExceptionMiddleware.cs:L35`, then serialises an `ApiException` with camelCase property names `API/Middleware/ExceptionMiddleware.cs:L41-L43`. In Development the body carries `statusCode`, `message` and `details`, the latter being the stack trace `API/Middleware/ExceptionMiddleware.cs:L38`; outside Development the same object is constructed with the status code alone `API/Middleware/ExceptionMiddleware.cs:L39`, so `message` falls back to "Server Error" `API/Errors/ApiResponse.cs:L20` and `details` takes its default of null `API/Errors/ApiException.cs:L5-L7`. No order is touched, because the exception occurs before the switch `API/Controllers/PaymentsController.cs:L44, L49`. Stripe sees a non-2xx response, treats the delivery as failed and retries; the cadence and the retry ceiling are Stripe-side behaviour and therefore **unverified** from this repository.
+
+Three further behaviours of this endpoint belong here because they shape what you can learn from a failure `API/Controllers/PaymentsController.cs:L40-L67`.
+
+- **The webhook dereferences `order.Id` with no null guard.** Both service methods can return `null` when the Specification matches nothing `Infrastructure/Services/PaymentService.cs:L86` and `Infrastructure/Services/PaymentService.cs:L100`, but the controller logs `order.Id` unconditionally on both branches `API/Controllers/PaymentsController.cs:L55` and `API/Controllers/PaymentsController.cs:L61`. When no order matches the intent id, that dereference throws and the request takes the same HTTP 500 path as a signature failure `API/Middleware/ExceptionMiddleware.cs:L35` — so Stripe retries, and the two very different causes are indistinguishable from the outside.
+- **The log messages carry no format placeholder, so the interesting value never renders.** All four calls pass a message string with no `{}` token followed by an argument `API/Controllers/PaymentsController.cs:L53, L55, L59, L61`. The two that would have recorded the Stripe intent id are `_logger.LogInformation("Payment Succeeded: ", intent.Id)` `API/Controllers/PaymentsController.cs:L53` and `_logger.LogInformation("Payment Failed: ", intent.Id)` `API/Controllers/PaymentsController.cs:L59`; the argument is dropped and the log line contains only the literal prefix. The webhook therefore leaves no record of which intent it processed.
+- **There is no idempotency check and no stored event id.** Nothing in the action records that an event was handled `API/Controllers/PaymentsController.cs:L40-L67`, and the `Order` aggregate has no member for a Stripe event id `Core/Entities/OrderAggregate/Order.cs:L22-L29`. A redelivered event re-runs the same handler and re-assigns the same status `Infrastructure/Services/PaymentService.cs:L88` or `Infrastructure/Services/PaymentService.cs:L102`.
+
+**Blast radius.** The failure contract of this endpoint is not defined in the controller — it is defined by `ExceptionMiddleware` sitting first in the pipeline `API/Startup.cs:L59`, so any change to middleware ordering changes what Stripe receives on every failed verification. Because verification failures, missing-order dereferences `API/Controllers/PaymentsController.cs:L55` and any other unhandled exception all produce the same 500 with the same shape `API/Middleware/ExceptionMiddleware.cs:L35-L39`, this endpoint cannot be monitored by status code alone, and the absent log placeholders `API/Controllers/PaymentsController.cs:L53, L59` remove the one correlation key that would have distinguished them. Since a non-2xx triggers Stripe's retry, a persistent fault here becomes a repeating delivery loop rather than a single failure, and without an idempotency check `API/Controllers/PaymentsController.cs:L40-L67` every retry re-executes the status assignment and a fresh `SaveChangesAsync` `Infrastructure/Services/PaymentService.cs:L91, L103`.
+
+### 8.3 Unit of Work save failure
+
+**Trigger.** The `SaveChangesAsync` behind `Complete()` `Infrastructure/Data/UnitOfWork.cs:L42` returns `0` or throws while the order is being committed `Infrastructure/Services/OrderService.cs:L55` — a constraint violation, a lost connection to PostgreSQL, or a concurrency conflict.
+
+**Code path.** The commit is the single `Complete()` call `Infrastructure/Services/OrderService.cs:L55`, which is `_context.SaveChangesAsync()` `Infrastructure/Data/UnitOfWork.cs:L42`. A non-positive count returns `null` from the service `Infrastructure/Services/OrderService.cs:L57`, and the controller converts `null` into a `BadRequest` `API/Controllers/OrdersController.cs:L34`. A thrown exception instead bypasses that check entirely and unwinds to `ExceptionMiddleware` `API/Middleware/ExceptionMiddleware.cs:L31`.
+
+**Observable outcome.** The returned-zero case produces HTTP 400 with `{ "statusCode": 400, "message": "Problem creating order" }` `API/Controllers/OrdersController.cs:L34` and `API/Errors/ApiResponse.cs:L11-L12`. The thrown case produces HTTP 500 with an `ApiException` body `API/Middleware/ExceptionMiddleware.cs:L35-L39`. In neither case is the Redis basket altered, since the order path never writes or deletes it `Infrastructure/Services/OrderService.cs:L24-L61`, and in neither case is the Stripe PaymentIntent cancelled or reversed — the intent created earlier `Infrastructure/Services/PaymentService.cs:L64` remains live with no order attached to it. Because there is no explicit transaction `Infrastructure/Data/UnitOfWork.cs:L40-L43`, the atomicity of a partially-staged batch — a stale-order delete plus a replacement insert `Infrastructure/Services/OrderService.cs:L48-L53` — is whatever one `SaveChangesAsync` call provides and nothing more.
+
+**The order-before-confirmation race belongs here.** `submitOrder()` awaits order creation first and only then confirms the card: `const createdOrder = await this.createOrder(basket);` `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L82` followed by `const paymentResult = await this.confirmPaymentWithStripe(basket);` `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L83`. A `Pending` order therefore exists in PostgreSQL before the card has been attempted `Infrastructure/Services/OrderService.cs:L52-L55` and `Core/Entities/OrderAggregate/Order.cs:L28`. If the browser closes, the network drops or the confirmation throws between those two awaits, the order is left in `Pending` and no Stripe event ever arrives to settle it, because the card was never confirmed. Nothing reconciles that: the only writers of order status are the two webhook handlers `Infrastructure/Services/PaymentService.cs:L88, L102`, reached only from the webhook action `API/Controllers/PaymentsController.cs:L54, L60`, and there is no scheduled job, no hosted service and no startup sweep anywhere — startup runs migrations and seeding only `API/Program.cs:L26-L33`. The client's own error handling does not surface the condition either: the `catch` writes to the browser console and clears the loading flag `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L92-L95`. The specification places card confirmation before order creation `tech spec §6.3.4.1`; the code does the reverse `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L82-L83`, and this race is the consequence.
+
+**Blast radius.** The `result <= 0` check is the only failure detection in the order path `Infrastructure/Services/OrderService.cs:L57`, so any change that stages a no-op modification turns a successful commit into a reported 400, and any change that adds a second `Complete()` `Infrastructure/Services/OrderService.cs:L55` splits the delete and insert into separately-failing batches with no transaction to protect them `Infrastructure/Data/UnitOfWork.cs:L40-L43`. Because a failed order creation leaves the Stripe intent live `Infrastructure/Services/PaymentService.cs:L64` and the Redis basket intact `Infrastructure/Data/BasketRepository.cs:L27`, retrying is safe only because of the stale-order replacement described in [Section 6.4](#64-stale-order-replacement-by-paymentintentid) — remove that and retries accumulate orders against one intent id. And because orphaned `Pending` rows accumulate with nothing to clear them, any report or query that treats `Pending` as "awaiting imminent settlement" will be wrong; `Pending` also means "abandoned", and the status alone cannot distinguish the two `Core/Entities/OrderAggregate/OrderStatus.cs:L8`.
+
+### 8.4 Re-submitted intents
+
+**Trigger.** `POST api/payments/{basketId}` is called again for a basket that already carries a `PaymentIntentId` — the shopper steps back to Review and forward again `client/src/app/checkout/checkout-review/checkout-review.component.ts:L23`, or the order is submitted twice for the same basket.
+
+**Code path.** The branch is chosen by `if (string.IsNullOrEmpty(basket.PaymentIntentId))` `Infrastructure/Services/PaymentService.cs:L56`. A basket that already has an id takes the else branch `Infrastructure/Services/PaymentService.cs:L69-L76`, which recomputes the amount `Infrastructure/Services/PaymentService.cs:L73` and calls `UpdateAsync` against the existing intent `Infrastructure/Services/PaymentService.cs:L75`. That branch assigns nothing back to the basket: only the create branch sets `ClientSecret` `Infrastructure/Services/PaymentService.cs:L66`. The corrected basket is written back regardless `Infrastructure/Services/PaymentService.cs:L78`. On the subsequent order call, the stale-order lookup runs and replaces any prior order carrying that same intent id `Infrastructure/Services/OrderService.cs:L43-L50`.
+
+**Observable outcome.** The basket comes back with its **original** `ClientSecret` `Infrastructure/Services/PaymentService.cs:L69-L76` — which is the correct value for a Stripe intent that has been amended rather than replaced, since the intent id is unchanged `Infrastructure/Services/PaymentService.cs:L75`, and it is the value the browser then confirms with `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L99`. The Stripe amount is updated `Infrastructure/Services/PaymentService.cs:L73`, and the Redis key's 30-day expiry is reset `Infrastructure/Data/BasketRepository.cs:L27`. Any prior order for that intent is deleted and re-inserted with a **new** identity value `Infrastructure/Services/OrderService.cs:L48, L52-L53` and `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L57-L58`, taking its line items with it through the cascade `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L129-L134`. Nothing at the database level prevents two rows from sharing a `PaymentId`: the column has no unique constraint and no index `Infrastructure/Data/Migrations/20211212023144_PostGres initial.cs:L70` and `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L62-L63`. Should duplicates ever exist, both webhook handlers resolve through `FirstOrDefaultAsync` with no ordering `Infrastructure/Data/GenericRepository.cs:L32` and `Core/Specifications/OrderByPaymentIntentIdSpecification.cs:L9`, so which row receives the status is unspecified; combined with the absent idempotency check `API/Controllers/PaymentsController.cs:L40-L67`, a redelivered event repeats that same unspecified choice.
+
+**Blast radius.** The single-order-per-intent invariant is maintained purely in application code `Infrastructure/Services/OrderService.cs:L43-L50`, with no database constraint behind it `Infrastructure/Data/Migrations/StoreContextModelSnapshot.cs:L62-L63`, so any new code path that inserts an order without first running that lookup can create duplicates that the schema will happily accept and the webhook will then resolve arbitrarily `Infrastructure/Data/GenericRepository.cs:L32`. Moving the `ClientSecret` assignment out of the create branch `Infrastructure/Services/PaymentService.cs:L66`, or assigning a stale secret in the update branch, breaks card confirmation in the browser `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L99`. And because every re-submission rewrites the basket `Infrastructure/Services/PaymentService.cs:L78`, the basket's expiry is extended on each pass `Infrastructure/Data/BasketRepository.cs:L27`, so a basket that is repeatedly reviewed effectively never expires.
+
+### 8.5 Basket-not-found
+
+**Trigger.** The supplied `basketId` does not resolve to a Redis key — a wrong or unknown id, a key whose 30-day expiry has lapsed `Infrastructure/Data/BasketRepository.cs:L27`, a browser whose `localStorage` entry was cleared `client/src/app/basket/basket.service.ts:L153`, or Redis being unreachable through the singleton connection `API/Startup.cs:L37-L42`.
+
+**Code path.** The repository returns `null` whenever the key is empty `Infrastructure/Data/BasketRepository.cs:L21`, and also returns `null` when a write reports failure `Infrastructure/Data/BasketRepository.cs:L29`. The two consumers then behave differently. `PaymentService` guards immediately: `if (basket == null) return null;` `Infrastructure/Services/PaymentService.cs:L34`. `OrderService` does not guard at all — it assigns the result `Infrastructure/Services/OrderService.cs:L27` and then enumerates `basket.Items` `Infrastructure/Services/OrderService.cs:L30`, which is where a null basket fails.
+
+**Observable outcome.** The same underlying condition produces three different responses depending on the endpoint. `POST api/orders` throws a `NullReferenceException` at the enumeration `Infrastructure/Services/OrderService.cs:L30`, which unwinds to `ExceptionMiddleware` and returns **HTTP 500** with an `ApiException` body `API/Middleware/ExceptionMiddleware.cs:L35-L39` — the `BadRequest` intended for a failed order is never reached, because the throw happens long before the null check at `Infrastructure/Services/OrderService.cs:L57`. `POST api/payments/{basketId}` returns a clean **HTTP 400** with `{ "statusCode": 400, "message": "Problem with your basket" }` `API/Controllers/PaymentsController.cs:L35-L36`. `GET api/basket` returns **HTTP 200** with an empty basket carrying the requested id `API/Controllers/BasketController.cs:L25`, so a caller cannot distinguish a basket that never existed, one that expired, and one that exists with no items.
+
+**The Redis key also outlives the checkout the shopper believes finished.** The path never deletes it: `OrderService.CreateOrderAsync` contains no delete `Infrastructure/Services/OrderService.cs:L24-L61`, and the client method invoked after successful payment clears only the two `BehaviorSubject`s and the `localStorage` entry, issuing no HTTP request `client/src/app/basket/basket.service.ts:L150-L154`, invoked at `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L85`. The key therefore survives for the remainder of its 30-day expiry `Infrastructure/Data/BasketRepository.cs:L27`, still holding the items, the `PaymentIntentId` and the `ClientSecret` `Core/Entities/CustomerBasket.cs:L19-L20`. A caller who still has the id — it is a plain string in `localStorage` `client/src/app/basket/basket.service.ts:L87` and the endpoints are anonymous `API/Controllers/BasketController.cs:L21-L40` — can read that basket back after checkout, and because a re-fetch would repopulate client state `client/src/app/basket/basket.service.ts:L46`, a basket the shopper believes is gone can reappear.
+
+**Blast radius.** The asymmetry between the guarded and unguarded consumers `Infrastructure/Services/PaymentService.cs:L34` versus `Infrastructure/Services/OrderService.cs:L27-L30` means the order endpoint's contract for a missing basket is an unhandled exception, so any monitoring that treats 500s as infrastructure faults will misclassify what is really a client-state problem. Because `GET api/basket` cannot express absence `API/Controllers/BasketController.cs:L25`, no caller can pre-flight the condition — the first indication is the 500 from order creation. Any change to the 30-day expiry `Infrastructure/Data/BasketRepository.cs:L27` changes how long an abandoned checkout stays resumable and how long a used basket stays readable at once, since one constant governs both. And because the intent endpoint rewrites the key on every call `Infrastructure/Services/PaymentService.cs:L78` while nothing on the path ever deletes it, the only mechanism that removes a checkout basket at all is expiry.
+
+---
+
+## 9. Configuration dependencies
+
+Eight configuration keys are read on this path. Six are present in tracked configuration `API/appsettings.Development.json:L9-L18`; two are read by code but appear in no tracked file `Infrastructure/Services/PaymentService.cs:L29` and `API/Controllers/PaymentsController.cs:L27`, and are therefore marked **unverified** throughout. By feature, the Redis connection string is what **F-003 Shopping Basket** cannot run without `Infrastructure/Data/BasketRepository.cs:L13-L16`, the `e-commerce` connection string is the same for **F-004 Order Processing** `API/Startup.cs:L31-L32`, and the two `StripeSettings` keys are the same for **F-005 Payment Processing** `Infrastructure/Services/PaymentService.cs:L29` and `API/Controllers/PaymentsController.cs:L27`. **Figure 5 — Checkout Configuration Dependencies** traces each key from the configuration source that supplies it, through the component that reads it, to the store or external service it ultimately reaches; read it before the table, because the table's "Consumed by" column is the middle band of that diagram spelled out with locators.
+
+```mermaid
+flowchart LR
+    subgraph CFG["Configuration sources"]
+        TRACKED["API/appsettings.Development.json<br/>TRACKED in git"]
+        UNTRACKED["appsettings.json or user secrets<br/>GIT-IGNORED - UNVERIFIED"]
+    end
+    subgraph KEYS["Configuration keys"]
+        K1["ConnectionStrings:DefaultConnection"]
+        K2["ConnectionStrings:IdentityConnection"]
+        K3["ConnectionStrings:Redis"]
+        K4["Token:Key"]
+        K5["Token:Issuer"]
+        K6["ApiUrl"]
+        K7["StripeSettings:SecretKey<br/>StripeSettings:WhSecret"]
+    end
+    subgraph CONSUMERS["Consumers"]
+        C1["StoreContext"]
+        C2["AppIdentityDbContext"]
+        C3["IConnectionMultiplexer<br/>BasketRepository"]
+        C4["TokenService<br/>JWT validation"]
+        C5["OrderItemUrlResolver"]
+        C6["PaymentService<br/>StripeConfiguration.ApiKey"]
+        C7["PaymentsController<br/>EventUtility.ConstructEvent"]
+    end
+    subgraph STORES["Stores and services"]
+        S1[("PostgreSQL e-commerce")]
+        S2[("PostgreSQL identity")]
+        S3[("Redis on 6379")]
+        S4["Stripe API"]
+        S5["delivery.json seed"]
+    end
+
+    TRACKED --> K1
+    TRACKED --> K2
+    TRACKED --> K3
+    TRACKED --> K4
+    TRACKED --> K5
+    TRACKED --> K6
+    UNTRACKED -.expected.-> K7
+    K1 --> C1
+    K2 --> C2
+    K3 --> C3
+    K4 --> C4
+    K5 --> C4
+    K6 --> C5
+    K7 -.unverified.-> C6
+    K7 -.unverified.-> C7
+    C1 --> S1
+    C2 --> S2
+    C3 --> S3
+    C6 --> S4
+    C7 --> S4
+    S5 --> S1
+```
+
+**Legend for Figure 5.** Left to right, the three bands are configuration sources, the keys they supply, and the components that read them, ending in the stores and services those components reach. A **solid** edge means the key is verified present in a tracked configuration file `API/appsettings.Development.json:L9-L18`. A **dotted** edge means the key is read by code but expected in configuration that is not in the repository, and is therefore labelled **unverified**; both dotted edges out of the `StripeSettings` node carry that meaning `Infrastructure/Services/PaymentService.cs:L29` and `API/Controllers/PaymentsController.cs:L27`. **Cylinder** nodes are datastores; plain rectangles are code components or external services. The `delivery.json seed` node feeds the `e-commerce` database rather than a key, because it is data rather than configuration `Infrastructure/Data/StoreContextSeed.cs:L55-L61`.
+
+### The eight keys
+
+| Key | Present in tracked config? | Consumed by | Purpose on this path | Verification status |
+|---|---|---|---|---|
+| `ConnectionStrings:DefaultConnection` | Yes — `Server=localhost; Port=5432;User Id=appuser; Password=secret; Database=e-commerce` `API/appsettings.Development.json:L10` | `StoreContext`, registered with `UseNpgsql` `API/Startup.cs:L31-L32` | Reaches the `e-commerce` database that holds `Orders`, `OrderItems` and `DeliveryMethods` `Infrastructure/Data/StoreContext.cs:L21-L23`; every price re-read, order insert and status commit goes through it `Infrastructure/Data/UnitOfWork.cs:L42` | Verified |
+| `ConnectionStrings:IdentityConnection` | Yes — same server, `Database=identity` `API/appsettings.Development.json:L11` | `AppIdentityDbContext` `API/Startup.cs:L33-L36` | Backs the accounts whose JWTs five of the nine endpoints require `API/Controllers/OrdersController.cs:L16` and `API/Controllers/PaymentsController.cs:L30`; incidental to checkout but the flow cannot run without it | Verified |
+| `ConnectionStrings:Redis` | Yes — `localhost` `API/appsettings.Development.json:L12` | A singleton `IConnectionMultiplexer` `API/Startup.cs:L37-L42`, injected into `BasketRepository` `Infrastructure/Data/BasketRepository.cs:L13-L16` | Reaches the store that holds every `CustomerBasket`, including the `PaymentIntentId` and `ClientSecret` the flow depends on `Core/Entities/CustomerBasket.cs:L19-L20`; the connection is parsed with `allowAdmin` enabled `API/Startup.cs:L39-L40` | Verified |
+| `Token:Key` | Yes — `super secret key` `API/appsettings.Development.json:L15` | The symmetric `IssuerSigningKey` for bearer validation `API/Extension/IdentityServiceExtensions.cs:L27` | Validates the JWT on the five authorised endpoints; a mismatch makes `POST api/orders` and `POST api/payments/{basketId}` unreachable | Verified — incidental |
+| `Token:Issuer` | Yes — `https://localhost:5001` `API/appsettings.Development.json:L16` | `ValidIssuer` `API/Extension/IdentityServiceExtensions.cs:L28`, with `ValidateIssuer = true` `API/Extension/IdentityServiceExtensions.cs:L29` and `ValidateAudience = false` `API/Extension/IdentityServiceExtensions.cs:L30` | Issuer is checked, audience is not `API/Extension/IdentityServiceExtensions.cs:L30`; the value matches the API origin the SPA calls `client/src/environments/environment.ts:L7` | Verified — incidental |
+| `ApiUrl` | Yes — `https://localhost:5001/Content/` `API/appsettings.Development.json:L18` | `OrderItemUrlResolver`, which concatenates it onto the stored relative path `API/Helpers/OrderItemUrlResolver.cs:L22` | Rewrites `PictureUrl` on every order item returned by `GET api/orders` and `GET api/orders/{id}` `API/Helpers/MappingProfiles.cs:L28`; genuinely in scope because it changes the order payload rather than the catalog | Verified |
+| `StripeSettings:SecretKey` | **No** — absent from every tracked configuration file; `StripeSettings` appears only in two `.cs` reads and no tracked JSON | Assigned to the process-wide static `StripeConfiguration.ApiKey` on every intent call `Infrastructure/Services/PaymentService.cs:L29` | Authenticates PaymentIntent create `Infrastructure/Services/PaymentService.cs:L64` and update `Infrastructure/Services/PaymentService.cs:L75` against Stripe | **unverified** — value, storage location and shape are expected in the git-ignored `appsettings.json` `.gitignore:L4` and cannot be confirmed from this repository |
+| `StripeSettings:WhSecret` | **No** — absent from every tracked configuration file, on the same basis | Captured once into `_whSecret` in the controller constructor `API/Controllers/PaymentsController.cs:L27` and passed to `EventUtility.ConstructEvent` `API/Controllers/PaymentsController.cs:L44` | The endpoint signing secret against which every webhook delivery is verified; it is the webhook's only authentication, since the action is anonymous `API/Controllers/PaymentsController.cs:L40-L41` | **unverified** — value, storage location and shape are expected in the git-ignored `appsettings.json` `.gitignore:L4` and cannot be confirmed from this repository |
+
+### The untracked-secret boundary
+
+`.gitignore` is six lines: `.idea`, `obj`, `bin`, `appsettings.json`, `*.db`, `*.rdb` `.gitignore:L1-L6`. Because `appsettings.json` is excluded at `.gitignore:L4`, the only settings file in the repository is `API/appsettings.Development.json`, and it stops at `ApiUrl` `API/appsettings.Development.json:L18`. Both Stripe keys are therefore read from configuration that no one can inspect here — `_config["StripeSettings:SecretKey"]` `Infrastructure/Services/PaymentService.cs:L29` and `config.GetSection("StripeSettings:WhSecret").Value` `API/Controllers/PaymentsController.cs:L27` — and their values, storage location and shape are **unverified**. This document does not guess them, and it does not add them to tracked configuration.
+
+Three properties of how those two keys are read are worth knowing before you change anything around them `Infrastructure/Services/PaymentService.cs:L29` and `API/Controllers/PaymentsController.cs:L27`.
+
+- **Neither key is bound to a strongly-typed options class.** Both are read directly off `IConfiguration`, one through the indexer `Infrastructure/Services/PaymentService.cs:L29` and one through `GetSection(...).Value` `API/Controllers/PaymentsController.cs:L27`. The only `services.Configure<>` call in the project targets `ApiBehaviorOptions` for the model-validation response factory `API/Extension/ApplicationServicesExtensions.cs:L23`, not a settings type. There is consequently no startup validation of either key: the application boots normally with both absent.
+- **The read timings differ.** `StripeSettings:SecretKey` is re-read and re-assigned to the static `StripeConfiguration.ApiKey` on every invocation of the intent method `Infrastructure/Services/PaymentService.cs:L27-L29`, so a change to configuration takes effect on the next call. `StripeSettings:WhSecret` is captured once in the controller constructor `API/Controllers/PaymentsController.cs:L27`; the controller is constructed per request, so the section is re-read per request rather than cached for the process lifetime.
+- **Neither read is null-checked, and neither service wraps its Stripe calls.** `Infrastructure/Services/PaymentService.cs` and `Infrastructure/Services/OrderService.cs` contain no `try` statement, and neither does `API/Controllers/PaymentsController.cs`. Any exception arising from a missing or wrong key therefore unwinds to `ExceptionMiddleware` `API/Middleware/ExceptionMiddleware.cs:L31` and surfaces as HTTP 500 `API/Middleware/ExceptionMiddleware.cs:L35`. For the webhook that is the path described in [Section 8.2](#82-invalid-webhook-signatures); Stripe's own reaction to that response is **unverified** from this repository.
+
+### Runtime services the flow requires
+
+`docker-compose.yml` supplies both datastores the connection strings point at `docker-compose.yml:L1-L37` and `API/appsettings.Development.json:L10-L12`.
+
+| Service | Image and ports | Notable configuration | Source |
+|---|---|---|---|
+| `redis` | `redis:latest`, published `6379:6379` | `command: ["redis-server", "--appendonly", "yes"]` and a named volume `redis-data:/data` `docker-compose.yml:L7-L9`, declared at `docker-compose.yml:L36-L37` | `docker-compose.yml:L3-L9` |
+| `redis-commander` | `rediscommander/redis-commander:latest`, published `8081:8081` | Points at `local:redis:6379` and depends on `redis` `docker-compose.yml:L14, L19-L20`; a browsing UI, not part of the request path | `docker-compose.yml:L11-L20` |
+| `db` | `postgres`, published `5432:5432` | `restart: always` `docker-compose.yml:L23`; `POSTGRES_USER=appuser` and `POSTGRES_PASSWORD=secret` `docker-compose.yml:L25-L26`, matching both connection strings `API/appsettings.Development.json:L10-L11` | `docker-compose.yml:L21-L28` |
+| `adminer` | `adminer`, published `8080:8080` | `restart: always` `docker-compose.yml:L32`; a browsing UI, not part of the request path | `docker-compose.yml:L30-L34` |
+
+Two details of that file are easy to misread. First, **compose declares no database name**: the `db` service sets only a user and a password `docker-compose.yml:L24-L26`, so `e-commerce` and `identity` exist solely because the connection strings name them `API/appsettings.Development.json:L10-L11` and because both contexts run `MigrateAsync` at startup `API/Program.cs:L27, L32`. Second, **the `db` service declares no volume** `docker-compose.yml:L21-L28`, while `redis` does `docker-compose.yml:L8-L9`; PostgreSQL data therefore lives only in the container's writable layer, whereas basket data survives a container restart through `redis-data` `docker-compose.yml:L36-L37`.
+
+Two further runtime values the flow depends on are hardcoded rather than configured, and are recorded here so you know not to look for keys that do not exist. The CORS policy admits exactly one origin, `https://localhost:4200`, written inline in `Startup` `API/Startup.cs:L46-L53`, specifically at `API/Startup.cs:L51`; the SPA's own API base address is likewise a literal, `https://localhost:5001/api/` in development `client/src/environments/environment.ts:L7` and the relative `api/` in production `client/src/environments/environment.prod.ts:L3`, consumed by both checkout services `client/src/app/basket/basket.service.ts:L14` and `client/src/app/checkout/checkout.service.ts:L12`. On the client side the Stripe publishable key is also a literal in the payment component `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L37`, where it initialises Stripe Elements before the card inputs are mounted `client/src/app/checkout/checkout-payment/checkout-payment.component.ts:L38-L41`; it is a publishable test-mode key, which is the class of key intended to be public, and no secret key appears anywhere in the repository.
+
+### Seed data every order total depends on
+
+`GetTotal()` adds the selected delivery method's price to the subtotal `Core/Entities/OrderAggregate/Order.cs:L33`, and `PaymentService` reads the same price when computing the Stripe amount `Infrastructure/Services/PaymentService.cs:L38-L41`, so the `DeliveryMethods` table is a hard dependency of both figures. It is populated from `Infrastructure/Data/SeedData/delivery.json`, which carries four rows: `UPS1` — "Fastest delivery time", 1-2 Days, 10 `Infrastructure/Data/SeedData/delivery.json:L2-L8`; `UPS2` — "Get it within 5 days", 2-5 Days, 5 `Infrastructure/Data/SeedData/delivery.json:L9-L15`; `UPS3` — "Slower but cheap", 5-10 Days, 2 `Infrastructure/Data/SeedData/delivery.json:L16-L22`; and `FREE` — "Free! You get what you pay for", 1-2 Weeks, 0 `Infrastructure/Data/SeedData/delivery.json:L23-L29`.
+
+Seeding is conditional and quiet. The seeder runs only when the table is empty — `if (!context.DeliveryMethods.Any())` `Infrastructure/Data/StoreContextSeed.cs:L53` — reading the file, deserialising it and saving `Infrastructure/Data/StoreContextSeed.cs:L55-L61`, so an existing table is never reconciled against the file. Its `catch` logs the exception message and nothing else `Infrastructure/Data/StoreContextSeed.cs:L64-L67`, which means a seeding failure does not stop startup. The call itself sits inside the startup block that migrates the store context first `API/Program.cs:L27-L28`, wrapped in an outer `try` that likewise only logs `API/Program.cs:L35-L38`. An API that starts cleanly is therefore not evidence that the four delivery methods exist, and without them `GET api/orders/deliveryMethods` returns an empty list `API/Controllers/OrdersController.cs:L60` and the delivery step of the stepper has nothing to select `client/src/app/checkout/checkout.component.html:L8`.
