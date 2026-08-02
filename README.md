@@ -53,4 +53,6 @@ Before you can run the project, you will need to install the following software:
 - Order checkout and payment processing (demo)
 - Dockerized for easy hosting
 
+## Documentation
+- [Checkout Workflow](docs/checkout-workflow.md) — end-to-end reference for the checkout path: basket, order creation and Stripe payment processing.
 
