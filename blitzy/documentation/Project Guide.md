@@ -10,7 +10,7 @@
 
 ### 1.1 Project Overview
 
-This project adds a **Real-Time Inventory & Flash-Sale System** to an existing .NET 5 (`net5.0`) / Angular 11 e-commerce store, delivered **additively** within the current `API → Infrastructure → Core` Clean Architecture chain (which is preserved unchanged). It introduces authoritative persistent stock (`Products.StockQuantity`), reservation-based oversell prevention using a PostgreSQL `SELECT ... FOR UPDATE` row lock, Redis hot-path counters with a fail-closed fallback, real-time stock broadcasting over SignalR (`/hubs/stock`), a 30-second background reconciliation service, and time-windowed flash-sale stock pools. Shoppers see live "Only N left!" / "Out of stock" badges and checkout gating. Target users are online shoppers and the store operators who rely on accurate, oversell-proof stock during high-demand flash sales.
+This project adds a **Real-Time Inventory & Flash-Sale System** to an existing .NET 5 (`net5.0`) / Angular 11 e-commerce store, delivered **additively** within the current `API → Infrastructure → Core` Clean Architecture chain (which is preserved unchanged). It introduces authoritative persistent stock (`Products.StockQuantity`), reservation-based oversell prevention using a PostgreSQL `SELECT ... FOR UPDATE` row lock, Redis hot-path counters with a fail-closed fallback, real-time stock broadcasting over SignalR (`/hubs/stock`), a 30-second background reconciliation service, and time-windowed flash-sale stock pools. Shoppers see live "Only X left!" / "Out of stock" badges and checkout gating. Target users are online shoppers and the store operators who rely on accurate, oversell-proof stock during high-demand flash sales.
 
 ### 1.2 Completion Status
 
