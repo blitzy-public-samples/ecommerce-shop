@@ -87,6 +87,52 @@ describe('BasketSummaryComponent', () => {
     expect(fixture.nativeElement.querySelectorAll('.fa-trash').length).toEqual(mockBasketItems.length);
   });
 
+  it('QA F7: quantity and remove controls are keyboard-operable buttons with accessible names', () => {
+    component.items = mockBasketItems;
+    component.isBasket = true;
+    fixture.detectChanges();
+
+    // Decrease / increase are real <button>s (keyboard-operable, not mouse-only
+    // <i> icons) carrying explicit accessible names.
+    const decBtns = fixture.nativeElement.querySelectorAll('button[aria-label="Decrease quantity"]');
+    const incBtns = fixture.nativeElement.querySelectorAll('button[aria-label="Increase quantity"]');
+    expect(decBtns.length).toEqual(mockBasketItems.length);
+    expect(incBtns.length).toEqual(mockBasketItems.length);
+
+    // The remove control — the documented gate-recovery path — is a real <button>
+    // with a descriptive, per-product accessible name.
+    const removeBtn = fixture.nativeElement.querySelector(
+      'button[aria-label="Remove Angular Speedster Board 2000 from basket"]'
+    );
+    expect(removeBtn).toBeTruthy();
+    expect(removeBtn.tagName).toBe('BUTTON');
+
+    // The decorative glyphs are hidden from assistive technology.
+    const icon = fixture.nativeElement.querySelector('.fa-trash');
+    expect(icon.getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('QA F7: clicking the button controls still emits the expected item outputs', () => {
+    component.items = mockBasketItems;
+    component.isBasket = true;
+    fixture.detectChanges();
+
+    const emitted: { dec?: IBasketItem; inc?: IBasketItem; rem?: IBasketItem } = {};
+    component.decrement.subscribe((v: IBasketItem) => (emitted.dec = v));
+    component.increment.subscribe((v: IBasketItem) => (emitted.inc = v));
+    component.remove.subscribe((v: IBasketItem) => (emitted.rem = v));
+
+    fixture.nativeElement.querySelector('button[aria-label="Decrease quantity"]').click();
+    fixture.nativeElement.querySelector('button[aria-label="Increase quantity"]').click();
+    fixture.nativeElement
+      .querySelector('button[aria-label="Remove Angular Speedster Board 2000 from basket"]')
+      .click();
+
+    expect(emitted.dec).toBe(mockBasketItems[0]);
+    expect(emitted.inc).toBe(mockBasketItems[0]);
+    expect(emitted.rem).toBe(mockBasketItems[0]);
+  });
+
   it('should hide quantity and remove controls when not in basket mode', () => {
     component.items = mockOrderItems;
     component.isBasket = false;

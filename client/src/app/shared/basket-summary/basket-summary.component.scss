@@ -1,0 +1,22 @@
+// QA F7/F13: the quantity (+/-) and remove controls are now real <button>s.
+// Strip the default Bootstrap link-button chrome so they render exactly like the
+// previous icon glyphs, but keep a clearly visible keyboard focus indicator
+// (WCAG 2.4.7) since these are the documented gate-recovery controls.
+.quantity-control {
+  line-height: 1;
+  vertical-align: middle;
+  text-decoration: none;
+
+  &:hover,
+  &:focus {
+    text-decoration: none;
+  }
+
+  &:focus,
+  &:focus-visible {
+    outline: 3px solid #005cbf;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 3px rgba(0, 92, 191, 0.35);
+    border-radius: 4px;
+  }
+}

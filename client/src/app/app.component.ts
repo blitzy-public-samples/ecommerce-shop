@@ -1,6 +1,7 @@
 import {Component, OnInit} from '@angular/core';
 import {BasketService} from "./basket/basket.service";
 import {AccountService} from "./account/account.service";
+import {StockService} from './core/services/stock.service';
 
 @Component({
   selector: 'app-root',
@@ -10,10 +11,11 @@ import {AccountService} from "./account/account.service";
 export class AppComponent implements OnInit {
   title = 'Web Store';
 
-  constructor(private basketService: BasketService, private accountService: AccountService) {
+  constructor(private basketService: BasketService, private accountService: AccountService, private stockService: StockService) {
   }
 
   ngOnInit(): void {
+    this.stockService.startConnection();
     this.loadBasket();
     this.loadCurrentUser();
   }

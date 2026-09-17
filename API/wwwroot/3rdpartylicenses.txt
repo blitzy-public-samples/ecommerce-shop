@@ -41,6 +41,9 @@ MIT
 @angular/router
 MIT
 
+@microsoft/signalr
+Apache-2.0
+
 ngx-bootstrap
 MIT
 The MIT License (MIT)

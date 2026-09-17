@@ -70,9 +70,12 @@ namespace Infrastructure.Tests.Helpers
         /// <summary>
         /// Seeds <paramref name="count"/> valid Products (sharing one ProductBrand and one
         /// ProductType so foreign keys resolve under any provider) and saves them.
+        /// Each product is created with <paramref name="stockQuantity"/> available units
+        /// (default 0, matching the entity/database default) so inventory and flash-sale
+        /// tests can arrange available stock deterministically.
         /// Returns the seeded products so tests can read their generated ids.
         /// </summary>
-        public static async Task<List<Product>> SeedProductsAsync(StoreContext context, int count = 3)
+        public static async Task<List<Product>> SeedProductsAsync(StoreContext context, int count = 3, int stockQuantity = 0)
         {
             var brand = new ProductBrand { Name = "Test Brand" };
             var type = new ProductType { Name = "Test Type" };
@@ -86,6 +89,7 @@ namespace Infrastructure.Tests.Helpers
                     Description = $"Test description {i}",
                     PictureUrl = $"images/products/test-{i}.png",
                     Price = 10m * i,
+                    StockQuantity = stockQuantity,
                     ProductBrand = brand,
                     ProductType = type
                 });
@@ -117,6 +121,82 @@ namespace Infrastructure.Tests.Helpers
             context.DeliveryMethods.AddRange(methods);
             await context.SaveChangesAsync();
             return methods;
+        }
+
+        /// <summary>
+        /// Seeds <paramref name="count"/> FlashSale rows for the given product with an explicit
+        /// window and status, then saves them. Returns the seeded flash sales so tests can read
+        /// their generated ids. Callers control the pool size and window so window-boundary and
+        /// status-transition behavior can be arranged deterministically.
+        /// </summary>
+        public static async Task<List<FlashSale>> SeedFlashSalesAsync(
+            StoreContext context,
+            int productId,
+            int saleStockQuantity,
+            DateTimeOffset startsAt,
+            DateTimeOffset endsAt,
+            FlashSaleStatus status = FlashSaleStatus.Active,
+            int count = 1)
+        {
+            var sales = new List<FlashSale>();
+            for (var i = 0; i < count; i++)
+            {
+                sales.Add(new FlashSale
+                {
+                    ProductId = productId,
+                    SaleStockQuantity = saleStockQuantity,
+                    StartsAt = startsAt,
+                    EndsAt = endsAt,
+                    Status = status
+                });
+            }
+
+            context.FlashSales.AddRange(sales);
+            await context.SaveChangesAsync();
+            return sales;
+        }
+
+        /// <summary>
+        /// Seeds <paramref name="count"/> Reservation rows for the given product, then saves them.
+        /// Returns the seeded reservations so tests can read their generated ids. Nullable
+        /// timestamps default to "now" (<paramref name="createdAt"/>) and "now + 10 minutes"
+        /// (<paramref name="expiresAt"/>); pass an explicit past <paramref name="expiresAt"/> to
+        /// arrange expired holds for reconciliation tests. A null <paramref name="flashSaleId"/>
+        /// binds the reservation to the general product-stock pool; a value binds it to that
+        /// flash-sale pool.
+        /// </summary>
+        public static async Task<List<Reservation>> SeedReservationsAsync(
+            StoreContext context,
+            int productId,
+            int quantity,
+            int count = 1,
+            ReservationStatus status = ReservationStatus.Active,
+            DateTimeOffset? createdAt = null,
+            DateTimeOffset? expiresAt = null,
+            string basketId = null,
+            int? flashSaleId = null)
+        {
+            var created = createdAt ?? DateTimeOffset.UtcNow;
+            var expires = expiresAt ?? DateTimeOffset.UtcNow.AddMinutes(10);
+
+            var reservations = new List<Reservation>();
+            for (var i = 0; i < count; i++)
+            {
+                reservations.Add(new Reservation
+                {
+                    ProductId = productId,
+                    BasketId = basketId ?? $"test-basket-{i}",
+                    Quantity = quantity,
+                    CreatedAt = created,
+                    ExpiresAt = expires,
+                    Status = status,
+                    FlashSaleId = flashSaleId
+                });
+            }
+
+            context.Reservations.AddRange(reservations);
+            await context.SaveChangesAsync();
+            return reservations;
         }
     }
 }

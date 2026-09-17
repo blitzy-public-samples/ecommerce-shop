@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -5,6 +6,7 @@ using API.Specifications;
 using Core.Entities;
 using Core.Entities.OrderAggregate;
 using Core.Interfaces;
+using Microsoft.Extensions.Logging;
 
 namespace Infrastructure.Services
 {
@@ -13,12 +15,22 @@ namespace Infrastructure.Services
         private readonly IBasketRepository _basketRepo;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IPaymentService _paymentService;
+        private readonly IInventoryService _inventoryService;
+        private readonly ILogger<OrderService> _logger;
 
-        public OrderService(IBasketRepository basketRepo, IUnitOfWork unitOfWork, IPaymentService paymentService)
+        // ILogger is an OPTIONAL trailing dependency (defaults to null). The DI container injects the real
+        // logger in production (ILogger<T> is registered by the host's logging infrastructure); leaving it
+        // optional keeps existing unit-test construction (new OrderService(basketRepo, unitOfWork,
+        // paymentService, inventoryService)) compiling and behaving unchanged. When null, logging is a no-op
+        // via the _logger?. null-conditional call.
+        public OrderService(IBasketRepository basketRepo, IUnitOfWork unitOfWork, IPaymentService paymentService,
+            IInventoryService inventoryService, ILogger<OrderService> logger = null)
         {
             _basketRepo = basketRepo;
             _unitOfWork = unitOfWork;
             _paymentService = paymentService;
+            _inventoryService = inventoryService;
+            _logger = logger;
         }
 
         public async Task<Order> CreateOrderAsync(string buyerEmail, int deliveryMethodId, string basketId, Address shippingAddress)
@@ -50,12 +62,69 @@ namespace Infrastructure.Services
             }
             // create order
             var order = new Order(items, buyerEmail, shippingAddress, deliveryMethod, subtotal, basket.PaymentIntentId);
-            _unitOfWork.Repository<Order>().Add(order);
-            // save to db
-            var result = await _unitOfWork.Complete();
 
-            if (result <= 0) return null;
-            
+            // Open an explicit transaction on the shared scoped StoreContext so order finalization is
+            // atomic AND serialized against concurrent finalizations. CommitReservationAsync below takes
+            // a PostgreSQL "SELECT ... FOR UPDATE" row lock on each reserved Product over this SAME
+            // context; because the lock lives inside this transaction it is held until CommitTransactionAsync,
+            // so two shoppers finalizing orders for the same product cannot both read the pre-decrement
+            // stock and silently overwrite each other (the oversell / lost-update defect). On the EF Core
+            // InMemory provider this is a no-op and behavior is unchanged.
+            await _unitOfWork.BeginTransactionAsync();
+            try
+            {
+                _unitOfWork.Repository<Order>().Add(order);
+                // commit the basket's stock reservations (Active -> Committed + permanent pool decrement)
+                // staged on the SAME scoped StoreContext as the order, so the single Complete() below
+                // flushes order rows and reservation/stock changes together atomically under the row lock.
+                await _inventoryService.CommitReservationAsync(basketId);
+                // save to db — single atomic flush of the order rows AND the staged reservation/stock changes
+                var result = await _unitOfWork.Complete();
+
+                if (result <= 0)
+                {
+                    // Nothing was written: roll back (releasing the row lock) and abort. The staged
+                    // reservation transition to Committed is discarded with the rollback, so the holds
+                    // remain Active and consistent with the un-decremented stock.
+                    await _unitOfWork.RollbackTransactionAsync();
+                    return null;
+                }
+
+                // Commit the row lock + all staged changes together, making the stock decrement durable.
+                await _unitOfWork.CommitTransactionAsync();
+            }
+            catch
+            {
+                // Any failure (DB error, FK violation, etc.) rolls back the whole unit — order rows and
+                // the staged reservation/stock changes revert together — then the error propagates.
+                await _unitOfWork.RollbackTransactionAsync();
+                throw;
+            }
+
+            // Flush succeeded and the transaction committed: now (and only now) delete the Redis hold keys
+            // for the just-committed reservations. Deferring this until after a successful, committed flush
+            // means a rolled-back order never deletes a hold key whose reservation reverted to Active,
+            // keeping PostgreSQL and Redis consistent.
+            //
+            // This cleanup is BEST-EFFORT and MUST NOT be fatal (P4-21): the order is already durably
+            // committed above, so a failure here (e.g. a transient DB/Redis hiccup while reading the
+            // Committed reservations or deleting their hold keys) must not propagate. If it did, the global
+            // ExceptionMiddleware would render a 500 for an order that actually succeeded, prompting the
+            // client to re-submit and risk a duplicate. Any hold key left behind is a stale artifact only:
+            // the background StockReconciliationService (AAP §0.5.2) reclaims/reseeds counters and clears
+            // residual holds on its next pass, so the system re-converges without client intervention.
+            try
+            {
+                await _inventoryService.FinalizeCommittedHoldsAsync(basketId);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex,
+                    "Post-commit hold-key cleanup failed for basket {BasketId} after a durable order commit; "
+                    + "the order is unaffected and reconciliation will converge the residual hold keys.",
+                    basketId);
+            }
+
             // return order
             return order;
         }

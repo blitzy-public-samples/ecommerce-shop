@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using API.IntegrationTests.Infrastructure;
 using Core.Interfaces;                          // IPaymentService — resolve the singleton stub (MJ-10)
 using FluentAssertions;
+using Infrastructure.Data;                      // StoreContext — set committed StockQuantity before basketing
+using Microsoft.EntityFrameworkCore;            // FindAsync / SaveChangesAsync on the real StoreContext
 using Microsoft.Extensions.DependencyInjection; // GetRequiredService — resolve the singleton stub (MJ-10)
 using Xunit;
 
@@ -125,6 +127,14 @@ namespace API.IntegrationTests.Contract
             using var productsResponse = await client.GetAsync("api/products");
             productsResponse.StatusCode.Should().Be(HttpStatusCode.OK);
             var product = (await ReadRootAsync(productsResponse)).GetProperty("data")[0];
+            var productId = product.GetProperty("id").GetInt32();
+
+            // Seeded products carry StockQuantity = 100 (the feature's source seed), and UpdateBasket now
+            // reserves-before-persist (rejecting with 409 any line it cannot hold). Reset this product to an
+            // ample, isolated stock (1000) first so the single-unit line is granted deterministically —
+            // independent of any stock already consumed by other reservations in this class's shared
+            // container — and this test exercises the wire CONTRACT, not stock policy.
+            await SetProductStockAsync(productId, 1000);
 
             var basketId = "contract-order-" + Guid.NewGuid();
             var payload = new
@@ -136,7 +146,7 @@ namespace API.IntegrationTests.Contract
                     {
                         // BasketItemDto: every member is [Required]; id is the product id the server
                         // re-prices authoritatively in CreateOrderAsync (client price is never trusted).
-                        id = product.GetProperty("id").GetInt32(),
+                        id = productId,
                         productName = product.GetProperty("name").GetString(),
                         price = product.GetProperty("price").GetDecimal(),
                         quantity = 1,
@@ -151,6 +161,29 @@ namespace API.IntegrationTests.Contract
             using var basketResponse = await client.PostAsJsonAsync("api/basket", payload);
             basketResponse.StatusCode.Should().Be(HttpStatusCode.OK);
             return basketId;
+        }
+
+        /// <summary>
+        /// Sets the committed PostgreSQL <c>StockQuantity</c> for a product to <paramref name="stock"/> so a
+        /// basket line for it can be reserved deterministically. Seeded products carry <c>StockQuantity = 100</c>
+        /// (the feature's source seed), and <c>UpdateBasket</c> reserves-before-persist (rejecting any line it
+        /// cannot fully hold); because this class's container is shared across its tests, a contract test resets
+        /// the product to a known, ample stock first so its single-unit line is granted regardless of stock
+        /// already consumed by sibling tests. Uses a DI scope on the real in-process host — the same pattern the
+        /// concurrency/resilience inventory tests use to seed state.
+        /// </summary>
+        /// <param name="productId">The DB id of the product to stock.</param>
+        /// <param name="stock">The committed stock quantity to set.</param>
+        private async Task SetProductStockAsync(int productId, int stock)
+        {
+            using var scope = _fixture.Factory.Services.CreateScope();
+            var context = scope.ServiceProvider.GetRequiredService<StoreContext>();
+            var product = await context.Products.FindAsync(productId);
+            if (product != null)
+            {
+                product.StockQuantity = stock;
+                await context.SaveChangesAsync();
+            }
         }
 
         /// <summary>
@@ -319,6 +352,74 @@ namespace API.IntegrationTests.Contract
             root.ValueKind.Should().Be(JsonValueKind.Array);
             root.GetArrayLength().Should().Be(4);
             ShouldExposeCamelCaseProperties(root[0], "id", "name");
+        }
+
+        /// <summary>
+        /// <b>Inventory-feature contract lock</b> (AAP §0.1.2 invariant "StockQuantity is not added to the DTO";
+        /// §0.4.1 non-touchpoints; §0.6.2). After the Real-Time Inventory &amp; Flash-Sale System is added,
+        /// <c>Products.StockQuantity</c> exists on the <c>Product</c> ENTITY and in the database, but it is
+        /// deliberately NOT added to <c>ProductToReturnDto</c> or <c>MappingProfiles</c>: live stock reaches the
+        /// client only over the SignalR hub, never through the <c>[Cached(600)]</c> catalog. This test proves the
+        /// cached list DTO shape is unchanged — the first <c>data</c> item still exposes EXACTLY the seven mapped
+        /// camelCase properties and leaks NO stock field (neither <c>stockQuantity</c> nor <c>stock</c>).
+        /// </summary>
+        [Fact]
+        public async Task GetProducts_AfterInventoryFeature_ProductDtoHasNoStockField()
+        {
+            // Arrange
+            using var client = _fixture.CreateClient();
+
+            // Act
+            using var response = await client.GetAsync("api/products");
+
+            // Assert — status + first item keeps the 7 mapped DTO props and leaks no stock field.
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            var item = root.GetProperty("data")[0];
+
+            // (1) the existing 7 camelCase props are still present (presence-only helper).
+            ShouldExposeCamelCaseProperties(
+                item, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
+
+            // (2) NO stock leakage — the helper cannot express absence, so assert it explicitly (camelCase).
+            item.TryGetProperty("stockQuantity", out _).Should()
+                .BeFalse("StockQuantity must never be exposed through the cached catalog DTO");
+            item.TryGetProperty("stock", out _).Should()
+                .BeFalse("no stock field may leak into the cached ProductToReturnDto");
+        }
+
+        /// <summary>
+        /// Single-product companion to
+        /// <see cref="GetProducts_AfterInventoryFeature_ProductDtoHasNoStockField"/>:
+        /// <c>GET api/products/{id}</c> for a real seeded id returns the <c>ProductToReturnDto</c> with EXACTLY the
+        /// seven mapped camelCase properties, echoes the requested id, and leaks NO stock field
+        /// (<c>stockQuantity</c>/<c>stock</c>). The id is discovered dynamically from the list response because
+        /// product ids are database-assigned.
+        /// </summary>
+        [Fact]
+        public async Task GetProduct_ExistingId_AfterInventoryFeature_ProductDtoHasNoStockField()
+        {
+            // Arrange — discover a real, seeded product id dynamically (ids are DB-assigned, never hardcoded).
+            using var client = _fixture.CreateClient();
+            using var listResponse = await client.GetAsync("api/products");
+            var listRoot = await ReadRootAsync(listResponse);
+            var existingId = listRoot.GetProperty("data")[0].GetProperty("id").GetInt32();
+
+            // Act
+            using var response = await client.GetAsync($"api/products/{existingId}");
+
+            // Assert — status + single-product DTO shape + id echo + NO stock leakage.
+            response.StatusCode.Should().Be(HttpStatusCode.OK);
+            var root = await ReadRootAsync(response);
+            ShouldExposeCamelCaseProperties(
+                root, "id", "name", "description", "price", "pictureUrl", "productType", "productBrand");
+            root.GetProperty("id").GetInt32().Should().Be(existingId);
+
+            // The helper cannot assert absence — assert the missing stock fields explicitly (camelCase).
+            root.TryGetProperty("stockQuantity", out _).Should()
+                .BeFalse("StockQuantity must never be exposed through the cached catalog DTO");
+            root.TryGetProperty("stock", out _).Should()
+                .BeFalse("no stock field may leak into the cached ProductToReturnDto");
         }
 
         // ---------------------------------------------------------------------------------------------

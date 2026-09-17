@@ -2,12 +2,31 @@
   width:33%;
   height:40px;
 }
-.image :hover {
+/* Reveal the hover overlay on mouse hover AND on keyboard focus within the card
+   (QA F14, WCAG 2.4.7): a keyboard user tabbing to the add-to-cart / View buttons
+   must see the same overlay a mouse user gets on hover, otherwise the controls are
+   effectively invisible to keyboard navigation. */
+.image:hover .hover-overlay,
+.image:focus-within .hover-overlay {
   opacity: 1;
-  & button {
-    transform: none;
-    opacity: 1;
-  }
+}
+.image:hover .hover-overlay button,
+.image:focus-within .hover-overlay button {
+  transform: none;
+  opacity: 1;
+}
+// V2: keep the disabled (out-of-stock) add-to-cart button visibly inert on hover.
+// The `.image :hover button { opacity: 1 }` rule above (specificity 0,2,1) otherwise
+// overrides Bootstrap's `.btn:disabled { opacity: .65 }`, so the disabled control
+// looks fully active. This higher-specificity rule (0,3,1) restores the faded,
+// not-allowed affordance for the disabled state only; the enabled button is
+// unaffected (still opacity 1, pointer cursor).
+.image :hover button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+.hover-overlay button:disabled {
+  cursor: not-allowed;
 }
 .hover-overlay {
   position:absolute;
@@ -31,4 +50,13 @@
     transform:translateX(20px);
   }
 
+}
+/* Visible keyboard focus indicator (QA F13, WCAG 2.4.7): every actionable button in
+   the card shows a clear focus ring when reached via keyboard. Scoped component
+   styles out-specify Bootstrap's global `.btn:focus`, so this reliably wins. */
+.btn:focus,
+.btn:focus-visible {
+  outline: 3px solid #005cbf;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px rgba(0, 92, 191, 0.35);
 }

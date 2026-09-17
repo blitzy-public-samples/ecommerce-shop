@@ -1,5 +1,6 @@
 using System.Linq;
 using API.Errors;
+using API.Hubs;
 using Core.Interfaces;
 using Infrastructure.Data;
 using Infrastructure.Services;
@@ -20,6 +21,15 @@ namespace API.Extension
             services.AddScoped<IProductRepository, ProductRepository>();
             services.AddScoped<IBasketRepository, BasketRepository>();
             services.AddScoped(typeof(IGenericRepository<>), typeof(GenericRepository<>));
+            // Real-Time Inventory & Flash-Sale System: SignalR core services + the two long-running
+            // background services (the 30s reconciliation loop and the Redis->SignalR broadcast bridge).
+            // AddSignalR() is registered HERE (single source of truth) so IHubContext<StockHub> is
+            // injectable into StockBroadcastBackgroundService; Startup.cs only maps the hub endpoint.
+            services.AddScoped<IInventoryService, InventoryService>();
+            services.AddScoped<IFlashSaleService, FlashSaleService>();
+            services.AddHostedService<StockReconciliationService>();
+            services.AddHostedService<StockBroadcastBackgroundService>();
+            services.AddSignalR();
             services.Configure<ApiBehaviorOptions>(options =>
             {
                 options.InvalidModelStateResponseFactory = actionContext =>

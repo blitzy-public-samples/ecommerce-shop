@@ -1,0 +1,11 @@
+/* Visible keyboard focus indicator (QA F13, WCAG 2.4.7): the Add-to-Cart button and
+   the quantity steppers show a clear focus ring when reached via keyboard. Scoped
+   component styles out-specify Bootstrap's global `.btn:focus`, so this wins. */
+.btn:focus,
+.btn:focus-visible,
+.quantity-control:focus,
+.quantity-control:focus-visible {
+  outline: 3px solid #005cbf;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px rgba(0, 92, 191, 0.35);
+}
