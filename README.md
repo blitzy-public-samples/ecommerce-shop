@@ -50,7 +50,7 @@ Before you can run the project, you will need to install the following software:
 - Authorization and authentication
 - Product browsing
 - Shopping cart functionalities
-- Order checkout and payment processing (demo)
+- Order checkout and payment processing (stubbed)
 - Dockerized for easy hosting
 
 
